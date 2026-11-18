@@ -672,15 +672,20 @@ impl NativeDidDeploymentService {
         let resolution = match self.resolver.resolve(&did).await {
             Ok(resolution) => resolution,
             Err(DidResolutionPortError::Unavailable | DidResolutionPortError::NotFound) => {
-                return self.pause(operation, DidDeploymentFailure::ResolutionUnavailable);
+                return Ok(operation);
             }
             Err(_) => return Err(NativeDidDeploymentError::Resolution),
         };
-        if resolution.source() != DidResolutionSource::Live
-            || resolution.document().id() != &did
-            || !required_holder_methods_resolve(&resolution)
-        {
+        if resolution.source() != DidResolutionSource::Live || resolution.document().id() != &did {
             return self.pause(operation, DidDeploymentFailure::ResolutionMismatch);
+        }
+        // The resolver may observe each included maintenance transaction at a
+        // different indexed height. A live document that still lacks one of
+        // the required holder methods is therefore an incomplete projection,
+        // not evidence of corruption. Keep the durable operation in Resolving
+        // so the caller can query again without resubmitting any transaction.
+        if !required_holder_methods_resolve(&resolution) {
+            return Ok(operation);
         }
         let ready = operation.transition(DidDeploymentState::Ready, self.now()?)?;
         self.operations.upsert(ready.clone())?;

@@ -423,6 +423,17 @@ impl DidResolutionPort for LiveResolver {
     }
 }
 
+struct MismatchedSubjectResolver;
+
+impl DidResolutionPort for MismatchedSubjectResolver {
+    fn resolve<'a>(&'a self, _: &'a MidnightDid) -> DidResolutionPortFuture<'a> {
+        let other = MidnightDid::parse(format!("did:midnight:undeployed:{}", "f".repeat(64)))
+            .expect("different DID");
+        let resolution = live_resolution(other, true);
+        Box::pin(async move { resolution })
+    }
+}
+
 fn live_resolution(
     did: MidnightDid,
     complete: bool,
@@ -633,19 +644,41 @@ fn indexed_receipt_barrier_prevents_the_next_transaction_from_being_composed() {
 }
 
 #[test]
-fn incomplete_live_resolution_pauses_without_exposing_the_did_as_ready() {
+fn incomplete_live_resolution_waits_without_resubmitting_or_exposing_ready() {
     let submissions = Arc::new(IncludedSubmission {
         submissions: AtomicUsize::new(0),
     });
     let operations = Arc::new(MemoryOperations::default());
     let service = service(
         Arc::new(LiveResolver { complete: false }),
-        submissions,
+        Arc::clone(&submissions),
         operations,
     );
 
     let operation =
         futures::executor::block_on(service.execute(command())).expect("durable failure snapshot");
+
+    assert_eq!(operation.state(), DidDeploymentState::Resolving);
+    assert_eq!(operation.failure(), None);
+    assert_eq!(operation.resume_from(), None);
+    assert_eq!(operation.receipts().len(), 8);
+    assert_eq!(submissions.submissions.load(Ordering::SeqCst), 8);
+}
+
+#[test]
+fn different_live_subject_still_pauses_as_a_resolution_mismatch() {
+    let submissions = Arc::new(IncludedSubmission {
+        submissions: AtomicUsize::new(0),
+    });
+    let operations = Arc::new(MemoryOperations::default());
+    let service = service(
+        Arc::new(MismatchedSubjectResolver),
+        Arc::clone(&submissions),
+        operations,
+    );
+
+    let operation =
+        futures::executor::block_on(service.execute(command())).expect("durable mismatch");
 
     assert_eq!(operation.state(), DidDeploymentState::RetryableFailure);
     assert_eq!(
@@ -653,6 +686,7 @@ fn incomplete_live_resolution_pauses_without_exposing_the_did_as_ready() {
         Some(DidDeploymentFailure::ResolutionMismatch)
     );
     assert_eq!(operation.resume_from(), Some(DidDeploymentState::Resolving));
+    assert_eq!(submissions.submissions.load(Ordering::SeqCst), 8);
 }
 
 #[test]
