@@ -650,10 +650,27 @@ where
 {
     let key_operations: Arc<dyn WalletKeyOperationPort> = security.clone();
     let challenge_signing: Arc<dyn WalletJubjubChallengeSigningPort> = security.clone();
-    let did_lifecycle = Arc::new(StandaloneDidLifecycle::with_jubjub_challenge_signing(
-        key_operations,
-        challenge_signing,
-    ));
+    let did_lifecycle =
+        StandaloneDidLifecycle::with_jubjub_challenge_signing(key_operations, challenge_signing);
+    #[cfg(all(
+        not(target_arch = "wasm32"),
+        any(
+            all(not(target_os = "ios"), not(target_os = "android")),
+            all(
+                feature = "mobile-portal",
+                any(target_os = "ios", target_os = "android")
+            )
+        )
+    ))]
+    let did_lifecycle = match &credential_profile {
+        HeadlessCredentialProfile::Portal(portal)
+            if portal.client_factory.deployment().uses_ledger9_jubjub_jwk() =>
+        {
+            did_lifecycle.with_ledger9_jubjub_jwk()
+        }
+        _ => did_lifecycle,
+    };
+    let did_lifecycle = Arc::new(did_lifecycle);
     let did_lifecycle_port: Arc<dyn DidLifecyclePort> = did_lifecycle.clone();
     let did_jubjub_challenge_signing: Arc<dyn DidJubjubChallengeSigningPort> = did_lifecycle;
     let did_resolver = headless_did_resolver();
