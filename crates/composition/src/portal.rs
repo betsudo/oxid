@@ -32,6 +32,10 @@ use oxid_platform_ports::IdentityLinkIngressPort;
 const MOBILE_PORTAL_ISSUER_ORIGIN: &str = "http://127.0.0.1:18090";
 #[cfg(any(test, target_os = "ios", target_os = "android"))]
 const MOBILE_PORTAL_ISSUER_RESOLVER_ORIGIN: &str = "http://127.0.0.1:18093";
+#[cfg(any(test, target_os = "ios", target_os = "android"))]
+const SHARED_LEDGER9_PORTAL_ISSUER_ORIGIN: &str = "http://127.0.0.1:8090";
+#[cfg(any(test, target_os = "ios", target_os = "android"))]
+const SHARED_LEDGER9_PORTAL_ISSUER_RESOLVER_ORIGIN: &str = "http://127.0.0.1:9092";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum PortalIdentityConfigurationError {
@@ -174,8 +178,20 @@ impl PortalIdentityConfiguration {
 fn validate_mobile_harness_origins(
     deployment: &PortalDeploymentManifest,
 ) -> Result<(), PortalIdentityConfigurationError> {
-    if deployment.issuer_origin() != MOBILE_PORTAL_ISSUER_ORIGIN
-        || deployment.issuer_resolver_origin() != MOBILE_PORTAL_ISSUER_RESOLVER_ORIGIN
+    let origins = (
+        deployment.issuer_origin(),
+        deployment.issuer_resolver_origin(),
+    );
+    if origins
+        != (
+            MOBILE_PORTAL_ISSUER_ORIGIN,
+            MOBILE_PORTAL_ISSUER_RESOLVER_ORIGIN,
+        )
+        && origins
+            != (
+                SHARED_LEDGER9_PORTAL_ISSUER_ORIGIN,
+                SHARED_LEDGER9_PORTAL_ISSUER_RESOLVER_ORIGIN,
+            )
     {
         return Err(PortalIdentityConfigurationError::MobileHarnessOriginMismatch);
     }
@@ -238,11 +254,19 @@ mod tests {
 
     #[test]
     fn mobile_manifest_requires_the_exact_local_harness_origins() {
-        let exact = deployment(
-            MOBILE_PORTAL_ISSUER_ORIGIN,
-            MOBILE_PORTAL_ISSUER_RESOLVER_ORIGIN,
-        );
-        validate_mobile_harness_origins(&exact).expect("exact mobile routes");
+        for (issuer, resolver) in [
+            (
+                MOBILE_PORTAL_ISSUER_ORIGIN,
+                MOBILE_PORTAL_ISSUER_RESOLVER_ORIGIN,
+            ),
+            (
+                SHARED_LEDGER9_PORTAL_ISSUER_ORIGIN,
+                SHARED_LEDGER9_PORTAL_ISSUER_RESOLVER_ORIGIN,
+            ),
+        ] {
+            validate_mobile_harness_origins(&deployment(issuer, resolver))
+                .expect("exact authenticated mobile routes");
+        }
 
         for (issuer, resolver) in [
             (
@@ -255,6 +279,15 @@ mod tests {
                 MOBILE_PORTAL_ISSUER_RESOLVER_ORIGIN,
             ),
             (MOBILE_PORTAL_ISSUER_ORIGIN, "https://resolver.example"),
+            (
+                SHARED_LEDGER9_PORTAL_ISSUER_ORIGIN,
+                MOBILE_PORTAL_ISSUER_RESOLVER_ORIGIN,
+            ),
+            (
+                MOBILE_PORTAL_ISSUER_ORIGIN,
+                SHARED_LEDGER9_PORTAL_ISSUER_RESOLVER_ORIGIN,
+            ),
+            (SHARED_LEDGER9_PORTAL_ISSUER_ORIGIN, "http://127.0.0.1:9093"),
         ] {
             let authenticated = deployment(issuer, resolver);
             assert_eq!(
