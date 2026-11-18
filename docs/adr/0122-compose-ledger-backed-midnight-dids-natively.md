@@ -6,6 +6,7 @@
 - Depends on: immutable Ledger8-compatible revisions of `midnight-ledger`, `compact`, `midnight-zk`, and `midnight-identity`
 - Supersedes: the external JavaScript DID call composer admitted as an interim bridge by ADR-0037
 - Amends: ADR-0037's statement that live Compact writes remain queued
+- Amended by: ADR-0123 migrates this native composition to one Ledger9 dependency cohort
 
 ## Context
 
