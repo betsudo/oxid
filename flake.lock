@@ -115,17 +115,17 @@
     "midnight-identity-ledger9": {
       "flake": false,
       "locked": {
-        "lastModified": 1794990465,
+        "lastModified": 1794993069,
         "narHash": "sha256-EClXcL4MpyDjYcEt6nEaNINJJNan+Nr15NOGk3xaooY=",
         "owner": "betsudo",
         "repo": "midnight-identity",
-        "rev": "e50d606c8b9cd7573bbe29e0a2d69726dd3d2a6b",
+        "rev": "e7e28eea94515d59b5e7360a717f5c0dee3eecdf",
         "type": "github"
       },
       "original": {
         "owner": "betsudo",
         "repo": "midnight-identity",
-        "rev": "e50d606c8b9cd7573bbe29e0a2d69726dd3d2a6b",
+        "rev": "e7e28eea94515d59b5e7360a717f5c0dee3eecdf",
         "type": "github"
       }
     },

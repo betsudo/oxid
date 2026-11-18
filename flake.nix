@@ -10,11 +10,9 @@
       url = "github:midnightntwrk/midnight-verifiable-credentials/39b1354212620b396e914b29603e6a38f2656546";
       flake = false;
     };
-    # Exact Ledger 9 DID/VC migration candidate. Replace this with the
-    # immutable merge commit of betsudo/midnight-identity#110 before release
-    # qualification.
+    # Immutable merge commit of the qualified Ledger 9 DID/VC migration.
     midnight-identity-ledger9 = {
-      url = "github:betsudo/midnight-identity/e50d606c8b9cd7573bbe29e0a2d69726dd3d2a6b";
+      url = "github:betsudo/midnight-identity/e7e28eea94515d59b5e7360a717f5c0dee3eecdf";
       flake = false;
     };
     midnight-zkir-ledger9.url = "github:betsudo/midnight-zkir/3377ad9e48741f60e0aa17010b6f23e34223d906";

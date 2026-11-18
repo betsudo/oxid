@@ -15,12 +15,10 @@ Oxid selects one Ledger 9 cohort for its native production graph:
 | `betsudo/compact` | `d6513a24debac14d43a8199460d9dc2c6d9af2b1` | Rust runtime `0.2.0`, ABI 54 |
 | `betsudo/midnight-zk` | `bca8db4d9e2c1ecaa5d1db5ba7a201935b6c6c8a` | `midnight-proofs 0.8.2` |
 | `betsudo/midnight-zkir` | `3377ad9e48741f60e0aa17010b6f23e34223d906` | ZKIR `3.2.1`, schema 20 |
-| `betsudo/midnight-identity` | `e50d606c8b9cd7573bbe29e0a2d69726dd3d2a6b` | DID/VC Ledger 9 candidate `0.5.0` |
+| `betsudo/midnight-identity` | `e7e28eea94515d59b5e7360a717f5c0dee3eecdf` | merged DID/VC Ledger 9 release source `0.5.0` |
 
-The identity revision is the exact remotely reachable head of upstream PR
-`betsudo/midnight-identity#110`. It is admitted for local migration work but
-must be replaced by the immutable merge commit before a release-qualified Oxid
-PR leaves draft state.
+The identity revision is the immutable merge commit of upstream PR
+`betsudo/midnight-identity#110` and is the qualified release source.
 
 ## Runtime topology
 

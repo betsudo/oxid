@@ -10,7 +10,7 @@
 
 stdenvNoCC.mkDerivation {
   pname = "oxid-midnight-did-ledger9-artifacts";
-  version = "0.5.0-e50d606";
+  version = "0.5.0-e7e28ee";
 
   src = midnightIdentitySource;
   nativeBuildInputs = [
@@ -45,7 +45,7 @@ stdenvNoCC.mkDerivation {
     cp crates/midnight-did-runtime/assets/rust-compatibility.json "$out/"
 
     jq -n \
-      --arg gitSha "e50d606c8b9cd7573bbe29e0a2d69726dd3d2a6b" \
+      --arg gitSha "e7e28eea94515d59b5e7360a717f5c0dee3eecdf" \
       --arg version "0.5.0" \
       '
         def entry($id): {
