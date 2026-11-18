@@ -381,7 +381,7 @@ async fn inspect_policy(
     }
     let proof_key =
         point_bytes(proof.public_key).ok_or(CredentialVerificationError::InvalidCredential)?;
-    if !jwk_matches_proof(method.public_key_jwk(), &proof_key) {
+    if !jwk_matches_proof(method.public_key_jwk(), &proof_key, &policy.trust_anchor) {
         return policy_failure(
             inspection,
             VerificationOutcome::Invalid,
@@ -531,20 +531,18 @@ fn point_bytes(point: EmbeddedGroupAffine) -> Option<[u8; 64]> {
     Some(bytes)
 }
 
-fn jwk_matches_proof(jwk: &oxid_identity_domain::PublicJwk, proof_key: &[u8; 64]) -> bool {
+fn jwk_matches_proof(
+    jwk: &oxid_identity_domain::PublicJwk,
+    proof_key: &[u8; 64],
+    trust_anchor: &DigitalPassportIssuerTrustAnchor,
+) -> bool {
     if jwk.key_type() != JwkKeyType::Ec || jwk.curve() != JwkCurve::Jubjub {
         return false;
     }
     let Some(y) = jwk.y() else {
         return false;
     };
-    let decode = |value: &str| {
-        general_purpose::URL_SAFE_NO_PAD
-            .decode(value)
-            .ok()
-            .filter(|bytes| bytes.len() == 32)
-            .filter(|bytes| general_purpose::URL_SAFE_NO_PAD.encode(bytes) == value)
-    };
+    let decode = |value| trust_anchor.decode_jwk_coordinate(value);
     matches!((decode(jwk.x()), decode(y)), (Some(x), Some(y)) if x == proof_key[..32] && y == proof_key[32..])
 }
 
@@ -1004,6 +1002,41 @@ mod tests {
         general_purpose::STANDARD
             .decode(value.trim())
             .expect("fixture base64")
+    }
+
+    #[test]
+    fn ledger9_portal_anchor_and_resolved_jwk_use_canonical_big_endian_coordinates() {
+        use midnight_did_domain::encode_jubjub_jwk_coordinate_from_little_endian;
+        use sha2::{Digest as _, Sha256};
+
+        let proof = parse_proof(&crate::standalone_compact_proof()).expect("proof");
+        let proof_key = point_bytes(proof.public_key).expect("public coordinates");
+        let x = encode_jubjub_jwk_coordinate_from_little_endian(&proof_key[..32], "x").unwrap();
+        let y = encode_jubjub_jwk_coordinate_from_little_endian(&proof_key[32..], "y").unwrap();
+        let wire = serde_json::json!({"crv":"Jubjub","kty":"EC","x":x,"y":y});
+        let digest = hex::encode(Sha256::digest(serde_json::to_vec(&wire).unwrap()));
+        let did = did_from_contract_address(proof.signer.did_contract_address);
+        let method = format!("{did}{}", method_fragment(&proof.signer.method_id).unwrap());
+        let anchor = DigitalPassportIssuerTrustAnchor::from_ledger9_portal_jubjub(
+            &did, &method, &x, &y, &digest,
+        )
+        .unwrap();
+        assert!(anchor.matches(&did, &proof.signer.method_id, &proof_key));
+        let resolved = PublicJwk::new(JwkKeyType::Ec, JwkCurve::Jubjub, x, Some(y)).unwrap();
+        assert!(jwk_matches_proof(&resolved, &proof_key, &anchor));
+        assert!(!jwk_matches_proof(
+            &resolved,
+            &proof_key,
+            &crate::standalone_digital_passport_issuer_trust_anchor()
+        ));
+        let legacy = PublicJwk::new(
+            JwkKeyType::Ec,
+            JwkCurve::Jubjub,
+            general_purpose::URL_SAFE_NO_PAD.encode(&proof_key[..32]),
+            Some(general_purpose::URL_SAFE_NO_PAD.encode(&proof_key[32..])),
+        )
+        .unwrap();
+        assert!(!jwk_matches_proof(&legacy, &proof_key, &anchor));
     }
 
     fn bound_request() -> BoundCredentialRequest {

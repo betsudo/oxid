@@ -28,6 +28,29 @@ pub struct DigitalPassportIssuerTrustAnchor {
     method_id: [u8; 32],
     public_key: [u8; 64],
     public_key_hash: [u8; 32],
+    jwk_coordinates: JubjubJwkCoordinates,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum JubjubJwkCoordinates {
+    Legacy,
+    Ledger9,
+}
+
+impl JubjubJwkCoordinates {
+    fn decode(self, value: &str) -> Option<[u8; 32]> {
+        match self {
+            Self::Legacy => general_purpose::URL_SAFE_NO_PAD
+                .decode(value)
+                .ok()
+                .filter(|bytes| general_purpose::URL_SAFE_NO_PAD.encode(bytes) == value)
+                .and_then(|bytes| bytes.try_into().ok()),
+            Self::Ledger9 => {
+                midnight_did_domain::decode_jubjub_jwk_coordinate_to_little_endian(value, "Jubjub")
+                    .ok()
+            }
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -64,6 +87,42 @@ impl DigitalPassportIssuerTrustAnchor {
         y: &str,
         expected_jwk_sha256: &str,
     ) -> Result<Self, DigitalPassportIssuerTrustAnchorError> {
+        Self::from_jubjub_jwk(
+            issuer_did,
+            issuer_method,
+            x,
+            y,
+            expected_jwk_sha256,
+            JubjubJwkCoordinates::Legacy,
+        )
+    }
+
+    /// Authenticate the canonical Jubjub JWK from the pinned Ledger 9 resolver.
+    pub fn from_ledger9_portal_jubjub(
+        issuer_did: &str,
+        issuer_method: &str,
+        x: &str,
+        y: &str,
+        expected_jwk_sha256: &str,
+    ) -> Result<Self, DigitalPassportIssuerTrustAnchorError> {
+        Self::from_jubjub_jwk(
+            issuer_did,
+            issuer_method,
+            x,
+            y,
+            expected_jwk_sha256,
+            JubjubJwkCoordinates::Ledger9,
+        )
+    }
+
+    fn from_jubjub_jwk(
+        issuer_did: &str,
+        issuer_method: &str,
+        x: &str,
+        y: &str,
+        expected_jwk_sha256: &str,
+        jwk_coordinates: JubjubJwkCoordinates,
+    ) -> Result<Self, DigitalPassportIssuerTrustAnchorError> {
         MidnightDid::parse(issuer_did.to_owned())
             .map_err(|_| DigitalPassportIssuerTrustAnchorError::InvalidIssuer)?;
         let fragment = issuer_method
@@ -81,11 +140,8 @@ impl DigitalPassportIssuerTrustAnchor {
         let mut method_id = [0_u8; 32];
         method_id[..fragment.len()].copy_from_slice(fragment.as_bytes());
         let decode = |value: &str| {
-            general_purpose::URL_SAFE_NO_PAD
+            jwk_coordinates
                 .decode(value)
-                .ok()
-                .filter(|bytes| general_purpose::URL_SAFE_NO_PAD.encode(bytes) == value)
-                .and_then(|bytes| <[u8; 32]>::try_from(bytes).ok())
                 .and_then(|bytes| Fr::from_le_bytes(&bytes))
                 .ok_or(DigitalPassportIssuerTrustAnchorError::InvalidPublicKey)
         };
@@ -116,6 +172,7 @@ impl DigitalPassportIssuerTrustAnchor {
             public_key: point_bytes(point)
                 .ok_or(DigitalPassportIssuerTrustAnchorError::InvalidPublicKey)?,
             public_key_hash: persistent_hash(&ValueReprAlignedValue(AlignedValue::from(point))),
+            jwk_coordinates,
         })
     }
 
@@ -143,6 +200,10 @@ impl DigitalPassportIssuerTrustAnchor {
         self.issuer_did == issuer_did
             && &self.method_id == method_id
             && &self.public_key == public_key
+    }
+
+    pub(crate) fn decode_jwk_coordinate(&self, value: &str) -> Option<[u8; 32]> {
+        self.jwk_coordinates.decode(value)
     }
 }
 
@@ -189,6 +250,7 @@ pub fn standalone_digital_passport_issuer_trust_anchor() -> DigitalPassportIssue
         public_key_hash: persistent_hash(&ValueReprAlignedValue(AlignedValue::from(
             proof.public_key,
         ))),
+        jwk_coordinates: JubjubJwkCoordinates::Legacy,
     }
 }
 

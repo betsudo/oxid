@@ -145,7 +145,12 @@ impl PortalIdentityConfiguration {
             .map(HttpDidResolver::new)
             .map_err(PortalIdentityConfigurationError::Resolver)?;
         let jwk = deployment.issuer_jubjub_jwk();
-        let trust_anchor = DigitalPassportIssuerTrustAnchor::from_portal_jubjub(
+        let trust_anchor_for_source = if deployment.uses_ledger9_jubjub_jwk() {
+            DigitalPassportIssuerTrustAnchor::from_ledger9_portal_jubjub
+        } else {
+            DigitalPassportIssuerTrustAnchor::from_portal_jubjub
+        };
+        let trust_anchor = trust_anchor_for_source(
             deployment.issuer_did(),
             deployment.issuer_method(),
             &jwk.x,

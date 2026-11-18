@@ -292,6 +292,11 @@ impl PortalDeploymentManifest {
     }
 
     #[must_use]
+    pub fn uses_ledger9_jubjub_jwk(&self) -> bool {
+        LEDGER9_SOURCE.matches(self)
+    }
+
+    #[must_use]
     pub fn issuer_did(&self) -> &str {
         &self.issuer_did
     }
