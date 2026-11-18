@@ -26,7 +26,9 @@ struct NonceResponse<'a> {
     // Keep the encoded secret borrowed so serde never owns its decoded text.
     #[serde(borrow)]
     c_nonce: &'a RawValue,
-    c_nonce_expires_in: u64,
+    // RFC 9449/OID4VCI issuers may omit the optional lifetime. Keep accepting
+    // the older Portal shape, but require a bounded integer when it is present.
+    c_nonce_expires_in: Option<u64>,
 }
 
 #[derive(Deserialize)]

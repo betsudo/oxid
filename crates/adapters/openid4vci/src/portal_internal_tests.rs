@@ -705,6 +705,12 @@ fn token_and_nonce_responses_remain_strictly_typed() {
         Ok("nonce")
     );
     assert_eq!(
+        parse_nonce_response(br#"{"c_nonce":"nonce"}"#)
+            .as_ref()
+            .map(|value| value.as_str()),
+        Ok("nonce")
+    );
+    assert_eq!(
         parse_token_response(
             br#"{"access_token":"token","expires_in":300,"token_type":"B\u0065arer"}"#
         )
@@ -734,7 +740,6 @@ fn token_and_nonce_responses_remain_strictly_typed() {
         br#"{"c_nonce":7,"c_nonce_expires_in":300}"#,
         br#"{"c_nonce":"nonce","c_nonce_expires_in":300,"extra":true}"#,
         br#"{"c_nonce_expires_in":300}"#,
-        br#"{"c_nonce":"nonce"}"#,
     ] {
         assert_eq!(
             parse_nonce_response(response),
