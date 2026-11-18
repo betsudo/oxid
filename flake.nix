@@ -3,6 +3,7 @@
 
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
+    fenix.url = "github:nix-community/fenix";
     flake-parts.url = "github:hercules-ci/flake-parts";
     midnight-did-toolchain.url = "github:midnightntwrk/midnight-did/05b237a5e51f9c22853b424e7d4236dfa9384c24";
     midnight-verifiable-credentials = {

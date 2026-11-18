@@ -5,6 +5,14 @@
     { pkgs, self', ... }:
     let
       midnightDidPackages = inputs.midnight-did-toolchain.packages.${pkgs.stdenv.hostPlatform.system};
+      rustToolchain = inputs.fenix.packages.${pkgs.stdenv.hostPlatform.system}.toolchainOf {
+        channel = "1.99.0";
+        sha256 = "sha256-zm3dyIY2T414ZRR3EhLOvptzG6gta4WZUcawzMUWtqI=";
+      };
+      rustPlatform = pkgs.makeRustPlatform {
+        cargo = rustToolchain.cargo;
+        rustc = rustToolchain.rustc;
+      };
       midnightDidCompactArtifacts = pkgs.callPackage ./midnight-did-compact-artifacts.nix { };
       midnightDidLedger9Zkir = pkgs.callPackage ./midnight-did-ledger9-zkir.nix {
         midnightIdentitySource = inputs.midnight-identity-ledger9;
@@ -24,7 +32,7 @@
         midnightCircuitParams = midnightDidPackages.midnight-circuit-params;
         midnightVcSource = inputs.midnight-verifiable-credentials;
       };
-      oxidApp = pkgs.rustPlatform.buildRustPackage {
+      oxidApp = rustPlatform.buildRustPackage {
         pname = "oxid";
         version = "0.2.0";
         src = pkgs.lib.cleanSource ../..;
@@ -54,7 +62,7 @@
           mainProgram = "oxid-app";
         };
       };
-      brandCheck = pkgs.rustPlatform.buildRustPackage {
+      brandCheck = rustPlatform.buildRustPackage {
         pname = "oxid-brand-check";
         version = "0.2.0";
         src = pkgs.lib.cleanSource ../..;
@@ -113,7 +121,7 @@
 
         brand-check = brandCheck;
 
-        headless = pkgs.rustPlatform.buildRustPackage {
+        headless = rustPlatform.buildRustPackage {
           pname = "oxid-headless";
           version = "0.2.0";
           src = pkgs.lib.cleanSource ../..;

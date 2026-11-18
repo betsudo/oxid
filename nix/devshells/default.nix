@@ -5,6 +5,17 @@
     { pkgs, self', ... }:
     let
       midnightDidPackages = inputs.midnight-did-toolchain.packages.${pkgs.stdenv.hostPlatform.system};
+      rustToolchain = inputs.fenix.packages.${pkgs.stdenv.hostPlatform.system}.toolchainOf {
+        channel = "1.99.0";
+        sha256 = "sha256-zm3dyIY2T414ZRR3EhLOvptzG6gta4WZUcawzMUWtqI=";
+      };
+      rustComponents = rustToolchain.withComponents [
+        "cargo"
+        "clippy"
+        "rust-src"
+        "rustc"
+        "rustfmt"
+      ];
       linuxLibraries = pkgs.lib.optionals pkgs.stdenv.hostPlatform.isLinux [
         pkgs.glib
         pkgs.gtk3
@@ -13,14 +24,11 @@
         pkgs.xdotool
       ];
       ciRustPackages = with pkgs; [
-        cargo
-        clippy
         git
         nodejs_24
         pkg-config
         ripgrep
-        rustc
-        rustfmt
+        rustComponents
         sccache
       ];
       ciQualityPackages =
@@ -30,7 +38,7 @@
           cargo-deny
         ]);
       ciRustShellHook = ''
-        export RUST_SRC_PATH=${pkgs.rustPlatform.rustLibSrc}
+        export RUST_SRC_PATH=${rustToolchain.rust-src}/lib/rustlib/src/rust/library
         export RUSTC_WRAPPER=${pkgs.sccache}/bin/sccache
         # rustc incremental artifacts are target-directory state and cannot be
         # reused by sccache. CI prefers cross-run object reuse; the interactive
@@ -111,13 +119,11 @@
         packages =
           with pkgs;
           [
-            cargo
             cargo-audit
             cargo-deny
             cargo-edit
             cargo-llvm-cov
             cargo-nextest
-            clippy
             dioxus-cli
             git
             gh
@@ -137,8 +143,7 @@
             (python3.withPackages (pythonPackages: [ pythonPackages.pillow ]))
             ripgrep
             rust-analyzer
-            rustc
-            rustfmt
+            rustComponents
             sccache
           ]
           ++ pkgs.lib.optionals pkgs.stdenv.hostPlatform.isDarwin [
@@ -149,7 +154,7 @@
         buildInputs = linuxLibraries;
 
         shellHook = ''
-          export RUST_SRC_PATH=${pkgs.rustPlatform.rustLibSrc}
+          export RUST_SRC_PATH=${rustToolchain.rust-src}/lib/rustlib/src/rust/library
           export LLVM_COV=${pkgs.llvmPackages.llvm}/bin/llvm-cov
           export LLVM_PROFDATA=${pkgs.llvmPackages.llvm}/bin/llvm-profdata
           export JAVA_HOME=${pkgs.jdk17.home}
