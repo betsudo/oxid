@@ -128,43 +128,57 @@ fn deployment_manifest_requires_exact_digest_source_profile_and_canonical_public
 
 #[test]
 fn ledger9_source_is_authenticated_only_for_the_pinned_local_routes() {
-    let bytes = manifest_bytes("http://127.0.0.1:8090");
-    let mut manifest = PortalDeploymentManifest::from_bytes(&bytes, &sha256(&bytes)).unwrap();
-    manifest.integration_commit = LEDGER9_SOURCE.commit.to_owned();
-    manifest.integration_tree = LEDGER9_SOURCE.tree.to_owned();
-    manifest.provenance_sha256 = LEDGER9_SOURCE.provenance_sha256.to_owned();
-    manifest.issuer_resolver_origin = "http://127.0.0.1:9092".to_owned();
-
-    let authenticate = |manifest: &PortalDeploymentManifest| {
-        let bytes = serde_json::to_vec(manifest).unwrap();
-        PortalDeploymentManifest::from_bytes(&bytes, &sha256(&bytes))
+    let tree = "4f9952cebd0e9cc8a82ec9d459d2eadc9cce8adb";
+    let provenance = "70f67a9f339ca0756ca4d10f5bef9dea769746094076288b8f571d93cb9c51fc";
+    let manifest = String::from_utf8(manifest_bytes("http://127.0.0.1:8090"))
+        .unwrap()
+        .replace(
+            PORTAL_INTEGRATION_COMMIT,
+            "154ad777456ab40ab2f46a8b94959ae63b14a459",
+        )
+        .replace(PORTAL_INTEGRATION_TREE, tree)
+        .replace(PORTAL_PROVENANCE_SHA256, provenance)
+        .replace(
+            r#""issuerResolverOrigin":"http://127.0.0.1:8090""#,
+            r#""issuerResolverOrigin":"http://127.0.0.1:9092""#,
+        );
+    let authenticate = |manifest: &str| {
+        let bytes = manifest.as_bytes();
+        PortalDeploymentManifest::from_bytes(bytes, &sha256(bytes))
     };
-    assert_eq!(authenticate(&manifest).unwrap(), manifest);
-
-    let mut mismatched = manifest.clone();
-    mismatched.integration_tree = PORTAL_INTEGRATION_TREE.to_owned();
+    let authenticated = authenticate(&manifest).expect("exact Ledger 9 manifest authenticates");
+    assert_eq!(authenticated.issuer_origin(), "http://127.0.0.1:8090");
     assert_eq!(
-        authenticate(&mismatched).err(),
-        Some(PortalDeploymentManifestError::SourceLockMismatch)
+        authenticated.issuer_resolver_origin(),
+        "http://127.0.0.1:9092"
     );
-    mismatched = manifest.clone();
-    mismatched.provenance_sha256 = PORTAL_PROVENANCE_SHA256.to_owned();
-    assert_eq!(
-        authenticate(&mismatched).err(),
-        Some(PortalDeploymentManifestError::SourceLockMismatch)
-    );
-    mismatched = manifest.clone();
-    mismatched.issuer_origin = "https://issuer.example".to_owned();
-    assert_eq!(
-        authenticate(&mismatched).err(),
-        Some(PortalDeploymentManifestError::InvalidOrigin)
-    );
-    mismatched = manifest;
-    mismatched.issuer_resolver_origin = "http://127.0.0.1:9093".to_owned();
-    assert_eq!(
-        authenticate(&mismatched).err(),
-        Some(PortalDeploymentManifestError::InvalidOrigin)
-    );
+    for (expected, replacement, error) in [
+        (
+            tree,
+            PORTAL_INTEGRATION_TREE,
+            PortalDeploymentManifestError::SourceLockMismatch,
+        ),
+        (
+            provenance,
+            PORTAL_PROVENANCE_SHA256,
+            PortalDeploymentManifestError::SourceLockMismatch,
+        ),
+        (
+            "http://127.0.0.1:8090",
+            "https://issuer.example",
+            PortalDeploymentManifestError::InvalidOrigin,
+        ),
+        (
+            "http://127.0.0.1:9092",
+            "http://127.0.0.1:9093",
+            PortalDeploymentManifestError::InvalidOrigin,
+        ),
+    ] {
+        assert_eq!(
+            authenticate(&manifest.replace(expected, replacement)).err(),
+            Some(error)
+        );
+    }
 }
 
 #[test]
