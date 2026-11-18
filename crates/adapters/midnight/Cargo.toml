@@ -42,6 +42,7 @@ midnight-serialize.workspace = true
 midnight-storage.workspace = true
 midnight-transient-crypto.workspace = true
 midnight-zkir.workspace = true
+midnight-zkir-v2.workspace = true
 midnight-zswap.workspace = true
 rand.workspace = true
 reqwest = { workspace = true, features = ["stream"] }

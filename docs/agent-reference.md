@@ -1385,9 +1385,12 @@ only that the schema is authenticated and does not imply where the bytes came
 from. The exact ledger has 15 fields and
 contract version 1. Cap decoding at 16 MiB and 4,096 contiguous locks, require
 per-lock/global accounting agreement and `claimCount == consumedClaims.size`,
-and reject trailing bytes or unknown decisions. The deterministic fixture at
-`fixtures/passport-vault/contract-state-v1.hex` is 2,013 bytes with SHA-256
-`dc4a2f242b8a0a525310b1090ca1ad117cc0d7b019e16d8738f3c9505760a8c0`.
+and reject trailing bytes or unknown decisions. The deterministic Ledger9
+layout fixture at `fixtures/passport-vault/contract-state-v1.hex` is 1,654 bytes
+with SHA-256
+`29309501c082ee55bffb9211a5ab96b36b8dd0e658788f0789641dfab0aa98bc`.
+It uses `contract-state[v8]`, preserves the exact public state shape, and has no
+deployable operations; issue #1194 owns the Ledger9 Compact operation closure.
 Do not relabel it live/cached without an authenticated acquisition/freshness
 adapter.
 

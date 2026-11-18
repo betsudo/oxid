@@ -251,6 +251,9 @@ impl DidDeploymentContextSource for NodeAnchoredDidDeploymentContextSource {
             Ok(MidnightDidCallContext {
                 contract_state: snapshot.serialized_contract_state,
                 contract_address: did_contract_address(did)?,
+                observation_transaction_hash: decode_hex_32(&snapshot.transaction_hash_hex)?,
+                observation_block_hash: decode_hex_32(&snapshot.action_block_hash_hex)?,
+                observation_block_height: snapshot.action_block_height,
                 zswap_chain_state: Some(chain.zswap_chain_state().to_vec()),
                 ledger_parameters: Some(chain.ledger_parameters().to_vec()),
                 network_id: wallet.network_id().as_str().to_owned(),
@@ -735,6 +738,13 @@ fn did_contract_address(did: &MidnightDid) -> Result<[u8; 32], NativeDidDeployme
         .ok_or(NativeDidDeploymentError::Integrity)?;
     let decoded = hex::decode(encoded).map_err(|_| NativeDidDeploymentError::Integrity)?;
     decoded
+        .try_into()
+        .map_err(|_| NativeDidDeploymentError::Integrity)
+}
+
+fn decode_hex_32(value: &str) -> Result<[u8; 32], NativeDidDeploymentError> {
+    let bytes = hex::decode(value).map_err(|_| NativeDidDeploymentError::Integrity)?;
+    bytes
         .try_into()
         .map_err(|_| NativeDidDeploymentError::Integrity)
 }

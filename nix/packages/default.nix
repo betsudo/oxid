@@ -6,6 +6,11 @@
     let
       midnightDidPackages = inputs.midnight-did-toolchain.packages.${pkgs.stdenv.hostPlatform.system};
       midnightDidCompactArtifacts = pkgs.callPackage ./midnight-did-compact-artifacts.nix { };
+      midnightDidLedger9Zkir = pkgs.callPackage ./midnight-did-ledger9-zkir.nix {
+        midnightIdentitySource = inputs.midnight-identity-ledger9;
+        zkirCompiler = inputs.midnight-zkir-ledger9.packages.${pkgs.stdenv.hostPlatform.system}.zkir;
+        publicParams = inputs.midnight-zkir-ledger9.packages.${pkgs.stdenv.hostPlatform.system}.public-params;
+      };
       cargoOutputHashes = {
         "midnight-base-crypto-1.0.1" = "sha256-KVp5T/m9NzzUwn4dnlp5IVy9DoticxIquio7ms6g+1Q=";
         "midnight-compact-runtime-0.16.102" = "sha256-e+2iLWOlwQGpbrsJvNN5ryAxm2jzBlE6g+eQC8x3l6I=";
@@ -155,6 +160,8 @@
 
         midnight-did-compact-artifacts = midnightDidCompactArtifacts;
 
+        midnight-did-ledger9-zkir = midnightDidLedger9Zkir;
+
         passport-vault-compact-artifacts = passportVaultCompactArtifacts;
 
         passport-vault-call-composer = passportVaultCallComposer;
@@ -180,6 +187,7 @@
         });
         presentation-compact-artifacts = presentationCompactArtifacts;
         midnight-did-compact-artifacts = midnightDidCompactArtifacts;
+        midnight-did-ledger9-zkir = midnightDidLedger9Zkir;
         passport-vault-compact-artifacts = passportVaultCompactArtifacts;
         passport-vault-call-composer = passportVaultCallComposer;
         brand-packs =

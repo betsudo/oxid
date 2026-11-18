@@ -3,38 +3,55 @@
 
 set -euo pipefail
 
-if ! command -v jq >/dev/null 2>&1; then
-  echo "jq is required; run this check from 'nix develop'." >&2
-  exit 1
-fi
+for tool in cargo jq; do
+  command -v "$tool" >/dev/null 2>&1 || {
+    echo "$tool is required; run this check from 'nix develop'." >&2
+    exit 1
+  }
+done
 
-readonly ledger_revision="8655615e7c4cbf3a1187b3203bf72e69dc09b8dc"
-readonly ledger_source="git+https://github.com/MediaNoxLabs/midnight-ledger.git?rev=${ledger_revision}"
-readonly proofs_revision="532629b044a88473a7175f4a96c2511c91156136"
-readonly proofs_source="git+https://github.com/MediaNoxLabs/midnight-zk?rev=${proofs_revision}"
-readonly compact_revision="32e314770da10cc62dab30dcfeb340ec4c6bcb64"
-readonly compact_source="git+https://github.com/MediaNoxLabs/compact.git?rev=${compact_revision}"
-readonly identity_revision="fcf3c51cb9368a3e7574f06f82434f92386d0a2b"
-readonly identity_source="git+https://github.com/MediaNoxLabs/midnight-identity.git?rev=${identity_revision}"
+readonly root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+readonly manifest="$root/config/midnight-integration-compatibility.json"
+source_for() {
+  local component="$1"
+  jq -er --arg component "$component" '
+    .wallet[$component] | "git+\(.repository)?rev=\(.revision)"
+  ' "$manifest"
+}
+
+readonly ledger_source="$(source_for ledger)"
+readonly compact_source="$(source_for compact)"
+readonly proofs_source="$(source_for proofs)"
+readonly zkir_source="$(source_for zkir)"
+readonly identity_source="$(source_for nativeIdentity)"
+readonly -a reviewed_sources=(
+  "$ledger_source"
+  "$compact_source"
+  "$proofs_source"
+  "$zkir_source"
+  "$identity_source"
+)
 
 metadata_file="$(mktemp)"
 trap 'rm -f "$metadata_file"' EXIT
 cargo metadata --locked --format-version 1 >"$metadata_file"
 
-dependency_count=0
-while IFS=$'\t' read -r package source path; do
+direct_count=0
+while IFS=$'\t' read -r package rename source path; do
   [ -n "$package" ] || continue
-  dependency_count=$((dependency_count + 1))
-
+  direct_count=$((direct_count + 1))
   case "$package" in
-    midnight-ledger|midnight-zswap|midnight-zkir|midnight-onchain-runtime|\
-      midnight-serialize|midnight-base-crypto|midnight-coin-structure|\
-      midnight-onchain-state|midnight-storage|midnight-transient-crypto|\
-      midnight-proof-server)
+    midnight-ledger-v9|midnight-zswap|midnight-onchain-runtime|midnight-serialize|\
+      midnight-base-crypto|midnight-coin-structure|midnight-onchain-state|\
+      midnight-storage|midnight-transient-crypto)
       expected_source="$ledger_source"
       ;;
-    midnight-proofs)
-      expected_source="$proofs_source"
+    midnight-zkir)
+      if [ "$rename" = midnight-zkir-v2 ]; then
+        expected_source="$ledger_source"
+      else
+        expected_source="$zkir_source"
+      fi
       ;;
     midnight-compact-runtime)
       expected_source="$compact_source"
@@ -42,130 +59,88 @@ while IFS=$'\t' read -r package source path; do
     midnight-did-domain|midnight-did-jubjub-schnorr|midnight-did-runtime)
       expected_source="$identity_source"
       ;;
-    midnight-circuits|midnight-zk-stdlib|midnight-curves)
-      expected_source="git+https://github.com/midnightntwrk/midnight-zk.git?rev="
-      ;;
     *)
       continue
       ;;
   esac
-
-  if [ -n "$path" ]; then
+  if [ "$path" != "-" ]; then
     echo "$package must not use a local path dependency ($path)." >&2
     exit 1
   fi
-
-  if [[ "$source" != "$expected_source" ]]; then
+  if [ "$source" != "$expected_source" ]; then
     echo "$package must use the reviewed immutable source $expected_source." >&2
     exit 1
   fi
-
   revision="${source#*?rev=}"
-  revision="${revision%%#*}"
   revision="${revision%%&*}"
   if [[ ! "$revision" =~ ^[0-9a-f]{40}$ ]]; then
-    echo "$package must pin a full 40-character Git commit in 'rev' (found '$revision')." >&2
+    echo "$package must pin a full 40-character Git commit (found '$revision')." >&2
+    exit 1
+  fi
+  if [ "$package" = midnight-ledger-v9 ] && [ "$rename" != midnight-ledger ]; then
+    echo "midnight-ledger-v9 must remain exposed through the midnight-ledger workspace alias." >&2
     exit 1
   fi
 done < <(
   jq -r '
     [.workspace_members[] as $member | .packages[] | select(.id == $member) | .dependencies[]]
     | .[]
-    | select(.name as $name | [
-        "midnight-ledger",
-        "midnight-zswap",
-        "midnight-zkir",
-        "midnight-onchain-runtime",
-        "midnight-serialize",
-        "midnight-base-crypto",
-        "midnight-coin-structure",
-        "midnight-onchain-state",
-        "midnight-storage",
-        "midnight-transient-crypto",
-        "midnight-proof-server",
-        "midnight-proofs",
-        "midnight-compact-runtime",
-        "midnight-did-domain",
-        "midnight-did-jubjub-schnorr",
-        "midnight-did-runtime",
-        "midnight-circuits",
-        "midnight-zk-stdlib",
-        "midnight-curves"
-      ] | index($name))
-    | [.name, (.source // ""), (.path // "")]
+    | select(.name | startswith("midnight-"))
+    | [.name, (.rename // "-"), (.source // "-"), (.path // "-")]
     | @tsv
   ' "$metadata_file"
 )
 
-ledger_graph_count="$(jq -r --arg source "$ledger_source" '
-  [.packages[]
-   | select(.name | test("^midnight-(ledger(?:-static)?|zswap|zkir|onchain-.+|storage.*|serialize.*|transient-crypto|base-crypto(?:-derive)?|coin-structure)$"))
-   | select(.source | startswith($source))]
-  | length
-' "$metadata_file")"
-if [ "$ledger_graph_count" = "0" ]; then
-  echo "The locked graph contains no packages from the reviewed Ledger8 source." >&2
-  exit 1
-fi
-
-unexpected_ledger_sources="$(jq -r --arg source "$ledger_source" '
+# Check every Git-backed Midnight package, including transitive packages, so a
+# second repository or revision cannot enter through an indirect dependency.
+while IFS=$'\t' read -r package version source; do
+  [ -n "$package" ] || continue
+  admitted=false
+  for reviewed in "${reviewed_sources[@]}"; do
+    if [[ "$source" == "$reviewed"#* ]]; then
+      admitted=true
+      break
+    fi
+  done
+  if [ "$admitted" != true ]; then
+    echo "$package $version uses unreviewed Midnight Git source $source." >&2
+    exit 1
+  fi
+done < <(jq -r '
   .packages[]
-  | select(.name | test("^midnight-(ledger(?:-static)?|zswap|zkir|onchain-.+|storage.*|serialize.*|transient-crypto|base-crypto(?:-derive)?|coin-structure)$"))
-  | select((.source | startswith($source)) | not)
-  | "\(.name) \(.version) \(.source // "path")"
-' "$metadata_file")"
-if [ -n "$unexpected_ledger_sources" ]; then
-  echo "Locked Ledger-family packages must all resolve from $ledger_source:" >&2
-  echo "$unexpected_ledger_sources" >&2
-  exit 1
-fi
+  | select((.name | startswith("midnight-")) and ((.source // "") | startswith("git+")))
+  | [.name, .version, .source] | @tsv
+' "$metadata_file")
 
-duplicate_ledger_packages="$(jq -r '
-  [.packages[]
-   | select(.name | test("^midnight-(ledger(?:-static)?|zswap|zkir|onchain-.+|storage.*|serialize.*|transient-crypto|base-crypto(?:-derive)?|coin-structure)$"))]
-  | group_by(.name)
-  | .[]
-  | select(length > 1)
-  | map("\(.name) \(.version) \(.source // "path")")
-  | join("; ")
-' "$metadata_file")"
-if [ -n "$duplicate_ledger_packages" ]; then
-  echo "Locked graph contains duplicate Ledger-family packages: $duplicate_ledger_packages" >&2
-  exit 1
-fi
+for legacy_revision in \
+  8655615e7c4cbf3a1187b3203bf72e69dc09b8dc \
+  32e314770da10cc62dab30dcfeb340ec4c6bcb64 \
+  532629b044a88473a7175f4a96c2511c91156136 \
+  fcf3c51cb9368a3e7574f06f82434f92386d0a2b; do
+  if jq -e --arg revision "$legacy_revision" '
+    any(.packages[]; (.source // "") | contains($revision))
+  ' "$metadata_file" >/dev/null; then
+    echo "Ledger 8 source $legacy_revision remains in the selected production graph." >&2
+    exit 1
+  fi
+done
 
-if ! jq -e --arg source "$proofs_source" '
-  [.packages[] | select(.name == "midnight-proofs" and (.source | startswith($source)))]
-  | length == 1
+if ! jq -e --arg ledger "$ledger_source" '
+  ([.packages[] | select(.name == "midnight-ledger-v9" and (.version == "1.0.2") and (.source | startswith($ledger)))] | length == 1)
+  and ([.packages[] | select(.name == "midnight-zswap" and (.version == "9.0.1") and (.source | startswith($ledger)))] | length == 1)
 ' "$metadata_file" >/dev/null; then
-  echo "midnight-proofs must resolve once from the exact patch declared by the selected Ledger8 workspace." >&2
+  echo "Ledger 9 and Zswap packages do not match the reviewed cohort." >&2
   exit 1
 fi
 
 if ! jq -e --arg compact "$compact_source" --arg identity "$identity_source" '
-  ([.packages[]
-    | select(.name == "midnight-compact-runtime")
-    | select(.source | startswith($compact))] | length == 1)
-  and
-  ([.packages[]
-    | select(.name | test("^midnight-did-(domain|jubjub-schnorr|method|runtime)$"))]
-   | length > 0
-   and all(.source | startswith($identity)))
+  ([.packages[] | select(.name == "midnight-compact-runtime" and (.source | startswith($compact)))] | length == 1)
+  and ([.packages[] | select(.name | test("^midnight-did-(domain|jubjub-schnorr|method|runtime)$"))]
+       | length == 4 and all(.source | startswith($identity)))
 ' "$metadata_file" >/dev/null; then
-  echo "Compact runtime and Midnight DID packages must resolve once from their reviewed immutable sources." >&2
+  echo "Compact runtime and Midnight DID packages differ from the reviewed Ledger 9 sources." >&2
   exit 1
 fi
 
-if ! jq -e '
-  [.packages[] | select(.name == "midnight-ledger" or .name == "midnight-zswap")]
-  | all(.version == "8.2.0-rc.1")
-' "$metadata_file" >/dev/null; then
-  echo "Ledger9 is out of scope: midnight-ledger and midnight-zswap must remain on 8.2.0-rc.1." >&2
-  exit 1
-fi
-
-if [ "$dependency_count" = "0" ]; then
-  echo "Midnight Git source rules passed (no direct Midnight Cargo packages present)."
-else
-  echo "Midnight Git source rules passed for $dependency_count direct dependencies and $ledger_graph_count locked Ledger8 packages."
-fi
+git_midnight_count="$(jq '[.packages[] | select((.name | startswith("midnight-")) and ((.source // "") | startswith("git+")))] | length' "$metadata_file")"
+echo "Midnight Git source rules passed for $direct_count direct dependencies and $git_midnight_count reviewed Ledger 9 cohort packages."

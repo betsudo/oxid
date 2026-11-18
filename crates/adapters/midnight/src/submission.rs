@@ -13,14 +13,14 @@ use std::{
 };
 
 use futures::{SinkExt, StreamExt};
-use midnight_base_crypto::{schnorr::Signature, time::Timestamp};
+use midnight_base_crypto::time::Timestamp;
 use midnight_coin_structure::coin::TokenType;
 use midnight_ledger::{
     dust::{DustActions, DustLocalState, DustOutput, DustParameters, DustPublicKey, DustSecretKey},
     events::Event,
     structure::{
         Intent, LedgerParameters, ProofPreimageMarker, ProofPreimageVersioned, ProofVersioned,
-        StandardTransaction, Transaction,
+        Signature, StandardTransaction, Transaction,
     },
 };
 use midnight_onchain_runtime::cost_model::INITIAL_COST_MODEL;
@@ -32,7 +32,9 @@ use midnight_storage::{
 use midnight_transient_crypto::{
     commitment::PedersenRandomness,
     curve::Fr,
-    proofs::{Proof, ProofPreimage, ProvingKeyMaterial, ProvingProvider, WrappedIr},
+    proofs::{
+        KeyLocation, Proof, ProofPreimage, ProvingKeyMaterial, ProvingProvider, Resolver, WrappedIr,
+    },
 };
 use oxid_adapter_platform_system::{http_client_builder_for, websocket_connector_for};
 use oxid_platform_ports::ClockPort;
@@ -1423,6 +1425,22 @@ impl ProvingProvider for HttpDustProvingProvider {
 
     fn split(&mut self) -> Self {
         self.clone()
+    }
+
+    fn resolver(&self) -> &impl Resolver {
+        self
+    }
+}
+
+impl Resolver for HttpDustProvingProvider {
+    async fn resolve_key(&self, key: KeyLocation) -> io::Result<Option<ProvingKeyMaterial>> {
+        if Self::is_builtin_key(key.0.as_ref()) {
+            return Ok(None);
+        }
+        self.remote_proving_material
+            .as_ref()
+            .ok_or_else(|| io::Error::other("external proving material is unavailable"))?
+            .resolve_key(key.0.as_ref())
     }
 }
 

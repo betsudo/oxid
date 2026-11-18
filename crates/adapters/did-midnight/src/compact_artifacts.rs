@@ -20,7 +20,7 @@ use midnight_transient_crypto::proofs::ProvingKeyMaterial;
 
 const EXPECTED_SCHEMA: &str = "midnight-did-zk-artifacts";
 const EXPECTED_VERSION: &str = "0.5.0";
-const EXPECTED_GIT_SHA: &str = "a14267cec3c1ab7e00bb0f058a54267d913a321b";
+const EXPECTED_GIT_SHA: &str = "e50d606c8b9cd7573bbe29e0a2d69726dd3d2a6b";
 const MAX_MANIFEST_BYTES: u64 = 256 * 1024;
 const MAX_VERIFIER_KEY_BYTES: u64 = 16 * 1024 * 1024;
 const MAX_PROVER_KEY_BYTES: u64 = 16 * 1024 * 1024;

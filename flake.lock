@@ -1,5 +1,24 @@
 {
   "nodes": {
+    "fenix": {
+      "inputs": {
+        "nixpkgs": "nixpkgs_2",
+        "rust-analyzer-src": "rust-analyzer-src"
+      },
+      "locked": {
+        "lastModified": 1788433075,
+        "narHash": "sha256-8j/0mNhbRbJQ7KyGxtS3vEeNhT5cK8NEM2ZQr03uOrU=",
+        "owner": "nix-community",
+        "repo": "fenix",
+        "rev": "c957e2d0e505ad7be04c7f2f2f3d7885fb9e242c",
+        "type": "github"
+      },
+      "original": {
+        "owner": "nix-community",
+        "repo": "fenix",
+        "type": "github"
+      }
+    },
     "flake-parts": {
       "inputs": {
         "nixpkgs-lib": "nixpkgs-lib"
@@ -36,6 +55,24 @@
         "type": "github"
       }
     },
+    "inclusive": {
+      "inputs": {
+        "stdlib": "stdlib"
+      },
+      "locked": {
+        "lastModified": 1628098927,
+        "narHash": "sha256-Ft4sdf7VPL8MQtu18AAPiN2s5pUsbv+3RxqzJSa/yzg=",
+        "owner": "input-output-hk",
+        "repo": "nix-inclusive",
+        "rev": "13123eb7a8c3359738a4756b8d645729e8655b27",
+        "type": "github"
+      },
+      "original": {
+        "owner": "input-output-hk",
+        "repo": "nix-inclusive",
+        "type": "github"
+      }
+    },
     "midnight-did-toolchain": {
       "inputs": {
         "flake-parts": "flake-parts_2",
@@ -56,6 +93,23 @@
         "type": "github"
       }
     },
+    "midnight-identity-ledger9": {
+      "flake": false,
+      "locked": {
+        "lastModified": 1794990465,
+        "narHash": "sha256-EClXcL4MpyDjYcEt6nEaNINJJNan+Nr15NOGk3xaooY=",
+        "owner": "betsudo",
+        "repo": "midnight-identity",
+        "rev": "e50d606c8b9cd7573bbe29e0a2d69726dd3d2a6b",
+        "type": "github"
+      },
+      "original": {
+        "owner": "betsudo",
+        "repo": "midnight-identity",
+        "rev": "e50d606c8b9cd7573bbe29e0a2d69726dd3d2a6b",
+        "type": "github"
+      }
+    },
     "midnight-verifiable-credentials": {
       "flake": false,
       "locked": {
@@ -70,6 +124,28 @@
         "owner": "midnightntwrk",
         "repo": "midnight-verifiable-credentials",
         "rev": "39b1354212620b396e914b29603e6a38f2656546",
+        "type": "github"
+      }
+    },
+    "midnight-zkir-ledger9": {
+      "inputs": {
+        "fenix": "fenix",
+        "inclusive": "inclusive",
+        "nixpkgs": "nixpkgs_3",
+        "utils": "utils"
+      },
+      "locked": {
+        "lastModified": 1794951108,
+        "narHash": "sha256-GtULoNDWGXjgIf9Vh8C4OXKlRLwm37lDQ+f0DAay/9c=",
+        "owner": "betsudo",
+        "repo": "midnight-zkir",
+        "rev": "3377ad9e48741f60e0aa17010b6f23e34223d906",
+        "type": "github"
+      },
+      "original": {
+        "owner": "betsudo",
+        "repo": "midnight-zkir",
+        "rev": "3377ad9e48741f60e0aa17010b6f23e34223d906",
         "type": "github"
       }
     },
@@ -121,6 +197,38 @@
     },
     "nixpkgs_2": {
       "locked": {
+        "lastModified": 1788316716,
+        "narHash": "sha256-bc7rSpXIdn9QWGNqfWcPZWOhEVF8NoeAZkWq0XWnf/k=",
+        "owner": "nixos",
+        "repo": "nixpkgs",
+        "rev": "3ed67ec0a4d3c7ab4ae1f04f8ee8df07bfa506a2",
+        "type": "github"
+      },
+      "original": {
+        "owner": "nixos",
+        "ref": "nixos-unstable",
+        "repo": "nixpkgs",
+        "type": "github"
+      }
+    },
+    "nixpkgs_3": {
+      "locked": {
+        "lastModified": 1788372231,
+        "narHash": "sha256-7aqErvrAEz/5OcPA5p3M+tVOqeYc4oJXkNIPXfCqxAw=",
+        "owner": "NixOS",
+        "repo": "nixpkgs",
+        "rev": "9387b3fcc0c23c86661636da63faabad4235a0a6",
+        "type": "github"
+      },
+      "original": {
+        "owner": "NixOS",
+        "ref": "nixpkgs-unstable",
+        "repo": "nixpkgs",
+        "type": "github"
+      }
+    },
+    "nixpkgs_4": {
+      "locked": {
         "lastModified": 1789006805,
         "narHash": "sha256-xB8mKMOx1IA9vTDNLmJZ6n4wCMq/cuWBBOzGCRnqxrU=",
         "owner": "NixOS",
@@ -139,8 +247,75 @@
       "inputs": {
         "flake-parts": "flake-parts",
         "midnight-did-toolchain": "midnight-did-toolchain",
+        "midnight-identity-ledger9": "midnight-identity-ledger9",
         "midnight-verifiable-credentials": "midnight-verifiable-credentials",
-        "nixpkgs": "nixpkgs_2"
+        "midnight-zkir-ledger9": "midnight-zkir-ledger9",
+        "nixpkgs": "nixpkgs_4"
+      }
+    },
+    "rust-analyzer-src": {
+      "flake": false,
+      "locked": {
+        "lastModified": 1788394718,
+        "narHash": "sha256-Dyr++cx/ODeP4T4PdaaW7gX8TH9IQs7kScZdi9aMn2s=",
+        "owner": "rust-lang",
+        "repo": "rust-analyzer",
+        "rev": "bf25c45e974ab01bf46bc9fdca0f8b2fde66ae27",
+        "type": "github"
+      },
+      "original": {
+        "owner": "rust-lang",
+        "ref": "nightly",
+        "repo": "rust-analyzer",
+        "type": "github"
+      }
+    },
+    "stdlib": {
+      "locked": {
+        "lastModified": 1590026685,
+        "narHash": "sha256-E5INrVvYX/P/UpcoUFDAsuHem+lsqT+/teBs9O7oc9Q=",
+        "owner": "manveru",
+        "repo": "nix-lib",
+        "rev": "99088cf7febcdb21afd375a335dcafa959bef3ed",
+        "type": "github"
+      },
+      "original": {
+        "owner": "manveru",
+        "repo": "nix-lib",
+        "type": "github"
+      }
+    },
+    "systems": {
+      "locked": {
+        "lastModified": 1681028828,
+        "narHash": "sha256-Vy1rq5AaRuLzOxct8nz4T6wlgyUR7zLU309k9mBC768=",
+        "owner": "nix-systems",
+        "repo": "default",
+        "rev": "da67096a3b9bf56a91d16901293e51ba5b49a27e",
+        "type": "github"
+      },
+      "original": {
+        "owner": "nix-systems",
+        "repo": "default",
+        "type": "github"
+      }
+    },
+    "utils": {
+      "inputs": {
+        "systems": "systems"
+      },
+      "locked": {
+        "lastModified": 1731533236,
+        "narHash": "sha256-l0KFg5HjrsfsO/JpG+r7fRrqm12kzFHyUHqHCVpMMbI=",
+        "owner": "numtide",
+        "repo": "flake-utils",
+        "rev": "11707dc2f618dd54ca8739b309ec4fc024de578b",
+        "type": "github"
+      },
+      "original": {
+        "owner": "numtide",
+        "repo": "flake-utils",
+        "type": "github"
       }
     }
   },

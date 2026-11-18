@@ -14,7 +14,7 @@ use midnight_base_crypto::{hash::HashOutput, time::Timestamp};
 use midnight_coin_structure::contract::ContractAddress;
 use midnight_ledger::structure::{
     ContractOperationVersionedVerifierKey, Intent, MaintenanceUpdate, ProofPreimageMarker,
-    SingleUpdate, StandardTransaction, Transaction,
+    Signature, SingleUpdate, StandardTransaction, Transaction,
 };
 use midnight_onchain_state::state::EntryPointBuf;
 use midnight_serialize::tagged_deserialize;
@@ -40,12 +40,7 @@ const MAX_TRANSACTION_BYTES: usize = 32 * 1024 * 1024;
 const MAINTENANCE_SIGNATURE_DOMAIN: &[u8] = b"oxid:did-maintenance:schnorr-rng:v1";
 const MAINTENANCE_INTENT_DOMAIN: &[u8] = b"oxid:did-maintenance:intent-rng:v1";
 
-type LedgerTransaction = Transaction<
-    midnight_base_crypto::schnorr::Signature,
-    ProofPreimageMarker,
-    PedersenRandomness,
-    DefaultDB,
->;
+type LedgerTransaction = Transaction<Signature, ProofPreimageMarker, PedersenRandomness, DefaultDB>;
 
 #[derive(Clone, PartialEq, Eq)]
 pub struct NativeMidnightDidMaintenanceRequest {
@@ -195,7 +190,7 @@ impl NativeMidnightDidMaintenanceComposer {
 
         let single = SingleUpdate::VerifierKeyInsert(
             EntryPointBuf(request.entry_point.as_bytes().to_vec()),
-            ContractOperationVersionedVerifierKey::V3(verifier_key),
+            ContractOperationVersionedVerifierKey::V4(verifier_key),
         );
         let address = ContractAddress(HashOutput(request.contract_address));
         let update: MaintenanceUpdate<DefaultDB> =
@@ -220,11 +215,10 @@ impl NativeMidnightDidMaintenanceComposer {
         self.custody
             .use_derived_secret(&request.profile_id, &path, &mut |secret| {
                 let signing_key = maintenance_signing_key(secret)?;
-                signed = Some(
-                    update
-                        .clone()
-                        .add_signature(0, signing_key.sign(&mut signing_rng, &payload)),
-                );
+                signed = Some(update.clone().add_signature(
+                    0,
+                    Signature::Schnorr(signing_key.sign(&mut signing_rng, &payload)),
+                ));
                 Ok(())
             })
             .map_err(map_security_error)?;

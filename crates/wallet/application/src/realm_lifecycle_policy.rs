@@ -387,7 +387,13 @@ impl WalletRealmLifecyclePolicy {
         }
         self.request(
             identity,
-            WalletRealmReconciliationTrigger::ManualRefresh,
+            // Automatic foreground/periodic reconciliation observes
+            // adapter-owned workers and repairs stale or missing facets. It
+            // must not carry manual-refresh semantics: that trigger is
+            // intentionally allowed to restart already-current facets and
+            // would therefore keep a fast worker in an endless
+            // Current -> Updating loop.
+            WalletRealmReconciliationTrigger::Initial,
             now_millis,
         )
     }
@@ -432,7 +438,7 @@ impl WalletRealmLifecyclePolicy {
     }
 
     fn observe_freshness(&mut self, now_millis: u64, facets: WalletRealmReconciliationState) {
-        if !is_stale(facets) {
+        if !requires_reconciliation(facets) {
             self.last_fresh_millis = Some(now_millis);
         }
     }
@@ -448,7 +454,7 @@ impl WalletRealmLifecyclePolicy {
         now_millis: u64,
         facets: WalletRealmReconciliationState,
     ) -> bool {
-        is_stale(facets)
+        requires_reconciliation(facets)
             || self
                 .last_fresh_millis
                 .is_none_or(|last| now_millis.saturating_sub(last) >= config.stale_age_millis)
@@ -487,13 +493,15 @@ impl WalletRealmLifecyclePolicy {
     }
 }
 
-fn is_stale(facets: WalletRealmReconciliationState) -> bool {
+fn requires_reconciliation(facets: WalletRealmReconciliationState) -> bool {
     [facets.account, facets.dust, facets.shielded]
         .into_iter()
         .any(|facet| {
             matches!(
                 facet,
-                WalletRealmFacetState::Stale | WalletRealmFacetState::Missing
+                WalletRealmFacetState::Stale
+                    | WalletRealmFacetState::Missing
+                    | WalletRealmFacetState::Updating
             )
         })
 }
@@ -630,6 +638,62 @@ mod tests {
                 },
             ),
             WalletRealmLifecycleDecision::Request(_)
+        ));
+    }
+
+    #[test]
+    fn adapter_owned_updates_are_observed_after_debounce_not_stale_age() {
+        let config =
+            WalletRealmLifecyclePolicyConfig::new(10, 30_000, 1, 10, 2, 0).expect("valid bounds");
+        let mut policy = WalletRealmLifecyclePolicy::default();
+        let active = identity("undeployed");
+        let _ = policy.reduce(
+            config,
+            WalletRealmLifecycleInput::Initialized {
+                identity: active.clone(),
+                now_millis: 0,
+                facets: stale(),
+            },
+        );
+        let updating = WalletRealmReconciliationState {
+            account: WalletRealmFacetState::Current,
+            dust: WalletRealmFacetState::Updating,
+            shielded: WalletRealmFacetState::Updating,
+        };
+        let _ = policy.reduce(
+            config,
+            WalletRealmLifecycleInput::ReconciliationFinished {
+                identity: active,
+                sequence: 1,
+                now_millis: 1,
+                facets: updating,
+                succeeded: true,
+            },
+        );
+
+        assert_eq!(policy.next_wakeup_millis(config), Some(10));
+        assert_eq!(
+            policy.reduce(
+                config,
+                WalletRealmLifecycleInput::PeriodicTick {
+                    now_millis: 9,
+                    facets: updating,
+                },
+            ),
+            WalletRealmLifecycleDecision::Ignored
+        );
+        assert!(matches!(
+            policy.reduce(
+                config,
+                WalletRealmLifecycleInput::PeriodicTick {
+                    now_millis: 10,
+                    facets: updating,
+                },
+            ),
+            WalletRealmLifecycleDecision::Request(WalletRealmLifecycleRequest {
+                trigger: WalletRealmReconciliationTrigger::Initial,
+                ..
+            })
         ));
     }
 

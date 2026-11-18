@@ -3,38 +3,52 @@ import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
 import test from "node:test";
 
-import {
-  auditCompatibility,
-  validatePortalDidPackages,
-} from "../../scripts/check-midnight-integration-compatibility.mjs";
+import { auditCompatibility } from "../../scripts/check-midnight-integration-compatibility.mjs";
 
-test("reviewed wallet, native DID runtime, Standalone, and Portal pins are explicit", () => {
+test("reviewed Ledger 9 wallet, native identity, shared stack, and Portal pins are explicit", () => {
   const result = auditCompatibility();
   assert.equal(result.state, "compatible");
-  assert.equal(result.contractRelease, "0.4.0");
+  assert.equal(result.ledgerFamily, "ledger9");
+  assert.equal(result.contractRelease, "0.5.0");
   assert.equal(result.demoReady, false, "native composition must not masquerade as qualified Portal readiness");
   assert.match(result.manifestSha256, /^[0-9a-f]{64}$/u);
 });
 
-test("a deliberate Portal DID package mismatch fails closed", () => {
-  const dependencies = Object.fromEntries([
-    "midnight-did",
-    "midnight-did-api",
-    "midnight-did-contract",
-    "midnight-did-domain",
-    "midnight-did-jubjub-schnorr",
-  ].map((name) => [`@midnight-ntwrk/${name}`, "0.5.0"]));
+test("a runtime compatibility-schema override cannot bypass the reviewed manifest", () => {
   assert.throws(
-    () => validatePortalDidPackages({ dependencies }, "0.4.0"),
-    /differs from the reviewed DID release/u,
+    () => auditCompatibility({ environment: { OXID_MIDNIGHT_COMPATIBILITY_SCHEMA: "legacy" } }),
+    /runtime compatibility schema override differs/u,
   );
 });
 
-test("a runtime proof-server override cannot bypass the reviewed image pin", () => {
-  assert.throws(
-    () => auditCompatibility({ environment: { PROOF_SERVER_IMAGE: "example.invalid/proof:drifted" } }),
-    /proof-server image override differs/u,
+test("the shared-stack attach preflight is read-only and manifest-driven", async () => {
+  const attach = await readFile(new URL("../../scripts/midnight-attach.sh", import.meta.url), "utf8");
+  assert.match(attach, /config\/midnight-integration-compatibility\.json/u);
+  assert.match(attach, /chain_getBlockHash/u);
+  assert.match(attach, /node and indexer disagree/u);
+  assert.doesNotMatch(attach, /docker compose|\bup -d\b|\bdown\b/u);
+});
+
+test("Nix consumes the same immutable Ledger 9 identity and validates ZKIR compatibility", async () => {
+  const flake = await readFile(new URL("../../flake.nix", import.meta.url), "utf8");
+  const manifest = JSON.parse(await readFile(
+    new URL("../../config/midnight-integration-compatibility.json", import.meta.url),
+    "utf8",
+  ));
+  assert.match(
+    flake,
+    new RegExp(`github:betsudo/midnight-identity/${manifest.wallet.nativeIdentity.revision}`, "u"),
   );
+
+  const derivation = await readFile(
+    new URL("../../nix/packages/midnight-did-ledger9-zkir.nix", import.meta.url),
+    "utf8",
+  );
+  assert.match(derivation, /rust-compatibility\.json/u);
+  assert.match(derivation, /\.compatibility\.ledger_version/u);
+  assert.match(derivation, /\.compatibility\.runtime_abi/u);
+  assert.match(derivation, /\.compatibility\.ir_schema/u);
+  assert.doesNotMatch(derivation, /fetchurl|midnight-did\/releases/u);
 });
 
 test("cleanup remains receipt-owned when compatibility inputs change", async () => {

@@ -12,11 +12,13 @@ use std::{
     thread,
 };
 
-use midnight_base_crypto::{hash::HashOutput, schnorr::Signature};
+use midnight_base_crypto::hash::HashOutput;
 use midnight_coin_structure::coin::{
     Info as CoinInfo, Nonce as CoinNonce, PublicKey as CoinPublicKey, ShieldedTokenType,
 };
-use midnight_ledger::structure::{ProofPreimageMarker, StandardTransaction, Transaction};
+use midnight_ledger::structure::{
+    ProofPreimageMarker, Signature, StandardTransaction, Transaction,
+};
 use midnight_storage::{DefaultDB, storage::HashMap as LedgerHashMap};
 use midnight_transient_crypto::{
     commitment::PedersenRandomness, encryption::PublicKey as EncryptionPublicKey,

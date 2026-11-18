@@ -117,6 +117,9 @@ impl DidDeploymentContextSource for ReadyContextSource {
             Ok(MidnightDidCallContext {
                 contract_state: vec![1],
                 contract_address: [2; 32],
+                observation_transaction_hash: [7; 32],
+                observation_block_hash: [8; 32],
+                observation_block_height: 1,
                 zswap_chain_state: Some(vec![3]),
                 ledger_parameters: Some(vec![4]),
                 network_id: "undeployed".to_owned(),

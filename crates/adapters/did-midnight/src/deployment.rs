@@ -7,20 +7,18 @@
 //! remain owned by `oxid-adapter-midnight`. Controller and maintenance secrets
 //! are borrowed only inside the custody callback and never cross this adapter.
 
-use std::{
-    fmt,
-    sync::{Arc, Mutex},
-};
+use std::{fmt, sync::Arc};
 
-use midnight_base_crypto::{hash::HashOutput, signatures::VerifyingKey, time::Timestamp};
-use midnight_compact_runtime::{ContractAddress, Fr, WitnessContext};
+use midnight_base_crypto::{schnorr::VerifyingKey, time::Timestamp};
+use midnight_compact_runtime as runtime;
 use midnight_did_jubjub_schnorr::derive_public_key_from_seed;
-use midnight_did_runtime::{
-    BackendError, DidAuthorizationSigner, DidPrivateStateStore, GeneratedDidExecutor,
-    LedgerDeploymentConfig,
+use midnight_did_runtime::ledger_contract;
+use midnight_ledger::structure::{
+    ContractDeploy, Intent, ProofPreimageMarker, Signature, StandardTransaction, Transaction,
 };
-use midnight_ledger::structure::{Intent, ProofPreimageMarker, StandardTransaction, Transaction};
-use midnight_onchain_state::state::ContractMaintenanceAuthority;
+use midnight_onchain_state::state::{
+    ContractMaintenanceAuthority, ContractMaintenanceVerifyingKey, ContractState,
+};
 use midnight_storage::{DefaultDB, storage::HashMap as LedgerHashMap};
 use midnight_transient_crypto::{commitment::PedersenRandomness, curve::EmbeddedGroupAffine};
 use oxid_identity_application::DidLifecyclePortError;
@@ -42,12 +40,7 @@ const MAX_TRANSACTION_BYTES: usize = 16 * 1024 * 1024;
 const DEPLOY_NONCE_DOMAIN: &[u8] = b"oxid:did-deploy:contract-nonce:v1";
 const DEPLOY_INTENT_DOMAIN: &[u8] = b"oxid:did-deploy:intent-rng:v1";
 
-type LedgerTransaction = Transaction<
-    midnight_base_crypto::schnorr::Signature,
-    ProofPreimageMarker,
-    PedersenRandomness,
-    DefaultDB,
->;
+type LedgerTransaction = Transaction<Signature, ProofPreimageMarker, PedersenRandomness, DefaultDB>;
 
 /// Stable inputs that must be journaled before a deployment is submitted.
 ///
@@ -276,22 +269,22 @@ fn compose_with_protected_randomness(
         recovery_public_key,
         timestamp_millis: request.created_at_millis,
     };
-    let executor = GeneratedDidExecutor::new(
-        NativeDidWitnesses,
-        Arc::new(NativeDidPrivateStateStore(Mutex::new(private_state))),
-        Arc::new(ConstructorOnlySigner),
-        ContractAddress::default(),
-    );
-    let deployment = executor.deployment_request().map_err(map_backend_error)?;
-    let deploy = deployment.to_contract_deploy(LedgerDeploymentConfig {
-        operations: LedgerHashMap::new(),
-        maintenance_authority: ContractMaintenanceAuthority {
+    let initial = ledger_contract::initial_state(
+        runtime::context::ConstructorContext::new(private_state),
+        &NativeDidWitnesses,
+    )
+    .map_err(|_| DidLifecyclePortError::InvalidOperation)?;
+    let contract = ContractState::new(
+        initial.ledger_state.get_ref().clone(),
+        LedgerHashMap::new(),
+        ContractMaintenanceAuthority {
             threshold: 1,
-            committee: vec![maintenance_key],
+            committee: vec![ContractMaintenanceVerifyingKey::Schnorr(maintenance_key)],
             counter: 0,
         },
-        nonce: HashOutput(*nonce),
-    });
+    );
+    let mut deploy_rng = ProtectedDeterministicRng::new(nonce);
+    let deploy = ContractDeploy::new(&mut deploy_rng, contract);
     let address = deploy.address().0.0;
     let did = MidnightDid::parse(format!(
         "did:midnight:{}:{}",
@@ -339,90 +332,80 @@ struct NativeDidPrivateState {
 #[derive(Clone, Copy)]
 struct NativeDidWitnesses;
 
-impl midnight_did_runtime::contract::Witnesses<NativeDidPrivateState> for NativeDidWitnesses {
-    fn get_schnorr_reduction<'a>(
+impl ledger_contract::Witnesses<NativeDidPrivateState> for NativeDidWitnesses {
+    fn getSchnorrReduction(
         &self,
-        _: &WitnessContext<midnight_did_runtime::contract::Ledger<'a>, NativeDidPrivateState>,
-        _: Fr,
-    ) -> (NativeDidPrivateState, (u8, u128)) {
-        unreachable!("unreachable for the pinned Ledger8 DID Compact output")
+        context: runtime::context::WitnessContext<
+            '_,
+            NativeDidPrivateState,
+            ledger_contract::LedgerView<'_>,
+        >,
+        challenge_hash: runtime::Field,
+    ) -> (
+        NativeDidPrivateState,
+        (
+            runtime::BoundedUint<127>,
+            runtime::WideUint<
+                1329227995784915872903807060280344575u128,
+                340282366920938463463374607431768211455u128,
+            >,
+        ),
+    ) {
+        let mut bytes = challenge_hash.as_le_bytes();
+        bytes.resize(32, 0);
+        let quotient = runtime::BoundedUint::new(bytes[31] as u128)
+            .expect("field quotient fits the generated bound");
+        bytes[31] = 0;
+        let remainder = runtime::WideUint::from_le_bytes(&bytes)
+            .expect("field remainder fits the generated bound");
+        (context.private_state.clone(), (quotient, remainder))
     }
 
-    fn local_controller_public_key<'a>(
+    fn localControllerPublicKey(
         &self,
-        context: &WitnessContext<midnight_did_runtime::contract::Ledger<'a>, NativeDidPrivateState>,
-    ) -> (NativeDidPrivateState, EmbeddedGroupAffine) {
+        context: runtime::context::WitnessContext<
+            '_,
+            NativeDidPrivateState,
+            ledger_contract::LedgerView<'_>,
+        >,
+    ) -> (NativeDidPrivateState, runtime::JubjubPoint) {
         (
             context.private_state.clone(),
-            context.private_state.controller_public_key,
+            context.private_state.controller_public_key.into(),
         )
     }
 
-    fn local_recovery_authority_public_key<'a>(
+    fn localRecoveryAuthorityPublicKey(
         &self,
-        context: &WitnessContext<midnight_did_runtime::contract::Ledger<'a>, NativeDidPrivateState>,
-    ) -> (NativeDidPrivateState, EmbeddedGroupAffine) {
+        context: runtime::context::WitnessContext<
+            '_,
+            NativeDidPrivateState,
+            ledger_contract::LedgerView<'_>,
+        >,
+    ) -> (NativeDidPrivateState, runtime::JubjubPoint) {
         (
             context.private_state.clone(),
-            context.private_state.recovery_public_key,
+            context.private_state.recovery_public_key.into(),
         )
     }
 
-    fn current_timestamp<'a>(
+    fn currentTimestamp(
         &self,
-        context: &WitnessContext<midnight_did_runtime::contract::Ledger<'a>, NativeDidPrivateState>,
-    ) -> (NativeDidPrivateState, u64) {
+        context: runtime::context::WitnessContext<
+            '_,
+            NativeDidPrivateState,
+            ledger_contract::LedgerView<'_>,
+        >,
+    ) -> (
+        NativeDidPrivateState,
+        runtime::BoundedUint<18446744073709551615>,
+    ) {
         (
             context.private_state.clone(),
-            context.private_state.timestamp_millis,
+            runtime::BoundedUint::new(context.private_state.timestamp_millis as u128)
+                .expect("u64 timestamp fits the generated bound"),
         )
     }
-}
-
-struct NativeDidPrivateStateStore(Mutex<NativeDidPrivateState>);
-
-impl DidPrivateStateStore<NativeDidPrivateState> for NativeDidPrivateStateStore {
-    fn load(&self) -> Result<NativeDidPrivateState, BackendError> {
-        self.0
-            .lock()
-            .map(|state| state.clone())
-            .map_err(|_| BackendError::Other("DID private-state lock poisoned".to_owned()))
-    }
-
-    fn store(&self, state: NativeDidPrivateState) -> Result<(), BackendError> {
-        *self
-            .0
-            .lock()
-            .map_err(|_| BackendError::Other("DID private-state lock poisoned".to_owned()))? =
-            state;
-        Ok(())
-    }
-}
-
-struct ConstructorOnlySigner;
-
-impl DidAuthorizationSigner for ConstructorOnlySigner {
-    fn sign_controller(
-        &self,
-        _: [Fr; 4],
-    ) -> Result<midnight_compact_runtime::SchnorrSignature, BackendError> {
-        Err(BackendError::Other(
-            "constructor must not request controller authorization".to_owned(),
-        ))
-    }
-
-    fn sign_recovery(
-        &self,
-        _: [Fr; 4],
-    ) -> Result<midnight_compact_runtime::SchnorrSignature, BackendError> {
-        Err(BackendError::Other(
-            "constructor must not request recovery authorization".to_owned(),
-        ))
-    }
-}
-
-fn map_backend_error(_: BackendError) -> DidLifecyclePortError {
-    DidLifecyclePortError::InvalidOperation
 }
 
 const fn map_security_error(error: WalletSecurityPortError) -> DidLifecyclePortError {
