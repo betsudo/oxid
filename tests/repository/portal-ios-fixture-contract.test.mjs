@@ -16,6 +16,10 @@ test("Portal iOS holder preparation follows the current DID detail contract", as
   ]);
 
   assert.match(fixture, /buttons\["Copy DID"\]/u);
+  assert.doesNotMatch(fixture, /buttons\["Use public demo wallet"\]/u);
+  assert.match(fixture, /WalletOnboardingFixture\.completeDevelopmentRecoveryCeremony/u);
+  assert.match(fixture, /requestFixedGrant\(for: address\)/u);
+  assert.match(fixture, /staticTexts\["Transfer confirmed"\]/u);
   assert.doesNotMatch(fixture, /staticTexts\["Identity"\]/u);
   assert.match(
     fixture,
@@ -29,8 +33,9 @@ test("Portal iOS holder preparation follows the current DID detail contract", as
     fixture,
     /buttons\["Leave credential review"\]\.waitForNonExistence/u,
   );
-  assert.doesNotMatch(fixture, /buttons\["Receive"\]\.waitForExistence/u);
+  assert.match(fixture, /application\.buttons\["Receive"\]/u);
   assert.match(dids, /aria_label: "Copy DID"/u);
+  assert.match(dids, /DID_REALM_PREFLIGHT_ATTEMPTS: usize = 360/u);
 });
 
 test("Portal acceptance uses only named development authority and bounded cleanup", async () => {

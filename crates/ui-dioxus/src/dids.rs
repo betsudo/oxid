@@ -2,7 +2,11 @@
 
 use super::*;
 
-const DID_REALM_PREFLIGHT_ATTEMPTS: usize = 90;
+// A freshly funded local wallet can require up to ten minutes before its NIGHT
+// grant produces spendable DUST. Keep the user action admitted once and let the
+// query-only observation loop cover that maturity window with a small finality
+// margin instead of turning normal chain progress into a retry prompt.
+const DID_REALM_PREFLIGHT_ATTEMPTS: usize = 360;
 const DID_REALM_PREFLIGHT_POLL_INTERVAL: Duration = Duration::from_secs(2);
 
 fn did_realm_prerequisites_ready(realm: &SelectedWalletRealmSyncView) -> bool {

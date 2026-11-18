@@ -85,23 +85,39 @@ final class PortalFlowTests: XCTestCase {
         }
         if createWallet.exists {
             createWallet.tap()
-            let publicDemo = application.buttons["Use public demo wallet"]
-            if !publicDemo.waitForExistence(timeout: 3), createWallet.exists {
-                createWallet.tap()
-            }
-            XCTAssertTrue(publicDemo.waitForExistence(timeout: 10))
-            publicDemo.tap()
             let createAndContinue = application.buttons["Create and continue"]
-            if !createAndContinue.waitForExistence(timeout: 3) {
-                createWallet.tap()
-            }
-            XCTAssertTrue(createAndContinue.waitForExistence(timeout: 7))
+            XCTAssertTrue(createAndContinue.waitForExistence(timeout: 10))
             createAndContinue.tap()
-            let enableProtection = application.buttons["Enable device protection"]
-            XCTAssertTrue(enableProtection.waitForExistence(timeout: 15))
-            enableProtection.tap()
+            WalletOnboardingFixture.completeDevelopmentRecoveryCeremony(
+                in: application,
+                timeout: 120
+            )
         }
         XCTAssertTrue(home.waitForExistence(timeout: 20))
+    }
+
+    private static func requestFixedGrant(for address: String) async throws {
+        var request = URLRequest(url: URL(string: "http://127.0.0.1:36301/fund")!)
+        request.httpMethod = "POST"
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.httpBody = try JSONSerialization.data(withJSONObject: [
+            "requestId": "ios-portal-\(UUID().uuidString.lowercased())",
+            "recipientAddress": address,
+        ])
+
+        let (data, response) = try await URLSession.shared.data(for: request)
+        let http = try XCTUnwrap(response as? HTTPURLResponse)
+        guard http.statusCode == 200 else {
+            throw NSError(
+                domain: "OxidUITests.PortalFaucet",
+                code: http.statusCode,
+                userInfo: [NSLocalizedDescriptionKey: String(decoding: data, as: UTF8.self)]
+            )
+        }
+        let body = try XCTUnwrap(
+            try JSONSerialization.jsonObject(with: data) as? [String: Any]
+        )
+        XCTAssertNotNil(body["result"], String(decoding: data, as: UTF8.self))
     }
 
     @MainActor
@@ -275,7 +291,7 @@ final class PortalFlowTests: XCTestCase {
     }
 
     @MainActor
-    func testPrepareHolder() {
+    func testPrepareHolder() async throws {
         let application = application()
         ensureProfile(in: application)
         application.buttons["Wallet"].tap()
@@ -285,6 +301,26 @@ final class PortalFlowTests: XCTestCase {
             activate.tap()
             XCTAssertTrue(application.buttons["Use my receive address"].waitForExistence(timeout: 45))
         }
+        XCTAssertTrue(application.buttons["Use my receive address"].waitForExistence(timeout: 45))
+        application.buttons["Home"].tap()
+        let receive = application.buttons["Receive"]
+        XCTAssertTrue(receive.waitForExistence(timeout: 10))
+        receive.tap()
+        XCTAssertTrue(application.staticTexts["Receive assets"].waitForExistence(timeout: 10))
+
+        let addressPrefix = "Full validated raw Unshielded receive address "
+        let addressElement = application.descendants(matching: .any)
+            .matching(NSPredicate(format: "label BEGINSWITH %@", addressPrefix))
+            .firstMatch
+        XCTAssertTrue(addressElement.waitForExistence(timeout: 15))
+        let address = String(addressElement.label.dropFirst(addressPrefix.count))
+        XCTAssertTrue(address.hasPrefix("mn_addr_undeployed1"))
+        try await Self.requestFixedGrant(for: address)
+        XCTAssertTrue(
+            application.staticTexts["Transfer confirmed"].waitForExistence(timeout: 180),
+            "The fresh Portal holder wallet did not observe its finalized NIGHT grant."
+        )
+        application.buttons["Close Receive"].firstMatch.tap()
         application.buttons["Documents"].tap()
         let manage = application.buttons["Manage identities"]
         XCTAssertTrue(manage.waitForExistence(timeout: 10))
@@ -299,7 +335,7 @@ final class PortalFlowTests: XCTestCase {
         scrollTo(confirmCreateDid, in: application)
         confirmCreateDid.tap()
         let copyDid = application.buttons["Copy DID"]
-        XCTAssertTrue(copyDid.waitForExistence(timeout: 600))
+        XCTAssertTrue(copyDid.waitForExistence(timeout: 1_500))
         XCTAssertTrue(application.staticTexts["Managed"].exists)
         XCTAssertTrue(application.staticTexts["Standalone development · Midnight network"].exists)
     }
