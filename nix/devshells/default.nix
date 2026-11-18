@@ -157,8 +157,6 @@
           export COMPACT_DIRECTORY=${midnightDidPackages.compact-toolchain}
           export OXID_MIDNIGHT_DID_ARTIFACTS_DIR=${self'.packages.midnight-did-compact-artifacts}
           export OXID_PRESENTATION_ARTIFACTS_DIR=${self'.packages.presentation-compact-artifacts}
-          export OXID_PASSPORT_VAULT_ARTIFACTS_DIR=${self'.packages.passport-vault-compact-artifacts}
-          export OXID_PASSPORT_VAULT_COMPOSER=${self'.packages.passport-vault-call-composer}/bin/oxid-passport-vault-call-composer
           # Keep only runtime state in the Git common directory. PI_CODING_AGENT_DIR
           # remains user-scoped because it owns authentication and user policy;
           # sessions and pi-subagents lifecycle state are checkout-scoped instead.

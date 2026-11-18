@@ -927,7 +927,7 @@ mod tests {
         assert_eq!(brand.name, "oxid");
         assert_eq!(brand.metadata.product_name, "Oxid");
         assert_eq!(brand.metadata.bundle_identifier, "io.medianox.oxid");
-        assert!(brand.metadata.show_vault_card);
+        assert!(!brand.metadata.show_vault_card);
         let css = render_brand_css(&brand);
         assert!(css.contains("--brand-dark-surface-0: #07090e;"));
         assert!(css.contains("--brand-dark-line: #1e293b;"));

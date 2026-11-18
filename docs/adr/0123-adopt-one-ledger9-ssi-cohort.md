@@ -67,6 +67,12 @@ qualification pass to avoid unnecessary host contention.
   source and ZKIR schema as Cargo.
 - The shared stack is an external capability with an explicit health contract,
   not a lifecycle owned by a worktree or demo script.
+- Passport Vault is temporarily excluded from the Oxid brand surface and the
+  default Nix package/dev-shell closure. Its Ledger8 composer is not a
+  prerequisite for OpenID4VCI credential issuance. The reviewed Rust sources
+  and historical tests remain in the repository so issue #1194 can restore the
+  feature only after its Compact artifacts and composer join this Ledger9
+  cohort.
 - VC and DigitalPassport reuse follows only after the DID provider and exact
   dependency graph are stable.
 - The previous Ledger 8 documentation remains as historical 0.2.0 evidence.

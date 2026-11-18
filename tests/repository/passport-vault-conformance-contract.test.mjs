@@ -40,21 +40,21 @@ test("external Passport Vault prerequisites are explicit ignored tests", async (
   }
 });
 
-test("Nix conformance command deliberately runs every ignored test", async () => {
-  const script = await read("scripts/test-passport-vault-conformance.sh");
+test("Passport Vault conformance is quarantined outside the active Ledger9 closure", async () => {
   const justfile = await read("Justfile");
+  const packages = await read("nix/packages/default.nix");
+  const devshell = await read("nix/devshells/default.nix");
+  const workflow = await read(".github/workflows/ci.yml");
 
-  assert.match(justfile, /passport-vault-conformance:\n\s+nix develop --command \.\/scripts\/test-passport-vault-conformance\.sh/u);
-  assert.match(script, /require_directory OXID_PASSPORT_VAULT_ARTIFACTS_DIR/u);
-  assert.match(script, /require_executable OXID_PASSPORT_VAULT_COMPOSER/u);
-  assert.equal((script.match(/-- --ignored --exact/gu) ?? []).length, 3);
-  for (const testName of [
-    "packaged_artifacts_authenticate_and_resolve_only_wallet_circuits_when_configured",
-    "packaged_composer_emits_a_rust_compatible_unproven_call_when_configured",
-    "standalone_managed_claim_composes_and_settles_through_the_native_stack",
+  for (const [name, source] of [
+    ["Justfile", justfile],
+    ["Nix package set", packages],
+    ["Nix development shell", devshell],
+    ["hosted CI", workflow],
   ]) {
-    assert.match(script, new RegExp(testName, "u"));
+    assert.doesNotMatch(source, /passport-vault-(?:compact-artifacts|call-composer)/u, name);
   }
+  assert.doesNotMatch(devshell, /OXID_PASSPORT_VAULT_(?:ARTIFACTS_DIR|COMPOSER)/u);
 });
 
 test("non-ignored Rust tests cannot silently pass when an environment prerequisite is absent", async () => {

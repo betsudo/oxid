@@ -4964,6 +4964,8 @@ fn HomePage(
     on_scan: EventHandler<MouseEvent>,
 ) -> Element {
     let services = consume_context::<WalletUiServices>();
+    let brand = consume_context::<BrandProfile>();
+    let show_vault = brand.show_vault_card();
     let mut state = use_signal(|| HomePageState::Loading);
     let profile_id = active_profile.id.clone();
     let services_for_load = services.clone();
@@ -4972,7 +4974,7 @@ fn HomePage(
         let profile_id = profile_id.clone();
         spawn(async move {
             state.set(
-                run_ui_blocking(move || load_home_page(&services, &profile_id))
+                run_ui_blocking(move || load_home_page(&services, &profile_id, show_vault))
                     .await
                     .unwrap_or(HomePageState::Failed),
             );
@@ -4988,7 +4990,11 @@ fn HomePage(
             }
             HomeQuickActions { scan_busy, on_receive, on_send, on_present, on_scan }
             section { class: "home-card-stack", aria_label: "Loading wallet products", aria_busy: "true",
-                for label in ["Wallet", "Newest document", "Passport Vault"] {
+                for label in if show_vault {
+                    vec!["Wallet", "Newest document", "Passport Vault"]
+                } else {
+                    vec!["Wallet", "Newest document"]
+                } {
                     article { class: "home-card home-card--loading", key: "{label}",
                         p { class: "card-eyebrow", "{label}" }
                         span { class: "loading-mark", aria_hidden: "true" }
@@ -5026,7 +5032,7 @@ fn HomePage(
                         state.set(HomePageState::Loading);
                         spawn(async move {
                             state.set(
-                                run_ui_blocking(move || load_home_page(&services, &profile_id))
+                                run_ui_blocking(move || load_home_page(&services, &profile_id, show_vault))
                                     .await
                                     .unwrap_or(HomePageState::Failed),
                             );
@@ -5876,6 +5882,7 @@ fn DocumentsPage(
 #[component]
 fn ActivityPage(active_profile: WalletProfileView) -> Element {
     let services = consume_context::<WalletUiServices>();
+    let brand = consume_context::<BrandProfile>();
     let mut state = use_signal(|| AccountPageState::Loading);
     let profile_id = active_profile.id.clone();
     let services_for_load = services.clone();
@@ -5895,7 +5902,7 @@ fn ActivityPage(active_profile: WalletProfileView) -> Element {
     rsx! {
         section { class: "page-heading",
             p { class: "eyebrow", "Wallet history" }
-            p { "Midnight transfers, Passport Vault operations, credential issuance, and recoverable submissions appear here." }
+            p { "Midnight transfers, credential issuance, and recoverable submissions appear here." }
         }
         match state.read().clone() {
             AccountPageState::Loading => rsx! {
@@ -5932,7 +5939,9 @@ fn ActivityPage(active_profile: WalletProfileView) -> Element {
                 rsx! { AccountActivityCard { account: *account, unavailable } }
             },
         }
-        PassportVaultActivitySection { profile_id: active_profile.id.clone() }
+        if brand.show_vault_card() {
+            PassportVaultActivitySection { profile_id: active_profile.id.clone() }
+        }
         CredentialIssuanceActivitySection { profile_id: active_profile.id.clone() }
         CredentialPresentationActivitySection { profile_id: active_profile.id.clone() }
         SubmissionRecoveryPane { profile_id: active_profile.id.clone() }
@@ -5947,10 +5956,9 @@ fn AccountActivityCard(account: WalletAccountView, unavailable: bool) -> Element
         article { class: "surface-card",
             p { class: "card-eyebrow", "Wallet activity" }
             h2 { "On-chain transfers" }
-            p { class: "activity-source-note", "Source: Midnight wallet account. Passport Vault and credential issuance activity are listed separately below." }
+            p { class: "activity-source-note", "Source: Midnight wallet account. Credential issuance activity is listed separately below." }
             div { class: "activity-filters", role: "group", aria_label: "Activity sources",
                 span { class: "status-pill", "Wallet" }
-                span { class: "status-pill", "Passport Vault" }
                 span { class: "status-pill", "Credential issuance" }
             }
             if account.transactions.is_empty() {
@@ -6450,7 +6458,11 @@ fn account_placeholder_recovery_required(
     }
 }
 
-fn load_home_page(services: &WalletUiServices, profile_id: &str) -> HomePageState {
+fn load_home_page(
+    services: &WalletUiServices,
+    profile_id: &str,
+    include_vault: bool,
+) -> HomePageState {
     let (account, security) = match load_account_page(services, profile_id) {
         AccountPageState::Ready {
             account, security, ..
@@ -6469,12 +6481,16 @@ fn load_home_page(services: &WalletUiServices, profile_id: &str) -> HomePageStat
             profile_id: profile_id.to_owned(),
         })
         .map_or(HomeResource::Unavailable, HomeResource::Ready);
-    let vault = services
-        .list_passport_vault_locks()
-        .execute()
-        .map_or(HomeResource::Unavailable, |vault| {
-            HomeResource::Ready(Box::new(vault))
-        });
+    let vault = if include_vault {
+        services
+            .list_passport_vault_locks()
+            .execute()
+            .map_or(HomeResource::Unavailable, |vault| {
+                HomeResource::Ready(Box::new(vault))
+            })
+    } else {
+        HomeResource::Unavailable
+    };
 
     HomePageState::Ready(Box::new(HomePageProjection {
         account,

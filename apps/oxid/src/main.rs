@@ -639,8 +639,8 @@ fn main() {
     #[cfg(feature = "ui-profile-dev")]
     let ui = ui.with_developer_capabilities(oxid_ui_dioxus::CapabilityManifestContext::new(
         application.compact_presentation_proof_available(),
-        application.passport_vault_call_mode(),
-        application.passport_vault_state_persistence(),
+        "unavailable",
+        "unavailable",
     ));
     #[cfg(feature = "developer-proof-benchmark")]
     let ui = ui.with_proof_benchmark(

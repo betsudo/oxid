@@ -23,17 +23,6 @@
         midnightCircuitParams = midnightDidPackages.midnight-circuit-params;
         midnightVcSource = inputs.midnight-verifiable-credentials;
       };
-      passportVaultCompactArtifacts = pkgs.callPackage ./passport-vault-compact-artifacts.nix {
-        compactMidnight = midnightDidPackages.compact-midnight;
-        compactToolchain = midnightDidPackages.compact-toolchain;
-        midnightCircuitParams = midnightDidPackages.midnight-circuit-params;
-        midnightVcSource = inputs.midnight-verifiable-credentials;
-        passportVaultSource = ../../contracts/passport-vault;
-      };
-      passportVaultCallComposer = pkgs.callPackage ./passport-vault-call-composer.nix {
-        inherit passportVaultCompactArtifacts;
-        vaultContractStateFixture = ../../fixtures/passport-vault/contract-state-v1.hex;
-      };
       oxidApp = pkgs.rustPlatform.buildRustPackage {
         pname = "oxid";
         version = "0.2.0";
@@ -48,9 +37,6 @@
           "oxid-app"
         ];
         cargoTestFlags = [ "--workspace" ];
-        OXID_PASSPORT_VAULT_ARTIFACTS_DIR = passportVaultCompactArtifacts;
-        OXID_PASSPORT_VAULT_COMPOSER = "${passportVaultCallComposer}/bin/oxid-passport-vault-call-composer";
-
         nativeBuildInputs = [ pkgs.pkg-config ] ++ linuxNativeBuildInputs;
         buildInputs = [ pkgs.openssl ] ++ linuxBuildInputs;
 
@@ -162,10 +148,6 @@
 
         midnight-did-ledger9-zkir = midnightDidLedger9Zkir;
 
-        passport-vault-compact-artifacts = passportVaultCompactArtifacts;
-
-        passport-vault-call-composer = passportVaultCallComposer;
-
         dioxus-cli = pkgs.dioxus-cli;
 
         # Pinned through flake.lock; local Maestro pilots never fetch a global CLI.
@@ -188,8 +170,6 @@
         presentation-compact-artifacts = presentationCompactArtifacts;
         midnight-did-compact-artifacts = midnightDidCompactArtifacts;
         midnight-did-ledger9-zkir = midnightDidLedger9Zkir;
-        passport-vault-compact-artifacts = passportVaultCompactArtifacts;
-        passport-vault-call-composer = passportVaultCallComposer;
         brand-packs =
           pkgs.runCommand "oxid-brand-packs-check"
             {
