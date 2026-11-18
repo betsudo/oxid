@@ -291,13 +291,14 @@ final class PortalFlowTests: XCTestCase {
         XCTAssertTrue(createDid.waitForExistence(timeout: 10))
         scrollTo(createDid, in: application)
         createDid.tap()
-        let confirmCreateDid = application.buttons["Create DID"]
+        let confirmCreateDid = application.buttons["Create Midnight DID"]
         XCTAssertTrue(confirmCreateDid.waitForExistence(timeout: 10))
         scrollTo(confirmCreateDid, in: application)
         confirmCreateDid.tap()
         let copyDid = application.buttons["Copy DID"]
-        XCTAssertTrue(copyDid.waitForExistence(timeout: 30))
+        XCTAssertTrue(copyDid.waitForExistence(timeout: 600))
         XCTAssertTrue(application.staticTexts["Managed"].exists)
+        XCTAssertTrue(application.staticTexts["Midnight network"].exists)
     }
 
     @MainActor

@@ -572,6 +572,7 @@ fn main() {
         oxid_ui_dioxus::IdentityUiServices::new(
             oxid_ui_dioxus::DidUiServices::new(
                 application.create_did(),
+                application.deploy_did(),
                 application.resolve_did(),
                 application.list_did_records(),
                 application.update_did(),

@@ -106,8 +106,9 @@ use oxid_diagnostics_application::{
 };
 use oxid_identity_application::{
     CreateDidCommand, CreateDidUseCase, DeactivateDidCommand, DeactivateDidUseCase,
-    DidKeyAlgorithm, DidOperationError, DidRecordQuery, DidRecordView, DidRefreshAvailability,
-    DidUpdate, ForgetDidUseCase, ListDidRecordsQuery, ListDidRecordsUseCase,
+    DeployDidCommand, DeployDidUseCase, DidDeploymentState, DidKeyAlgorithm, DidOperationError,
+    DidRecordQuery, DidRecordView, DidRefreshAvailability, DidUpdate, ForgetDidUseCase,
+    IdentityProfileId, ListDidRecordsQuery, ListDidRecordsUseCase, MidnightNetwork,
     PUBLISH_DID_TO_TEST_ISSUER_INTENT, PublishDidCommand, PublishDidUseCase, ResolveDidCommand,
     ResolveDidUseCase, SignDidPayloadCommand, SignDidPayloadUseCase, UpdateDidCommand,
     UpdateDidUseCase,
@@ -372,6 +373,7 @@ pub struct WalletUiServices {
     list_wallet_transfer_submissions: Arc<dyn ListWalletTransferSubmissionsUseCase>,
     reconcile_wallet_transfer_submission: Arc<dyn ReconcileWalletTransferSubmissionUseCase>,
     create_did: Arc<dyn CreateDidUseCase>,
+    deploy_did: Arc<dyn DeployDidUseCase>,
     resolve_did: Arc<dyn ResolveDidUseCase>,
     list_did_records: Arc<dyn ListDidRecordsUseCase>,
     publish_did: Option<Arc<dyn PublishDidUseCase>>,
@@ -477,6 +479,7 @@ impl WalletDustSettlementUiServices {
 /// DID inventory and resolution use cases consumed by the DIDs page.
 pub struct DidUiServices {
     create_did: Arc<dyn CreateDidUseCase>,
+    deploy_did: Arc<dyn DeployDidUseCase>,
     resolve_did: Arc<dyn ResolveDidUseCase>,
     list_did_records: Arc<dyn ListDidRecordsUseCase>,
     publish_did: Option<Arc<dyn PublishDidUseCase>>,
@@ -736,6 +739,7 @@ impl DidUiServices {
     #[must_use]
     pub const fn new(
         create_did: Arc<dyn CreateDidUseCase>,
+        deploy_did: Arc<dyn DeployDidUseCase>,
         resolve_did: Arc<dyn ResolveDidUseCase>,
         list_did_records: Arc<dyn ListDidRecordsUseCase>,
         update_did: Arc<dyn UpdateDidUseCase>,
@@ -745,6 +749,7 @@ impl DidUiServices {
     ) -> Self {
         Self {
             create_did,
+            deploy_did,
             resolve_did,
             list_did_records,
             publish_did: None,
@@ -1111,6 +1116,7 @@ impl WalletUiServices {
             list_wallet_transfer_submissions: transactions.list_wallet_transfer_submissions,
             reconcile_wallet_transfer_submission: transactions.reconcile_wallet_transfer_submission,
             create_did: dids.create_did,
+            deploy_did: dids.deploy_did,
             resolve_did: dids.resolve_did,
             list_did_records: dids.list_did_records,
             publish_did: dids.publish_did,
@@ -1431,6 +1437,11 @@ impl WalletUiServices {
     #[must_use]
     pub fn create_did(&self) -> Arc<dyn CreateDidUseCase> {
         Arc::clone(&self.create_did)
+    }
+
+    #[must_use]
+    pub fn deploy_did(&self) -> Arc<dyn DeployDidUseCase> {
+        Arc::clone(&self.deploy_did)
     }
 
     #[must_use]

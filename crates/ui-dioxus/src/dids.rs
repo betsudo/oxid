@@ -217,6 +217,14 @@ pub(super) fn DidsPage(
             let create_services = services.clone();
             let create_profile = profile_id.clone();
             let create_records = records.clone();
+            let deploy_services = services.clone();
+            let deploy_profile = profile_id.clone();
+            let deploy_records = records.clone();
+            let deployment_network = selected_network.read().clone();
+            let ledger_deployment_available = deployment_network
+                .as_deref()
+                .and_then(MidnightNetwork::parse)
+                .is_some_and(|network| network != MidnightNetwork::Offchain);
             let active_managed_did =
                 active_managed_issuance_methods(&records).map(|(did, _, _)| did);
             let issuance_did_ready = active_managed_did.is_some();
@@ -260,10 +268,125 @@ pub(super) fn DidsPage(
                         "data-testid": "identity-did-create",
                     p { class: "card-eyebrow", "Managed identity" }
                     h2 { "Create your identity" }
-                    p { class: "form-hint", "This off-chain demo identity carries its public DID document in the identifier. It is self-contained, not published to Midnight, and private keys remain in protected custody." }
+                    p { class: "form-hint", "Publish a protected DID to the selected Midnight network. The wallet submits the ordered Ledger effects, waits for finality, and verifies the finished document through live resolution before it becomes available for credentials." }
                     if creation == DidCreationState::Ready {
                         button {
-                            class: "primary-action", r#type: "button", disabled: resolving,
+                            class: "primary-action", r#type: "button",
+                            disabled: resolving || !ledger_deployment_available,
+                            aria_label: "Create Midnight DID",
+                            onclick: move |_| {
+                                {
+                                    let mut creation = did_creation.write();
+                                    if !begin_did_creation_value(&mut creation) {
+                                        return;
+                                    }
+                                }
+                                did_creation_notice.set(None);
+                                let service = deploy_services.deploy_did();
+                                let resolver = deploy_services.resolve_did();
+                                let profile_id = deploy_profile.clone();
+                                let network = deployment_network.clone();
+                                let records = deploy_records.clone();
+                                spawn(async move {
+                                    let Some(network) = network.as_deref().and_then(MidnightNetwork::parse) else {
+                                        did_creation.set(DidCreationState::Failed);
+                                        did_creation_notice.set(Some("Select a ledger-backed Midnight network before creating this DID.".to_owned()));
+                                        return;
+                                    };
+                                    if network == MidnightNetwork::Offchain {
+                                        did_creation.set(DidCreationState::Failed);
+                                        did_creation_notice.set(Some("The selected network cannot publish a ledger-backed DID.".to_owned()));
+                                        return;
+                                    }
+                                    let Ok(identity_profile_id) = IdentityProfileId::parse(profile_id.clone()) else {
+                                        did_creation.set(DidCreationState::Failed);
+                                        did_creation_notice.set(Some("The active profile cannot create a ledger-backed DID.".to_owned()));
+                                        return;
+                                    };
+                                    let command = DeployDidCommand {
+                                        profile_id: identity_profile_id,
+                                        network,
+                                        account_index: 0,
+                                    };
+                                    for _attempt in 0..300 {
+                                        let service = service.clone();
+                                        let command = command.clone();
+                                        match run_ui_future(async move { service.execute(command).await }).await {
+                                            Ok(Ok(operation)) if operation.state() == DidDeploymentState::Ready => {
+                                                let Some(did) = operation.did().map(|did| did.as_str().to_owned()) else {
+                                                    did_creation.set(DidCreationState::Failed);
+                                                    did_creation_notice.set(Some("Midnight confirmed the deployment without a resolvable DID.".to_owned()));
+                                                    return;
+                                                };
+                                                let resolver = resolver.clone();
+                                                let resolve_profile = profile_id.clone();
+                                                let resolve_did = did.clone();
+                                                match run_ui_future(async move {
+                                                    resolver.execute(ResolveDidCommand {
+                                                        profile_id: resolve_profile,
+                                                        did: resolve_did,
+                                                    }).await
+                                                }).await {
+                                                    Ok(Ok(record)) => {
+                                                        let mut updated = records;
+                                                        updated.retain(|existing| existing.document.id != record.document.id);
+                                                        updated.push(record);
+                                                        updated.sort_by(|left, right| left.document.id.cmp(&right.document.id));
+                                                        state.set(DidPageState::Ready { records: updated, resolving: false, operation_error: None });
+                                                        did_creation.set(DidCreationState::Created);
+                                                        did_creation_notice.set(Some("Midnight DID published and verified.".to_owned()));
+                                                        journey.set(DidJourney::Detail(did));
+                                                    }
+                                                    Ok(Err(error)) => {
+                                                        did_creation.set(DidCreationState::Failed);
+                                                        did_creation_notice.set(Some(did_operation_message(error)));
+                                                    }
+                                                    Err(error) => {
+                                                        did_creation.set(DidCreationState::Failed);
+                                                        did_creation_notice.set(Some(error.to_string()));
+                                                    }
+                                                }
+                                                return;
+                                            }
+                                            Ok(Ok(operation)) if operation.state() == DidDeploymentState::RetryableFailure => {
+                                                let failure = operation.failure().map_or("unknown", |failure| failure.as_str());
+                                                did_creation_notice.set(Some(format!("Waiting for Midnight to converge: {failure}. Progress is retained and will resume automatically.")));
+                                            }
+                                            Ok(Ok(operation)) => {
+                                                did_creation_notice.set(Some(format!(
+                                                    "Publishing to Midnight: {} · {}.",
+                                                    operation.state().as_str(),
+                                                    operation.effect().as_str(),
+                                                )));
+                                            }
+                                            Ok(Err(error)) => {
+                                                did_creation.set(DidCreationState::Failed);
+                                                did_creation_notice.set(Some(error.to_string()));
+                                                return;
+                                            }
+                                            Err(error) => {
+                                                did_creation.set(DidCreationState::Failed);
+                                                did_creation_notice.set(Some(error.to_string()));
+                                                return;
+                                            }
+                                        }
+                                        tokio::time::sleep(Duration::from_secs(2)).await;
+                                    }
+                                    did_creation.set(DidCreationState::Failed);
+                                    did_creation_notice.set(Some("Midnight DID deployment did not finish within ten minutes. Progress was retained for a safe retry.".to_owned()));
+                                });
+                            },
+                            "Create Midnight DID"
+                        }
+                        p { class: "form-hint",
+                            if let Some(network) = selected_network.read().as_deref() {
+                                "Selected network: {network}."
+                            } else {
+                                "Waiting for the selected Midnight network."
+                            }
+                        }
+                        button {
+                            class: "secondary-action", r#type: "button", disabled: resolving,
                             onclick: move |_| {
                                 {
                                     let mut creation = did_creation.write();
