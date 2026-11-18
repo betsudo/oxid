@@ -101,16 +101,16 @@ const reviewedException = {
 };
 
 const nativeDidChangedLineException = {
-  id: "issue-1181-native-did-changed-lines",
+  id: "issue-1193-ledger9-did-changed-lines",
   kind: "changed-lines",
   packages: ["oxid-adapter-did-midnight", "oxid-composition"],
   owner: "identity-maintainers",
-  issue: "https://github.com/MediaNoxLabs/oxid/issues/1181",
-  rationale: "PR #1180 replaces the rejected WebView composer with the reviewed native Ledger8 DID runtime. Its focused runtime, composition, artifact-authentication, lint, and profile tests pass, but the imported native call boundary and mobile composition surface do not yet meet the changed-line floor.",
-  compensatingTest: "Native DID adapter and composition tests, authenticated mobile artifact checks, strict clippy, and strict UI profile validation remain required and green on PR #1180.",
-  approval: "Reviewed as a bounded PR #1180 coverage exception; absolute package floors remain enforced.",
-  expiry: "2026-10-23",
-  removalCondition: "Close #1181 by adding focused deterministic coverage for the native DID call boundary and mobile composition paths, then remove this exception before expiry.",
+  issue: "https://github.com/MediaNoxLabs/oxid/issues/1193",
+  rationale: "PR #1196 moves the reviewed native DID runtime onto the pinned Ledger 9 cohort while #1193 completes the typed provider, finality, and resolver boundary. Focused runtime, composition, artifact-authentication, lint, and profile tests remain required, but the rewritten native call boundary and mobile composition surface do not yet meet the changed-line floor.",
+  compensatingTest: "Native DID adapter and composition tests, authenticated mobile artifact checks, strict clippy, strict UI profile validation, and the read-only Ledger 9 attach preflight remain required while #1193 closes the deterministic coverage gap.",
+  approval: "Bounded Ledger 9 migration exception tied to #1193; absolute package floors remain enforced and the repository floor is unchanged.",
+  expiry: "2026-12-18",
+  removalCondition: "Close #1193 with focused deterministic coverage for the Ledger 9 DID call, finality, resolver, and mobile composition paths, then remove this exception before expiry.",
 };
 
 test("policy pins the current-phase 70 percent floors, baseline placeholders, paths, diff semantics, and exceptions", async () => {
