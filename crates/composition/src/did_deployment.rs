@@ -485,6 +485,22 @@ impl NativeDidDeploymentService {
                     }
                     continue;
                 }
+                DidDeploymentState::Submitting | DidDeploymentState::Confirming => {
+                    // These states can be restored after the process is suspended or
+                    // terminated while a submission is in flight. Re-funding and
+                    // broadcasting here could duplicate the contract effect, so the
+                    // durable submission receipt must be reconciled first.
+                    operation = self.reconcile(operation)?;
+                    if matches!(
+                        operation.state(),
+                        DidDeploymentState::Submitting
+                            | DidDeploymentState::Confirming
+                            | DidDeploymentState::OutcomeUnknown
+                    ) {
+                        return Ok(operation);
+                    }
+                    continue;
+                }
                 DidDeploymentState::RetryableFailure => {
                     let resume = operation
                         .resume_from()
@@ -495,9 +511,7 @@ impl NativeDidDeploymentService {
                 }
                 DidDeploymentState::Composing
                 | DidDeploymentState::Funding
-                | DidDeploymentState::Proving
-                | DidDeploymentState::Submitting
-                | DidDeploymentState::Confirming => {}
+                | DidDeploymentState::Proving => {}
             }
 
             let plan = match self.effects.compose(&operation, account_index).await {
@@ -632,10 +646,14 @@ impl NativeDidDeploymentService {
                 self.operations.upsert(included.clone())?;
                 Ok(included)
             }
+            MidnightContractCallSubmissionState::OutcomeUnknown => {
+                let unknown = operation.outcome_unknown(self.now()?)?;
+                self.operations.upsert(unknown.clone())?;
+                Ok(unknown)
+            }
             MidnightContractCallSubmissionState::Running
             | MidnightContractCallSubmissionState::CancellationRequested
-            | MidnightContractCallSubmissionState::Broadcasting
-            | MidnightContractCallSubmissionState::OutcomeUnknown => Ok(operation),
+            | MidnightContractCallSubmissionState::Broadcasting => Ok(operation),
             MidnightContractCallSubmissionState::Rejected
             | MidnightContractCallSubmissionState::Expired => {
                 self.pause(operation, DidDeploymentFailure::SubmissionRejected)
@@ -842,6 +860,14 @@ fn map_transaction_failure(error: WalletTransactionPortError) -> DidDeploymentFa
             DidDeploymentFailure::ProtectionLocked
         }
         WalletTransactionPortError::InsufficientDust => DidDeploymentFailure::InsufficientDust,
+        WalletTransactionPortError::InsufficientFunds => DidDeploymentFailure::InsufficientNight,
+        WalletTransactionPortError::InvalidChainState => {
+            DidDeploymentFailure::ChainStateUnavailable
+        }
+        WalletTransactionPortError::UnsupportedNetwork => DidDeploymentFailure::UnsupportedNetwork,
+        WalletTransactionPortError::InvalidData | WalletTransactionPortError::DraftConflict => {
+            DidDeploymentFailure::InvalidFundingPlan
+        }
         WalletTransactionPortError::ProvingFailed => DidDeploymentFailure::ProvingUnavailable,
         WalletTransactionPortError::SubmissionRejected
         | WalletTransactionPortError::DraftExpired => DidDeploymentFailure::SubmissionRejected,

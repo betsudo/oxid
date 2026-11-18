@@ -673,7 +673,20 @@ where
     let did_lifecycle = Arc::new(did_lifecycle);
     let did_lifecycle_port: Arc<dyn DidLifecyclePort> = did_lifecycle.clone();
     let did_jubjub_challenge_signing: Arc<dyn DidJubjubChallengeSigningPort> = did_lifecycle;
-    let did_resolver = headless_did_resolver();
+    let did_resolver = match &credential_profile {
+        HeadlessCredentialProfile::Standalone => headless_did_resolver(),
+        #[cfg(all(
+            not(target_arch = "wasm32"),
+            any(
+                all(not(target_os = "ios"), not(target_os = "android")),
+                all(
+                    feature = "mobile-portal",
+                    any(target_os = "ios", target_os = "android")
+                )
+            )
+        ))]
+        HeadlessCredentialProfile::Portal(portal) => Arc::clone(&portal.issuer_resolver),
+    };
     let (
         compact_issuer_resolver,
         trust_anchor,

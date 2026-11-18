@@ -3,12 +3,15 @@
 //! Bounded standalone completion of an authorized Midnight transfer.
 
 use std::{
-    fmt, io,
+    fmt,
+    future::Future,
+    io,
     net::IpAddr,
     sync::{
         Arc, Mutex,
         atomic::{AtomicBool, Ordering},
     },
+    thread,
     time::{Duration, Instant},
 };
 
@@ -92,9 +95,36 @@ const MAX_TRANSACTION_BYTES: usize = 16 * 1024 * 1024;
 const MAX_BALANCE_ITERATIONS: usize = 16;
 const MAX_FEE_RECONCILIATION_ITERATIONS: usize = 3;
 const MAX_RECONCILIATION_BLOCKS: usize = 2_048;
+const MIDNIGHT_RUNTIME_STACK_BYTES: usize = 8 * 1024 * 1024;
 
 type UnprovenTransaction =
     Transaction<Signature, ProofPreimageMarker, PedersenRandomness, DefaultDB>;
+
+fn run_isolated_midnight_runtime<Output, Factory, Operation>(
+    operation: Factory,
+) -> Result<Output, WalletTransactionPortError>
+where
+    Output: Send,
+    Factory: FnOnce() -> Operation + Send,
+    Operation: Future<Output = Result<Output, WalletTransactionPortError>>,
+{
+    thread::scope(|scope| {
+        let worker = thread::Builder::new()
+            .name("oxid-midnight-runtime".to_owned())
+            .stack_size(MIDNIGHT_RUNTIME_STACK_BYTES)
+            .spawn_scoped(scope, move || {
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .map_err(|_| WalletTransactionPortError::Unavailable)?;
+                runtime.block_on(operation())
+            })
+            .map_err(|_| WalletTransactionPortError::Unavailable)?;
+        worker
+            .join()
+            .map_err(|_| WalletTransactionPortError::Unavailable)?
+    })
+}
 
 /// Explicit source of authenticated public proving material for application
 /// circuits that are not built into the standalone proof server.
@@ -377,11 +407,9 @@ impl MidnightSubmissionReconciler for LiveMidnightSubmissionReconciler {
         entry: &StoredSubmissionJournalEntry,
     ) -> Result<MidnightSubmissionReconciliation, WalletTransactionPortError> {
         self.validate_entry(entry)?;
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .map_err(|_| WalletTransactionPortError::Unavailable)?;
-        runtime.block_on(reconcile_live_submission(&self.config, entry))
+        run_isolated_midnight_runtime(move || async move {
+            reconcile_live_submission(&self.config, entry).await
+        })
     }
 
     fn reconcile_async<'a>(
@@ -498,18 +526,17 @@ where
                 None
             };
         let dust_key = DustSecretKey::derive_secret_key(dust_seed);
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .map_err(|_| WalletTransactionPortError::Unavailable)?;
-        runtime.block_on(complete_live(
-            &self.config,
-            request,
-            &dust_key,
-            self.dust_checkpoints.as_ref(),
-            self.clock.as_ref(),
-            self.remote_proving_material.as_ref(),
-        ))
+        run_isolated_midnight_runtime(move || async move {
+            complete_live(
+                &self.config,
+                request,
+                &dust_key,
+                self.dust_checkpoints.as_ref(),
+                self.clock.as_ref(),
+                self.remote_proving_material.as_ref(),
+            )
+            .await
+        })
     }
 }
 
@@ -1824,6 +1851,17 @@ mod tests {
             .enable_all()
             .build()
             .expect("test runtime builds")
+    }
+
+    #[test]
+    fn synchronous_adapter_boundary_is_safe_inside_an_async_runtime() {
+        let result = runtime().block_on(async {
+            run_isolated_midnight_runtime(|| async {
+                Ok::<_, WalletTransactionPortError>("completed")
+            })
+        });
+
+        assert_eq!(result, Ok("completed"));
     }
 
     #[allow(clippy::result_large_err)] // tungstenite's test-server callback owns the error type.

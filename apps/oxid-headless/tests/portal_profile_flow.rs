@@ -237,6 +237,21 @@ struct HolderProofExpectation {
     public_key_x: String,
 }
 
+#[derive(Clone, Copy, Default, PartialEq, Eq)]
+enum ResolverFixtureMode {
+    #[default]
+    Current,
+    NotFound,
+    StaleIssuerKey,
+}
+
+#[derive(Clone, Copy, Default, PartialEq, Eq)]
+enum CredentialFixtureMode {
+    #[default]
+    Valid,
+    Malformed,
+}
+
 #[derive(Default)]
 struct ServerState {
     holder: Option<BoundCredentialRequest>,
@@ -245,6 +260,8 @@ struct ServerState {
     grant_redeemed: bool,
     response_status: u16,
     issued_credentials: usize,
+    resolver_mode: ResolverFixtureMode,
+    credential_mode: CredentialFixtureMode,
 }
 
 #[cfg_attr(not(feature = "development-did-approval-fixture"), allow(dead_code))]
@@ -315,6 +332,14 @@ impl PortalServer {
         let mut state = self.state.lock().expect("state");
         state.holder = Some(holder);
         state.holder_proof = Some(proof);
+    }
+
+    fn set_resolver_mode(&self, mode: ResolverFixtureMode) {
+        self.state.lock().expect("state").resolver_mode = mode;
+    }
+
+    fn set_credential_mode(&self, mode: CredentialFixtureMode) {
+        self.state.lock().expect("state").credential_mode = mode;
     }
 
     fn offer(&self) -> String {
@@ -494,6 +519,7 @@ fn response_for(path: &str, body: &str, origin: &str, state: &Arc<Mutex<ServerSt
                 return reject_proof(state);
             }
             server.issued_credentials += 1;
+            let credential_mode = server.credential_mode;
             let holder = holder.expect("holder public facts configured");
             drop(server);
             let bundle = block_on(
@@ -503,7 +529,7 @@ fn response_for(path: &str, body: &str, origin: &str, state: &Arc<Mutex<ServerSt
             )
             .expect("fresh bound credential");
             let private = portal_private_parts();
-            json!({
+            let mut response = json!({
                 "credentials":[{
                     "credential": general_purpose::URL_SAFE_NO_PAD.encode(bundle.signed_bytes),
                     "midnight":{
@@ -529,15 +555,43 @@ fn response_for(path: &str, body: &str, origin: &str, state: &Arc<Mutex<ServerSt
                         "schemaVersion":"1.0"
                     }
                 }]
-            })
-            .to_string()
+            });
+            if credential_mode == CredentialFixtureMode::Malformed {
+                response["credentials"][0]["credential"] = json!("AA");
+            }
+            response.to_string()
         }
         "/resolve" => {
             let requested: Value = serde_json::from_str(body).expect("resolver request");
             assert_eq!(requested["did"], STANDALONE_COMPACT_PASSPORT_ISSUER_DID);
+            let resolver_mode = state.lock().expect("state").resolver_mode;
+            if resolver_mode == ResolverFixtureMode::NotFound {
+                state.lock().expect("state").response_status = 404;
+                return json!({
+                    "didDocument":null,
+                    "didDocumentMetadata":{},
+                    "didResolutionMetadata":{"error":"notFound"}
+                })
+                .to_string();
+            }
             let did = MidnightDid::parse(STANDALONE_COMPACT_PASSPORT_ISSUER_DID).expect("DID");
             let resolution = block_on(StandaloneDidResolver.resolve(&did)).expect("resolution");
-            resolution_to_json_value(&resolution).to_string()
+            let mut value = resolution_to_json_value(&resolution);
+            if resolver_mode == ResolverFixtureMode::StaleIssuerKey {
+                let issuer_method = value["didDocument"]["verificationMethod"]
+                    .as_array_mut()
+                    .and_then(|methods| {
+                        methods
+                            .iter_mut()
+                            .find(|method| method["id"] == ISSUER_METHOD)
+                    })
+                    .expect("issuer method");
+                issuer_method["publicKeyJwk"]["x"] =
+                    json!("EMyWcM8XCxkJTyn8MDXM4q6wVLMfqCxYCu0MwT0hHPQ");
+                issuer_method["publicKeyJwk"]["y"] =
+                    json!("H0wYFnDb0GGRQPznl3NU9G1sohdsMMrVdZpEQyiZrd0");
+            }
+            value.to_string()
         }
         _ => panic!("unexpected Portal fixture path: {path}"),
     }
@@ -671,6 +725,143 @@ fn request(process: &mut ProcessHarness, id: &str, method: &str, params: Value) 
     process.request(json!({
         "protocol":"oxid.headless.v1","id":id,"method":method,"params":params
     }))
+}
+
+#[cfg(feature = "development-did-approval-fixture")]
+struct PreparedPortalIssuance {
+    holder_did: String,
+    authentication_method: String,
+    binding_method: String,
+    issuance_id: String,
+}
+
+#[cfg(feature = "development-did-approval-fixture")]
+fn prepare_portal_issuance(
+    process: &mut ProcessHarness,
+    server: &PortalServer,
+    offer: &str,
+) -> PreparedPortalIssuance {
+    let created = request(
+        process,
+        "profile-create",
+        "wallet.profile.create",
+        json!({"displayName":"Portal negative matrix"}),
+    );
+    let profile_id = created["result"]["profile"]["id"]
+        .as_str()
+        .expect("profile id");
+    assert_eq!(
+        request(
+            process,
+            "profile-select",
+            "wallet.profile.select",
+            json!({"profileId":profile_id})
+        )["ok"],
+        true
+    );
+    assert_eq!(
+        request(process, "security", "wallet.security.initialize", json!({}))["ok"],
+        true
+    );
+    let did_response = request(process, "did", "did.create", json!({}));
+    let document = &did_response["result"]["didRecord"]["document"];
+    let holder_did = document["id"].as_str().expect("holder DID").to_owned();
+    let authentication_method = document["relationships"]
+        .as_array()
+        .expect("relationships")
+        .iter()
+        .find(|value| value["relationship"] == "authentication")
+        .and_then(|value| value["methodIds"][0].as_str())
+        .expect("authentication method")
+        .to_owned();
+    let binding = document["verificationMethods"]
+        .as_array()
+        .expect("verification methods")
+        .iter()
+        .find(|value| value["publicKeyJwk"]["crv"] == "Jubjub")
+        .expect("Jubjub method");
+    let binding_method = binding["id"].as_str().expect("binding method").to_owned();
+    let authentication = document["verificationMethods"]
+        .as_array()
+        .expect("verification methods")
+        .iter()
+        .find(|value| value["id"] == authentication_method)
+        .expect("authentication verification method");
+    server.set_holder(
+        BoundCredentialRequest {
+            holder_did: holder_did.clone(),
+            holder_binding_method_id: binding_method.clone(),
+            public_key_x: binding["publicKeyJwk"]["x"]
+                .as_str()
+                .expect("binding x")
+                .to_owned(),
+            public_key_y: binding["publicKeyJwk"]["y"]
+                .as_str()
+                .expect("binding y")
+                .to_owned(),
+        },
+        HolderProofExpectation {
+            holder_did: holder_did.clone(),
+            method_id: authentication_method.clone(),
+            public_key_x: authentication["publicKeyJwk"]["x"]
+                .as_str()
+                .expect("authentication x")
+                .to_owned(),
+        },
+    );
+    let prepared = request(
+        process,
+        "prepare",
+        "credential.issuance.prepare",
+        json!({"offer":offer}),
+    );
+    assert_eq!(prepared["result"]["issuance"]["state"], "awaiting_consent");
+    PreparedPortalIssuance {
+        holder_did,
+        authentication_method,
+        binding_method,
+        issuance_id: prepared["result"]["issuance"]["id"]
+            .as_str()
+            .expect("issuance id")
+            .to_owned(),
+    }
+}
+
+#[cfg(feature = "development-did-approval-fixture")]
+#[test]
+fn portal_profile_rejects_a_malformed_credential_before_persistence() {
+    let store = TestStore::new();
+    let server = PortalServer::spawn();
+    let manifest_digest = server.write_manifest(&store.manifest());
+    let offer = server.offer();
+    let mut process = ProcessHarness::spawn(&store, &manifest_digest);
+    let prepared = prepare_portal_issuance(&mut process, &server, &offer);
+    server.set_credential_mode(CredentialFixtureMode::Malformed);
+
+    let rejected = request(
+        &mut process,
+        "accept-malformed",
+        "credential.issuance.accept",
+        json!({
+            "issuanceId":prepared.issuance_id,
+            "holderDid":prepared.holder_did,
+            "methodId":prepared.authentication_method,
+            "holderBindingMethodId":prepared.binding_method,
+            "confirmed":true,
+            "intent":"ACCEPT_CREDENTIAL_ISSUANCE"
+        }),
+    );
+
+    assert_eq!(rejected["ok"], false);
+    assert_eq!(rejected["error"]["code"], "invalid_credential_response");
+    assert_eq!(server.state.lock().expect("state").issued_credentials, 1);
+    let listed = request(&mut process, "list", "credential.list", json!({}));
+    assert_eq!(
+        listed["result"]["credentials"].as_array().map(Vec::len),
+        Some(0)
+    );
+    assert!(!format!("{rejected}{listed}").contains(SECRET_CODE));
+    assert!(process.quit().is_empty());
 }
 
 #[cfg(feature = "development-did-approval-fixture")]
@@ -951,6 +1142,66 @@ fn portal_standalone_profile_issues_encrypts_restores_and_reverifies_in_a_new_pr
         listed["result"]["credentials"][0]["verification"]["outcome"],
         "valid"
     );
+    let secret_calls_before_resolver_failures = server
+        .state
+        .lock()
+        .expect("state")
+        .journal
+        .iter()
+        .filter(|(path, _)| {
+            matches!(
+                path.as_str(),
+                "/api/issuer/token" | "/api/issuer/nonce" | "/api/issuer/credentials"
+            )
+        })
+        .count();
+    server.set_resolver_mode(ResolverFixtureMode::NotFound);
+    let unresolved = request(
+        &mut first,
+        "reverify-unresolved",
+        "credential.reverify",
+        json!({"credentialId":credential_id}),
+    );
+    assert_eq!(
+        unresolved["result"]["credential"]["verification"]["outcome"],
+        "error"
+    );
+    assert!(
+        unresolved["result"]["credential"]["verification"]["stages"]
+            .as_array()
+            .expect("unresolved stages")
+            .iter()
+            .any(|stage| stage["name"] == "issuer"
+                && stage["status"] == "failed"
+                && stage["reasonCode"] == "issuer_not_found")
+    );
+    server.set_resolver_mode(ResolverFixtureMode::StaleIssuerKey);
+    let stale = request(
+        &mut first,
+        "reverify-stale-resolver",
+        "credential.reverify",
+        json!({"credentialId":credential_id}),
+    );
+    assert_eq!(
+        stale["result"]["credential"]["verification"]["outcome"],
+        "invalid"
+    );
+    assert_eq!(
+        server
+            .state
+            .lock()
+            .expect("state")
+            .journal
+            .iter()
+            .filter(|(path, _)| matches!(
+                path.as_str(),
+                "/api/issuer/token" | "/api/issuer/nonce" | "/api/issuer/credentials"
+            ))
+            .count(),
+        secret_calls_before_resolver_failures,
+        "resolver failures must not replay protocol secret calls"
+    );
+    server.set_resolver_mode(ResolverFixtureMode::Current);
     let reverified = request(
         &mut first,
         "reverify",

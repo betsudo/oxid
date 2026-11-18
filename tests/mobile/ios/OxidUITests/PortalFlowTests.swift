@@ -86,6 +86,9 @@ final class PortalFlowTests: XCTestCase {
         if createWallet.exists {
             createWallet.tap()
             let publicDemo = application.buttons["Use public demo wallet"]
+            if !publicDemo.waitForExistence(timeout: 3), createWallet.exists {
+                createWallet.tap()
+            }
             XCTAssertTrue(publicDemo.waitForExistence(timeout: 10))
             publicDemo.tap()
             let createAndContinue = application.buttons["Create and continue"]
@@ -298,7 +301,7 @@ final class PortalFlowTests: XCTestCase {
         let copyDid = application.buttons["Copy DID"]
         XCTAssertTrue(copyDid.waitForExistence(timeout: 600))
         XCTAssertTrue(application.staticTexts["Managed"].exists)
-        XCTAssertTrue(application.staticTexts["Midnight network"].exists)
+        XCTAssertTrue(application.staticTexts["Standalone development · Midnight network"].exists)
     }
 
     @MainActor
@@ -392,6 +395,51 @@ final class PortalFlowTests: XCTestCase {
         assertSingleValidCredentialDetails(in: application)
         XCTAssertFalse(application.staticTexts["John"].exists)
         XCTAssertFalse(application.staticTexts["Doe"].exists)
+    }
+
+    @MainActor
+    func testPasteAndIssue() {
+        let application = application()
+        ensureProfile(in: application)
+        application.buttons["Documents"].tap()
+        let addDocument = application.buttons["Add document"]
+        if addDocument.waitForExistence(timeout: 5) {
+            scrollTo(addDocument, in: application)
+            addDocument.tap()
+        }
+        let startAnotherOffer = application.buttons["Start another offer"]
+        if startAnotherOffer.waitForExistence(timeout: 5) {
+            scrollTo(startAnotherOffer, in: application)
+            startAnotherOffer.tap()
+        }
+
+        let offer = application.textViews["Credential offer URI"]
+        XCTAssertTrue(offer.waitForExistence(timeout: 15))
+        scrollTo(offer, in: application)
+        offer.tap()
+        offer.press(forDuration: 1)
+        let paste = application.menuItems["Paste"]
+        XCTAssertTrue(paste.waitForExistence(timeout: 10))
+        paste.tap()
+
+        let preview = application.buttons["Preview credential offer"]
+        XCTAssertTrue(preview.waitForExistence(timeout: 10))
+        XCTAssertTrue(preview.isEnabled)
+        scrollTo(preview, in: application)
+        preview.tap()
+
+        let consent = assertExactPreview(in: application)
+        scrollTo(consent, in: application)
+        consent.tap()
+        let issue = application.buttons["Accept and issue credential"]
+        XCTAssertTrue(issue.isEnabled)
+        scrollTo(issue, in: application)
+        issue.tap()
+        XCTAssertTrue(application.staticTexts[
+            "Credential issued, verified, and stored in the protected inventory."
+        ].waitForExistence(timeout: 100))
+        XCTAssertTrue(application.staticTexts["Saved to your wallet"].waitForExistence(timeout: 20))
+        assertSingleValidCredentialDetails(in: application)
     }
 
     @MainActor

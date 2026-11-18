@@ -36,6 +36,26 @@ use zeroize::Zeroizing;
 
 use super::*;
 
+#[test]
+fn funding_failures_preserve_actionable_safe_categories() {
+    assert_eq!(
+        map_transaction_failure(WalletTransactionPortError::InsufficientFunds),
+        DidDeploymentFailure::InsufficientNight
+    );
+    assert_eq!(
+        map_transaction_failure(WalletTransactionPortError::InvalidChainState),
+        DidDeploymentFailure::ChainStateUnavailable
+    );
+    assert_eq!(
+        map_transaction_failure(WalletTransactionPortError::UnsupportedNetwork),
+        DidDeploymentFailure::UnsupportedNetwork
+    );
+    assert_eq!(
+        map_transaction_failure(WalletTransactionPortError::InvalidData),
+        DidDeploymentFailure::InvalidFundingPlan
+    );
+}
+
 struct FixedClock;
 
 impl ClockPort for FixedClock {
@@ -660,6 +680,56 @@ fn outcome_unknown_reconciles_without_a_second_submission() {
     assert_eq!(reconciled.state(), DidDeploymentState::Ready);
     assert_eq!(reconciled.operation_id(), unknown.operation_id());
     assert_eq!(submissions.submissions.load(Ordering::SeqCst), 8);
+}
+
+#[test]
+fn restored_submitting_operation_reconciles_before_continuing() {
+    let submissions = Arc::new(IncludedSubmission {
+        submissions: AtomicUsize::new(0),
+    });
+    let operations = Arc::new(MemoryOperations::default());
+    let deploy = command();
+    let operation = DidDeploymentOperation::new(
+        DidDeploymentOperationId::parse("deployment-restored-submitting").expect("operation id"),
+        deploy.profile_id.clone(),
+        deploy.network,
+        UnixTimestampMillis::new(10_000),
+    )
+    .expect("operation");
+    let did =
+        MidnightDid::parse(format!("did:midnight:undeployed:{}", "a".repeat(64))).expect("DID");
+    let submission_id = effect_submission_id(&operation);
+    let operation = operation
+        .composed(did, submission_id, UnixTimestampMillis::new(10_000))
+        .expect("composed")
+        .transition(
+            DidDeploymentState::Proving,
+            UnixTimestampMillis::new(10_000),
+        )
+        .expect("proving")
+        .transition(
+            DidDeploymentState::Submitting,
+            UnixTimestampMillis::new(10_000),
+        )
+        .expect("submitting");
+    operations
+        .upsert(operation)
+        .expect("persist interrupted state");
+    let service = NativeDidDeploymentService::with_effects(
+        Arc::new(AllEffectsComposer),
+        Arc::new(PassthroughFunding),
+        Arc::clone(&submissions) as Arc<dyn MidnightContractCallSubmissionPort>,
+        Arc::new(LiveResolver { complete: true }),
+        operations,
+        Arc::new(FixedClock),
+        Arc::new(FixedRandom),
+    );
+
+    let recovered = futures::executor::block_on(service.execute(deploy))
+        .expect("reconciled deployment completes");
+
+    assert_eq!(recovered.state(), DidDeploymentState::Ready);
+    assert_eq!(submissions.submissions.load(Ordering::SeqCst), 7);
 }
 
 #[test]

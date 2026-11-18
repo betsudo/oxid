@@ -1394,6 +1394,47 @@ mod tests {
     }
 
     #[test]
+    fn ledger9_adapter_matches_the_typescript_jubjub_wire_vectors() {
+        use midnight_did_domain::encode_jubjub_jwk_coordinate_from_little_endian;
+        use midnight_did_jubjub_schnorr::{
+            decode_signature, derive_public_key_from_seed, encode_signature,
+            sign_payload_from_seed, verify_payload,
+        };
+
+        const SEED: [u8; 32] = [
+            0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e,
+            0x0f, 0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18, 0x19, 0x1a, 0x1b, 0x1c,
+            0x1d, 0x1e, 0x1f, 0x20,
+        ];
+        const PAYLOAD: &[u8] = b"midnight-identity jubjub-schnorr golden vector";
+        const X_JWK: &str = "EMyWcM8XCxkJTyn8MDXM4q6wVLMfqCxYCu0MwT0hHPQ";
+        const Y_JWK: &str = "H0wYFnDb0GGRQPznl3NU9G1sohdsMMrVdZpEQyiZrd0";
+        const SIGNATURE_HEX: &str = "02b4bfc039ddca33a2bc807a2df358682a81a6dd0db45eaf9567f00d000211460abff840b93c8fbc864111ba6009a31d227a9e04d44adcc6a44c0b103bb459da0603b2f0bc6eb850600cc297da66b157c88c53a731cfda0887153d531eabcd9c";
+
+        let public_key = derive_public_key_from_seed(&SEED);
+        let x = public_key.x().expect("non-identity x coordinate");
+        let y = public_key.y().expect("non-identity y coordinate");
+        assert_eq!(
+            encode_jubjub_jwk_coordinate_from_little_endian(&x.as_le_bytes(), "x")
+                .expect("canonical x"),
+            X_JWK
+        );
+        assert_eq!(
+            encode_jubjub_jwk_coordinate_from_little_endian(&y.as_le_bytes(), "y")
+                .expect("canonical y"),
+            Y_JWK
+        );
+
+        let signature = sign_payload_from_seed(&SEED, PAYLOAD).expect("deterministic signature");
+        let encoded = encode_signature(&signature).expect("canonical signature");
+        assert_eq!(hex::encode(&encoded), SIGNATURE_HEX);
+        let typescript_signature =
+            decode_signature(&hex::decode(SIGNATURE_HEX).expect("frozen signature hex"))
+                .expect("TypeScript signature decodes");
+        assert!(verify_payload(&public_key, PAYLOAD, &typescript_signature));
+    }
+
+    #[test]
     fn fails_closed_for_live_unmanaged_locked_and_conflicting_operations() {
         let (security, lifecycle, profile) = setup();
         assert_eq!(
