@@ -39,10 +39,14 @@ test("Portal iOS holder preparation follows the current DID detail contract", as
 });
 
 test("Portal acceptance uses only named development authority and bounded cleanup", async () => {
-  const [appManifest, profile, headless, lifecycle, liveFlow] = await Promise.all([
+  const [appManifest, profile, headlessProfile, headless, lifecycle, liveFlow] = await Promise.all([
     readFile(new URL("apps/oxid/Cargo.toml", root), "utf8"),
     readFile(
       new URL("crates/composition/src/profile_mobile.rs", root),
+      "utf8",
+    ),
+    readFile(
+      new URL("crates/composition/src/profile_headless.rs", root),
       "utf8",
     ),
     readFile(new URL("scripts/e2e/portal-headless-e2e.sh", root), "utf8"),
@@ -72,6 +76,14 @@ test("Portal acceptance uses only named development authority and bounded cleanu
   assert.match(
     profile,
     /let did_approvals = Some\(super::profile_headless::development_did_approval_service\(\)\)/u,
+  );
+  assert.match(
+    headlessProfile,
+    /all\(not\(target_os = "ios"\), not\(target_os = "android"\)\),\s*feature = "mobile-portal"/u,
+  );
+  assert.match(
+    headlessProfile,
+    /DevelopmentWalletSecurity::persistent\([\s\S]*?directory\.join\("private"\)/u,
   );
   assert.match(headless, /--features development-did-approval-fixture/u);
   assert.match(lifecycle, /timeout -k 5s 40s docker compose/u);
