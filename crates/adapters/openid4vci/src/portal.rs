@@ -79,6 +79,41 @@ const BUNDLED_PROVENANCE: &[u8] = include_bytes!(
     "../../../../fixtures/laceid-portal/25499870f84d77173c46e4af3021311decfb840b/openid4vci-final/provenance.json"
 );
 
+const LEDGER9_SOURCE: PortalSource = PortalSource {
+    commit: "154ad777456ab40ab2f46a8b94959ae63b14a459",
+    tree: "4f9952cebd0e9cc8a82ec9d459d2eadc9cce8adb",
+    provenance_sha256: "70f67a9f339ca0756ca4d10f5bef9dea769746094076288b8f571d93cb9c51fc",
+    lock: include_bytes!(
+        "../../../../fixtures/laceid-portal/154ad777456ab40ab2f46a8b94959ae63b14a459/source-lock.json"
+    ),
+    provenance: include_bytes!(
+        "../../../../fixtures/laceid-portal/154ad777456ab40ab2f46a8b94959ae63b14a459/openid4vci-final/provenance.json"
+    ),
+};
+const BUNDLED_SOURCE: PortalSource = PortalSource {
+    commit: PORTAL_INTEGRATION_COMMIT,
+    tree: PORTAL_INTEGRATION_TREE,
+    provenance_sha256: PORTAL_PROVENANCE_SHA256,
+    lock: BUNDLED_SOURCE_LOCK,
+    provenance: BUNDLED_PROVENANCE,
+};
+
+struct PortalSource {
+    commit: &'static str,
+    tree: &'static str,
+    provenance_sha256: &'static str,
+    lock: &'static [u8],
+    provenance: &'static [u8],
+}
+
+impl PortalSource {
+    fn matches(&self, manifest: &PortalDeploymentManifest) -> bool {
+        manifest.integration_commit == self.commit
+            && manifest.integration_tree == self.tree
+            && manifest.provenance_sha256 == self.provenance_sha256
+    }
+}
+
 /// Payload-free deployment/source-lock authentication errors.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PortalDeploymentManifestError {
@@ -204,13 +239,21 @@ impl PortalDeploymentManifest {
     }
 
     fn validate(&self) -> Result<(), PortalDeploymentManifestError> {
-        if self.schema != "oxid-portal-deployment-v3"
-            || self.integration_commit != PORTAL_INTEGRATION_COMMIT
-            || self.integration_tree != PORTAL_INTEGRATION_TREE
-            || self.provenance_sha256 != PORTAL_PROVENANCE_SHA256
-        {
+        if self.schema != "oxid-portal-deployment-v3" {
             return Err(PortalDeploymentManifestError::SourceLockMismatch);
         }
+        let source = if BUNDLED_SOURCE.matches(self) {
+            &BUNDLED_SOURCE
+        } else if LEDGER9_SOURCE.matches(self) {
+            if self.issuer_origin != "http://127.0.0.1:8090"
+                || self.issuer_resolver_origin != "http://127.0.0.1:9092"
+            {
+                return Err(PortalDeploymentManifestError::InvalidOrigin);
+            }
+            &LEDGER9_SOURCE
+        } else {
+            return Err(PortalDeploymentManifestError::SourceLockMismatch);
+        };
         validate_origin(&self.issuer_origin)?;
         validate_resolver_base(&self.issuer_resolver_origin)?;
         validate_issuer_did(&self.issuer_did)?;
@@ -235,8 +278,7 @@ impl PortalDeploymentManifest {
         {
             return Err(PortalDeploymentManifestError::InvalidJwk);
         }
-        authenticate_bundled_portal_source()?;
-        Ok(())
+        authenticate_portal_source(source)
     }
 
     #[must_use]
@@ -273,10 +315,14 @@ impl PortalDeploymentManifest {
 /// Authenticates the exact raw upstream provenance and the immutable source
 /// pins compiled into this native adapter.
 pub fn authenticate_bundled_portal_source() -> Result<(), PortalDeploymentManifestError> {
-    if sha256_hex(BUNDLED_PROVENANCE) != PORTAL_PROVENANCE_SHA256 {
+    authenticate_portal_source(&BUNDLED_SOURCE)
+}
+
+fn authenticate_portal_source(source: &PortalSource) -> Result<(), PortalDeploymentManifestError> {
+    if sha256_hex(source.provenance) != source.provenance_sha256 {
         return Err(PortalDeploymentManifestError::SourceLockMismatch);
     }
-    let lock = parse_strict_json(BUNDLED_SOURCE_LOCK)
+    let lock = parse_strict_json(source.lock)
         .map_err(|_| PortalDeploymentManifestError::SourceLockMismatch)?;
     let lock = lock
         .as_object()
@@ -291,16 +337,16 @@ pub fn authenticate_bundled_portal_source() -> Result<(), PortalDeploymentManife
     ];
     if lock.len() != lock_keys.len()
         || !lock_keys.iter().all(|key| lock.contains_key(*key))
-        || lock["integrationCommit"] != PORTAL_INTEGRATION_COMMIT
-        || lock["integrationTree"] != PORTAL_INTEGRATION_TREE
+        || lock["integrationCommit"] != source.commit
+        || lock["integrationTree"] != source.tree
         || lock["profileSourceCommit"] != PORTAL_PROFILE_SOURCE_COMMIT
         || lock["provenancePath"] != "openid4vci-final/provenance.json"
-        || lock["provenanceSha256"] != PORTAL_PROVENANCE_SHA256
+        || lock["provenanceSha256"] != source.provenance_sha256
         || lock["schema"] != "oxid-portal-source-lock-v3"
     {
         return Err(PortalDeploymentManifestError::SourceLockMismatch);
     }
-    let value = parse_strict_json(BUNDLED_PROVENANCE)
+    let value = parse_strict_json(source.provenance)
         .map_err(|_| PortalDeploymentManifestError::SourceLockMismatch)?;
     if value["schema"] != "laceid-openid4vci-profile-provenance-v1"
         || value["portal"]["profileSourceCommit"] != PORTAL_PROFILE_SOURCE_COMMIT

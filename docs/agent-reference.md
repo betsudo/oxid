@@ -596,6 +596,13 @@ as source-derived negative contract evidence only. ADR-0102 pins merged Portal
 `integration` commit `25499870f84d77173c46e4af3021311decfb840b`, tree
 `2d845d2293603dfd8adce5362c8a9941e6ba78a9`, and refreshed Final-profile
 provenance digest `63d2dd182f1a315d8fe7677ae6481aecebd2fd9cff709cc438b6c0261a3cf4c7`.
+The shared Ledger 9 lane admits merged Portal commit
+`154ad777456ab40ab2f46a8b94959ae63b14a459`, tree
+`4f9952cebd0e9cc8a82ec9d459d2eadc9cce8adb` and Final-profile provenance digest
+`70f67a9f339ca0756ca4d10f5bef9dea769746094076288b8f571d93cb9c51fc`.
+This source lock requires the issuer at `http://127.0.0.1:8090` and the pinned
+resolver at `http://127.0.0.1:9092`.
+
 Native desktop/headless development selects the strict HTTP
 adapter through an absolute manifest path plus exact digest. The
 `portal-headless-e2e` target fetches that exact Lace integration tree and runs
