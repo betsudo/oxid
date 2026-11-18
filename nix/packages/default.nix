@@ -12,10 +12,11 @@
         publicParams = inputs.midnight-zkir-ledger9.packages.${pkgs.stdenv.hostPlatform.system}.public-params;
       };
       cargoOutputHashes = {
-        "midnight-base-crypto-1.0.1" = "sha256-KVp5T/m9NzzUwn4dnlp5IVy9DoticxIquio7ms6g+1Q=";
-        "midnight-compact-runtime-0.16.102" = "sha256-e+2iLWOlwQGpbrsJvNN5ryAxm2jzBlE6g+eQC8x3l6I=";
-        "midnight-did-domain-0.5.0" = "sha256-eMZ7YjJ1QrWsBJu1cWOPHsU3zeyNa49aAKmV7+ZTNq8=";
-        "midnight-proofs-0.7.3" = "sha256-FWFXBZAoYmJJYuAry70jAKXPGhn6qSA18luxg3XalO4=";
+        "midnight-base-crypto-1.1.1" = "sha256-7nPujsILZToXHIBcRemu8NLrxmrg2+QM4sKPsJwGgu0=";
+        "midnight-compact-runtime-0.2.0" = "sha256-Z7UM69FOS0DWefFGW71GlEz2lYWTOFoi1XnekD2jgM8=";
+        "midnight-did-domain-0.5.0" = "sha256-EClXcL4MpyDjYcEt6nEaNINJJNan+Nr15NOGk3xaooY=";
+        "midnight-proofs-0.8.2" = "sha256-lofqa58hDlJ0C3vIWFodsdwYYwYoPEDpS1PMGV9TULg=";
+        "midnight-zkir-3.2.1" = "sha256-GtULoNDWGXjgIf9Vh8C4OXKlRLwm37lDQ+f0DAay/9c=";
       };
       presentationCompactArtifacts = pkgs.callPackage ./presentation-compact-artifacts.nix {
         compactMidnight = midnightDidPackages.compact-midnight;
