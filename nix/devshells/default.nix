@@ -96,7 +96,7 @@
           # Coverage must exercise the same pinned native DID paths as the
           # developer shell. Without these inputs the artifact-backed tests
           # return early while still reporting success.
-          export OXID_MIDNIGHT_DID_ARTIFACTS_DIR=${self'.packages.midnight-did-compact-artifacts}
+          export OXID_MIDNIGHT_DID_ARTIFACTS_DIR=${self'.packages.midnight-did-ledger9-zkir}
         '';
       };
 
@@ -160,7 +160,7 @@
           export JAVA_HOME=${pkgs.jdk17.home}
           export PATH="$JAVA_HOME/bin:$PATH"
           export COMPACT_DIRECTORY=${midnightDidPackages.compact-toolchain}
-          export OXID_MIDNIGHT_DID_ARTIFACTS_DIR=${self'.packages.midnight-did-compact-artifacts}
+          export OXID_MIDNIGHT_DID_ARTIFACTS_DIR=${self'.packages.midnight-did-ledger9-zkir}
           export OXID_PRESENTATION_ARTIFACTS_DIR=${self'.packages.presentation-compact-artifacts}
           # Keep only runtime state in the Git common directory. PI_CODING_AGENT_DIR
           # remains user-scoped because it owns authentication and user policy;

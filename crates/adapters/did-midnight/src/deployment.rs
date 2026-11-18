@@ -427,7 +427,7 @@ const fn map_security_error(error: WalletSecurityPortError) -> DidLifecyclePortE
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Mutex;
+    use std::{io::Cursor, sync::Mutex};
 
     use oxid_wallet_application::{WalletDerivedSecretUsePort, WalletHdPath};
 
@@ -511,6 +511,33 @@ mod tests {
             first_transaction.as_slice()
         );
         assert_eq!(custody.paths.lock().expect("paths").len(), 8);
+    }
+
+    #[test]
+    fn composed_deploy_preserves_ledger_balance_across_serialization() {
+        let transaction =
+            NativeMidnightDidDeploymentComposer::new(Arc::new(RecordingCustody::new()))
+                .compose(&request())
+                .expect("deployment")
+                .into_transaction();
+        let mut cursor = Cursor::new(transaction.as_slice());
+        let decoded: LedgerTransaction = midnight_serialize::tagged_deserialize(&mut cursor)
+            .expect("decode deployment transaction");
+        assert_eq!(
+            usize::try_from(cursor.position()).expect("cursor"),
+            transaction.len()
+        );
+        decoded.balance(None).expect("deployment balance");
+
+        let mut encoded = Vec::new();
+        midnight_serialize::tagged_serialize(&decoded, &mut encoded)
+            .expect("re-encode deployment transaction");
+        let mut cursor = Cursor::new(encoded.as_slice());
+        let round_trip: LedgerTransaction = midnight_serialize::tagged_deserialize(&mut cursor)
+            .expect("decode round-trip deployment transaction");
+        round_trip
+            .balance(None)
+            .expect("round-trip deployment balance");
     }
 
     #[test]

@@ -362,7 +362,7 @@ impl NativeMidnightDidCallComposer {
         let mut hasher = Sha256::new();
         hasher.update(b"oxid:did-call:replay:v1");
         hasher.update(operation_scope.as_bytes());
-        hasher.update(operation.circuit().id().as_bytes());
+        hasher.update(operation.circuit().artifact_id().as_bytes());
         self.compose(&NativeMidnightDidCallRequest {
             profile_id,
             account_index,
@@ -810,6 +810,7 @@ const fn map_security_error(error: WalletSecurityPortError) -> DidLifecyclePortE
         | WalletSecurityPortError::InvalidOperation => DidLifecyclePortError::InvalidOperation,
     }
 }
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -381,7 +381,7 @@ impl DidDeploymentEffectComposer for NativeDidDeploymentEffects {
                 operation.network().as_str(),
                 account_index,
                 address,
-                circuit.id(),
+                circuit.artifact_id(),
                 artifacts
                     .verifier_key(circuit)
                     .map_err(|_| NativeDidDeploymentError::Unavailable)?,
@@ -884,8 +884,16 @@ impl fmt::Display for NativeDidDeploymentError {
 impl Error for NativeDidDeploymentError {}
 
 impl From<DidDeploymentOperationError> for NativeDidDeploymentError {
-    fn from(_: DidDeploymentOperationError) -> Self {
-        Self::Operation
+    fn from(error: DidDeploymentOperationError) -> Self {
+        match error {
+            DidDeploymentOperationError::Integrity
+            | DidDeploymentOperationError::InvalidData
+            | DidDeploymentOperationError::InvalidTransition => Self::Integrity,
+            DidDeploymentOperationError::Unavailable
+            | DidDeploymentOperationError::NotFound
+            | DidDeploymentOperationError::Conflict
+            | DidDeploymentOperationError::CapacityExceeded => Self::Operation,
+        }
     }
 }
 

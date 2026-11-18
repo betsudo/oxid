@@ -29,7 +29,12 @@ const PROOF_SERVER: &str = "http://127.0.0.1:6300";
 const PLACEHOLDER_ADDRESS: &str =
     "mn_addr_undeployed1asujt0dayj4pelgq97wv75hjhscqv9epmzzpapkf8sy8c87jhh9smkp9zh";
 
-struct StateRoot(PathBuf);
+const RETAINED_STATE_PARENT_ENV: &str = "OXID_LIVE_E2E_RETAIN_STATE_PARENT";
+
+struct StateRoot {
+    path: PathBuf,
+    retained: bool,
+}
 
 impl StateRoot {
     fn new() -> Self {
@@ -37,18 +42,35 @@ impl StateRoot {
             .duration_since(UNIX_EPOCH)
             .expect("clock is after epoch")
             .as_nanos();
-        let path = std::env::temp_dir().join(format!(
+        let default_parent = std::env::temp_dir();
+        let (parent, retained) = match std::env::var_os(RETAINED_STATE_PARENT_ENV) {
+            Some(parent) => {
+                let parent = PathBuf::from(parent);
+                assert!(
+                    parent.is_absolute()
+                        && !parent
+                            .components()
+                            .any(|component| matches!(component, std::path::Component::ParentDir)),
+                    "retained live-test state parent must be an absolute normalized path"
+                );
+                fs::create_dir_all(&parent).expect("retained state parent is created");
+                make_owner_private(&parent);
+                (parent, true)
+            }
+            None => (default_parent, false),
+        };
+        let path = parent.join(format!(
             "oxid-standalone-faucet-{}-{unique}",
             std::process::id()
         ));
         fs::create_dir_all(path.join("private")).expect("isolated state directory");
         make_owner_private(&path);
         make_owner_private(&path.join("private"));
-        Self(path)
+        Self { path, retained }
     }
 
     fn child(&self, name: &str) -> PathBuf {
-        let path = self.0.join(name);
+        let path = self.path.join(name);
         fs::create_dir_all(path.join("private")).expect("isolated child state directory");
         make_owner_private(&path);
         make_owner_private(&path.join("private"));
@@ -56,11 +78,18 @@ impl StateRoot {
     }
 
     fn cleanup(self) {
-        fs::remove_dir_all(&self.0).expect("isolated live-test state cleanup");
-        assert!(
-            !self.0.exists(),
-            "isolated live-test state must be absent after cleanup"
-        );
+        if self.retained {
+            println!(
+                "standalone-live-e2e: retained-state-root={}",
+                self.path.display()
+            );
+        } else {
+            fs::remove_dir_all(&self.path).expect("isolated live-test state cleanup");
+            assert!(
+                !self.path.exists(),
+                "isolated live-test state must be absent after cleanup"
+            );
+        }
     }
 }
 
@@ -77,7 +106,9 @@ fn make_owner_private(_: &Path) {}
 
 impl Drop for StateRoot {
     fn drop(&mut self) {
-        let _ = fs::remove_dir_all(&self.0);
+        if !self.retained {
+            let _ = fs::remove_dir_all(&self.path);
+        }
     }
 }
 
@@ -189,7 +220,13 @@ impl ProcessHarness {
         self.input.flush().expect("request flush");
         let mut line = String::new();
         self.output.read_line(&mut line).expect("response line");
-        assert!(!line.is_empty(), "child exited before responding");
+        if line.is_empty() {
+            let mut stderr = String::new();
+            self.error
+                .read_to_string(&mut stderr)
+                .expect("child stderr after unexpected exit");
+            panic!("child exited before responding; stderr={stderr}");
+        }
         serde_json::from_str(&line).expect("response JSON")
     }
 
@@ -837,12 +874,24 @@ fn funded_wallet_deploys_and_resolves_a_native_holder_did() {
             let stderr = wallet.terminate_and_read_stderr();
             let progress = fs::read_to_string(wallet_root.join("private/did-deployments.json"))
                 .unwrap_or_else(|error| format!("unavailable: {error}"));
+            let submissions = fs::read_to_string(wallet_root.join("private/submissions.json"))
+                .unwrap_or_else(|error| format!("unavailable: {error}"));
             panic!(
-                "native DID deployment failed: {deployment}; progress={progress}; stderr={stderr}"
+                "native DID deployment failed: {deployment}; progress={progress}; submissions={submissions}; stderr={stderr}"
             );
         }
         if deployment["result"]["deployment"]["state"] == "ready" {
             break deployment;
+        }
+        if deployment["result"]["deployment"]["state"] == "retryable_failure" {
+            let stderr = wallet.terminate_and_read_stderr();
+            let progress = fs::read_to_string(wallet_root.join("private/did-deployments.json"))
+                .unwrap_or_else(|error| format!("unavailable: {error}"));
+            let submissions = fs::read_to_string(wallet_root.join("private/submissions.json"))
+                .unwrap_or_else(|error| format!("unavailable: {error}"));
+            panic!(
+                "native DID deployment paused without forward progress: {deployment}; progress={progress}; submissions={submissions}; stderr={stderr}"
+            );
         }
         assert!(
             started.elapsed() < DID_DEPLOYMENT_DEADLINE,

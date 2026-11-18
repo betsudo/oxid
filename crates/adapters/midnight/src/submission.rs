@@ -90,6 +90,7 @@ const MAX_PROOF_REQUEST_BYTES: usize = 16 * 1024 * 1024;
 const MAX_PROOF_RESPONSE_BYTES: usize = 16 * 1024 * 1024;
 const MAX_TRANSACTION_BYTES: usize = 16 * 1024 * 1024;
 const MAX_BALANCE_ITERATIONS: usize = 16;
+const MAX_FEE_RECONCILIATION_ITERATIONS: usize = 3;
 const MAX_RECONCILIATION_BLOCKS: usize = 2_048;
 
 type UnprovenTransaction =
@@ -558,7 +559,7 @@ where
         &mut persist_progress,
     )
     .await?;
-    let mut dust_state = synchronized.state;
+    let dust_state = synchronized.state;
     ensure_submission_active(&cancellation)?;
     if dust_state.params != chain_tip.parameters.dust {
         return Err(WalletTransactionPortError::InvalidChainState);
@@ -582,33 +583,56 @@ where
     if ttl <= current_time {
         return Err(WalletTransactionPortError::DraftExpired);
     }
-    let (balanced, fee_specks) = balance_dust(
-        request.transaction.clone(),
-        &mut dust_state,
-        dust_key,
-        &chain_tip.parameters,
-        current_time,
-        ttl,
-        config.indexer.network_id().as_str(),
-    )?;
-    let sealed = match config.proving() {
-        MidnightProvingMode::Local(local_config) => {
-            let outcome =
-                local_proving::prove_transaction(balanced, local_config, &cancellation).await?;
-            let _metrics = outcome.metrics;
-            outcome.transaction
+    // Ledger 9 fee calculation is accurate only for proven transactions. The
+    // first pass therefore uses the unproven estimate to construct the DUST
+    // intent, then bounded reconciliation passes rebuild that intent with the
+    // actual sealed fee. Re-proving is intentional: changing the DUST spend
+    // changes the transaction binding input, so the first proof cannot be
+    // submitted with the corrected fee.
+    let original_transaction = request.transaction.clone();
+    let original_dust_state = dust_state.clone();
+    let mut required_fee = None;
+    let mut reconciled = None;
+    for _ in 0..MAX_FEE_RECONCILIATION_ITERATIONS {
+        ensure_submission_active(&cancellation)?;
+        let mut candidate_dust_state = original_dust_state.clone();
+        let (balanced, funded_fee) = balance_dust(
+            original_transaction.clone(),
+            &mut candidate_dust_state,
+            dust_key,
+            &chain_tip.parameters,
+            current_time,
+            ttl,
+            config.indexer.network_id().as_str(),
+            required_fee,
+        )?;
+        let sealed = match config.proving() {
+            MidnightProvingMode::Local(local_config) => {
+                let outcome =
+                    local_proving::prove_transaction(balanced, local_config, &cancellation).await?;
+                let _metrics = outcome.metrics;
+                outcome.transaction
+            }
+            MidnightProvingMode::Remote { proof_server_url } => {
+                prove_via_http(balanced, proof_server_url, remote_proving_material.cloned()).await?
+            }
+        };
+        ensure_submission_active(&cancellation)?;
+        let sealed_fee = sealed
+            .fees(&chain_tip.parameters, false)
+            .map_err(|_| WalletTransactionPortError::InvalidChainState)?;
+        let sealed_balance = sealed
+            .balance(Some(sealed_fee))
+            .map_err(|_| WalletTransactionPortError::InvalidChainState)?;
+        let final_fee_is_covered =
+            funded_fee >= sealed_fee && sealed_balance.values().all(|balance| *balance >= 0);
+        if final_fee_is_covered {
+            reconciled = Some((sealed, sealed_fee));
+            break;
         }
-        MidnightProvingMode::Remote { proof_server_url } => {
-            prove_via_http(balanced, proof_server_url, remote_proving_material.cloned()).await?
-        }
-    };
-    ensure_submission_active(&cancellation)?;
-    let sealed_fee = sealed
-        .fees(&chain_tip.parameters, false)
-        .map_err(|_| WalletTransactionPortError::InvalidChainState)?;
-    if sealed_fee != fee_specks {
-        return Err(WalletTransactionPortError::InvalidChainState);
+        required_fee = Some(sealed_fee);
     }
+    let (sealed, fee_specks) = reconciled.ok_or(WalletTransactionPortError::InvalidChainState)?;
     let mut transaction_bytes = Vec::new();
     midnight_serialize::tagged_serialize(&sealed, &mut transaction_bytes)
         .map_err(|_| WalletTransactionPortError::InvalidData)?;
@@ -1258,15 +1282,17 @@ fn balance_dust(
     current_time: Timestamp,
     ttl: Timestamp,
     network_id: &str,
+    required_fee: Option<u128>,
 ) -> Result<(UnprovenTransaction, u128), WalletTransactionPortError> {
     let original_transaction = transaction.clone();
     let original_dust = dust_state.clone();
     let mut current = transaction;
     let mut accumulated_dust = 0_u128;
     for _ in 0..MAX_BALANCE_ITERATIONS {
-        let fees = current
+        let estimated_fees = current
             .fees(parameters, false)
             .map_err(|_| WalletTransactionPortError::InvalidChainState)?;
+        let fees = required_fee.unwrap_or(estimated_fees);
         let balance = current
             .balance(Some(fees))
             .map_err(|_| WalletTransactionPortError::InvalidChainState)?;
@@ -2762,9 +2788,73 @@ mod tests {
                 Timestamp::from_secs(1_700_000_000),
                 Timestamp::from_secs(1_700_003_600),
                 "undeployed",
+                None,
             )
             .err(),
             Some(WalletTransactionPortError::InsufficientDust)
+        );
+    }
+
+    #[test]
+    fn dust_reconciliation_uses_the_proven_fee_instead_of_the_unproven_estimate() {
+        use midnight_base_crypto::{hash::HashOutput, time::Timestamp};
+        use midnight_ledger::dust::{
+            DustGenerationInfo, InitialNonce, QualifiedDustOutput, dust_first_nonce,
+        };
+
+        let dust_key = DustSecretKey::derive_secret_key(&[0x5a; 32]);
+        let owner = DustPublicKey::from(dust_key.clone());
+        let backing_night = InitialNonce(HashOutput([0x2a; 32]));
+        let created_at = Timestamp::from_secs(1);
+        let generation = DustGenerationInfo {
+            value: 1_000_000_000_000_000,
+            owner,
+            nonce: backing_night,
+            dtime: Timestamp::MAX,
+        };
+        let output = QualifiedDustOutput {
+            initial_value: generation.value,
+            owner,
+            nonce: dust_first_nonce(&backing_night, &owner),
+            seq: 0,
+            ctime: created_at,
+            backing_night,
+            mt_index: 0,
+        };
+        let mut dust_state = DustLocalState::<DefaultDB>::new(INITIAL_PARAMETERS.dust)
+            .insert_generation_info(0, generation, Some(backing_night))
+            .expect("generation info inserts")
+            .insert_commitment(0, output, true)
+            .expect("commitment inserts")
+            .add_utxo(&output.nullifier(&dust_key), &output, None)
+            .expect("DUST output inserts");
+        let transaction = Transaction::Standard(StandardTransaction::new(
+            "undeployed",
+            LedgerHashMap::new(),
+            None,
+            LedgerHashMap::new(),
+        ));
+        let proven_fee = 123_456_789_u128;
+
+        let (balanced, funded_fee) = balance_dust(
+            transaction,
+            &mut dust_state,
+            &dust_key,
+            &INITIAL_PARAMETERS,
+            Timestamp::from_secs(2),
+            Timestamp::from_secs(3_600),
+            "undeployed",
+            Some(proven_fee),
+        )
+        .expect("the proven fee is funded");
+
+        assert_eq!(funded_fee, proven_fee);
+        assert!(
+            balanced
+                .balance(Some(proven_fee))
+                .expect("balanced transaction has a ledger balance")
+                .values()
+                .all(|value| *value >= 0)
         );
     }
 }

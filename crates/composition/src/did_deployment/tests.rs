@@ -661,3 +661,28 @@ fn outcome_unknown_reconciles_without_a_second_submission() {
     assert_eq!(reconciled.operation_id(), unknown.operation_id());
     assert_eq!(submissions.submissions.load(Ordering::SeqCst), 8);
 }
+
+#[test]
+fn operation_model_failures_are_not_misreported_as_storage_outages() {
+    for error in [
+        DidDeploymentOperationError::Integrity,
+        DidDeploymentOperationError::InvalidData,
+        DidDeploymentOperationError::InvalidTransition,
+    ] {
+        assert!(matches!(
+            NativeDidDeploymentError::from(error),
+            NativeDidDeploymentError::Integrity
+        ));
+    }
+    for error in [
+        DidDeploymentOperationError::Unavailable,
+        DidDeploymentOperationError::NotFound,
+        DidDeploymentOperationError::Conflict,
+        DidDeploymentOperationError::CapacityExceeded,
+    ] {
+        assert!(matches!(
+            NativeDidDeploymentError::from(error),
+            NativeDidDeploymentError::Operation
+        ));
+    }
+}

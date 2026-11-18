@@ -263,7 +263,7 @@ fi
 did_artifacts_dir=""
 if [ "$portal_profile" != "unavailable" ] && [ "$operation" != "deploy" ]; then
   did_artifacts_dir="$(
-    nix build .#midnight-did-compact-artifacts --no-link --print-out-paths
+    nix build .#midnight-did-ledger9-zkir --no-link --print-out-paths
   )"
 fi
 

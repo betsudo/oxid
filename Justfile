@@ -270,6 +270,11 @@ standalone-night-round-trip-headless-e2e:
 standalone-faucet-http-headless-e2e:
     ./scripts/e2e/standalone-faucet-http-headless-e2e.sh
 
+# Qualify one fresh native holder DID against the designated shared Ledger 9
+# stack. The command attaches read-only and never owns the shared stack.
+shared-ledger9-native-did-headless-e2e:
+    ./scripts/e2e/shared-ledger9-native-did-headless-e2e.sh
+
 # Owner-invoked private HTTPS discovery/funding lifecycle; never starts a phone.
 standalone-faucet-tailnet-start:
     ./scripts/standalone-faucet-tailnet.sh start
