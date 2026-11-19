@@ -92,6 +92,12 @@ its owning upstream graph drops the crate.
 - Enabling Subxt light-client support is forbidden under these exceptions. It
   requires an ADR/dependency review and removal or replacement of the affected
   packages first.
+- `RUSTSEC-2026-0344` affects `ruzstd 0.8.3`, which is locked through the same
+  optional light-client graph. The gate treats this exact advisory and version
+  as inactive only if a locked inverse Cargo tree is empty with all workspace
+  features, platforms, and dependency kinds enabled for inspection. A failed
+  graph query or any reachable path fails the gate. Remove this check when
+  Subxt stops resolving the affected decompressor. See #1197.
 
 ## Yanked crate versions
 

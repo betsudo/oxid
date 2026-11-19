@@ -78,9 +78,24 @@ fi
 failures=0
 
 if [ "$(jq -r '.vulnerabilities.found' "$report")" != "false" ]; then
-  echo "Denied: cargo audit reported vulnerabilities." >&2
-  jq -r '.vulnerabilities.list[]? | "  \(.advisory.id) \(.package.name) \(.package.version)"' "$report" >&2
-  failures=$((failures + 1))
+  findings="$(jq -er '
+    .vulnerabilities.list | select(length > 0) | .[]
+    | "\(.advisory.id) \(.package.name) \(.package.version)"
+  ' "$report")"
+  while IFS= read -r finding; do
+    # #1197: Subxt locks its optional light client even when disabled. Require
+    # an empty inverse tree on every workspace target and feature combination
+    # represented by the maximally enabled workspace graph.
+    if [ "$finding" = "RUSTSEC-2026-0344 ruzstd 0.8.3" ] && \
+      active_graph="$(cargo tree --locked --workspace --all-features --target all \
+        --edges normal,build,dev --invert ruzstd@0.8.3 --prefix none)" && \
+      [ -z "$active_graph" ]; then
+      echo "Note: $finding is present only in the inactive Subxt light-client lockfile graph (#1197)."
+      continue
+    fi
+    echo "Denied: $finding" >&2
+    failures=$((failures + 1))
+  done <<< "$findings"
 fi
 
 # Every informational class other than `yanked` still fails closed, so an
