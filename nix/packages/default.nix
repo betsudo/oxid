@@ -22,7 +22,9 @@
       cargoOutputHashes = {
         "midnight-base-crypto-1.1.1" = "sha256-7nPujsILZToXHIBcRemu8NLrxmrg2+QM4sKPsJwGgu0=";
         "midnight-compact-runtime-0.2.0" = "sha256-Z7UM69FOS0DWefFGW71GlEz2lYWTOFoi1XnekD2jgM8=";
-        "midnight-did-domain-0.5.0" = "sha256-EClXcL4MpyDjYcEt6nEaNINJJNan+Nr15NOGk3xaooY=";
+        # Cargo's Git fetch includes submodules. The GitHub archive in
+        # flake.lock has a separate hash for the same source revision.
+        "midnight-did-domain-0.5.0" = "sha256-J684SunbTIK8fblcMAtBg7lTFj0lzyzpiRNDW9w2Uv4=";
         "midnight-proofs-0.8.2" = "sha256-lofqa58hDlJ0C3vIWFodsdwYYwYoPEDpS1PMGV9TULg=";
         "midnight-zkir-3.2.1" = "sha256-GtULoNDWGXjgIf9Vh8C4OXKlRLwm37lDQ+f0DAay/9c=";
       };
