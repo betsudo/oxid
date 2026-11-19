@@ -103,7 +103,7 @@ export function auditCompatibility({ portalSource, environment = process.env } =
   }
 
   const flake = readFileSync(path.join(root, "flake.nix"), "utf8");
-  if (!flake.includes(`git+${identity.repository}?rev=${identity.revision}&allRefs=1&submodules=1`)) {
+  if (!flake.includes(`git+${identity.repository}?rev=${identity.revision}&ref=develop&submodules=1`)) {
     fail("Nix identity source differs from the reviewed Ledger 9 cohort");
   }
   const flakeLock = JSON.parse(readFileSync(path.join(root, "flake.lock"), "utf8"));
@@ -112,7 +112,7 @@ export function auditCompatibility({ portalSource, environment = process.env } =
     || identityLock?.locked?.type !== "git"
     || identityLock?.locked?.url !== identity.repository
     || identityLock?.locked?.submodules !== true
-    || identityLock?.locked?.allRefs !== true
+    || identityLock?.locked?.ref !== "develop"
     || identityLock?.locked?.rev !== identity.revision) {
     fail("Nix identity lock differs from the reviewed Ledger 9 cohort");
   }

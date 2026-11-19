@@ -16,8 +16,28 @@
       compactSource =
         (builtins.fromJSON (builtins.readFile ../../config/midnight-integration-compatibility.json))
         .wallet.compact;
+      # Match both fields in nixpkgs' vendor lookup. One Ledger Git tree
+      # contains midnight-transient-crypto 2.2.0 and 3.1.0.
+      cargoVendorPath = pkgs.path + "/pkgs/build-support/rust";
+      cargoVendorSource = builtins.readFile (cargoVendorPath + "/import-cargo-lock.nix");
+      lookupByName = ''select(.name == "''${pkg.name}")'';
+      lookupByVersion = ''select(.name == "''${pkg.name}" and .version == "''${pkg.version}")'';
+      versionedCargoVendor =
+        assert builtins.length (pkgs.lib.splitString lookupByName cargoVendorSource) == 3;
+        import (
+          builtins.toFile "oxid-import-cargo-lock.nix" (
+            builtins.replaceStrings
+              [ lookupByName "./replace-workspace-values.py" ]
+              [
+                lookupByVersion
+                (builtins.toJSON (toString (cargoVendorPath + "/replace-workspace-values.py")))
+              ]
+              cargoVendorSource
+          )
+        );
       buildRustPackage = rustPlatform.buildRustPackage.override {
-        importCargoLock = rustPlatform.importCargoLock.override {
+        importCargoLock = pkgs.buildPackages.callPackage versionedCargoVendor {
+          inherit (rustToolchain) cargo;
           # Compact's retained CI evidence mentions Nix store paths. Fetch the
           # reviewed Git tree directly so the evidence does not enter a fetchgit
           # fixed-output derivation. Keep the exact revision and NAR hash.

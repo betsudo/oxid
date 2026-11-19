@@ -36,7 +36,7 @@ test("Nix consumes the same immutable Ledger 9 identity and validates ZKIR compa
     "utf8",
   ));
   const identity = manifest.wallet.nativeIdentity;
-  assert.ok(flake.includes(`git+${identity.repository}?rev=${identity.revision}&allRefs=1&submodules=1`));
+  assert.ok(flake.includes(`git+${identity.repository}?rev=${identity.revision}&ref=develop&submodules=1`));
 
   const derivation = await readFile(
     new URL("../../nix/packages/midnight-did-ledger9-zkir.nix", import.meta.url),
