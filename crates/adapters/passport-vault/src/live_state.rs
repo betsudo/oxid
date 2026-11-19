@@ -49,10 +49,7 @@ query OxidPassportVaultState($address: HexEncoded!, $height: Int!) {
     timestamp
     ledgerParameters
   }
-  contractAction(
-    address: $address
-    offset: { blockOffset: { height: $height } }
-  ) {
+  contractAction(address: $address) {
     address
     state
     zswapState
@@ -293,12 +290,12 @@ async fn read_on_runtime(
 ) -> Result<PassportVaultContractStateSnapshot, PassportVaultContractStateSourceError> {
     let rpc_client = timeout(
         CONNECT_TIMEOUT,
-        RpcClient::from_insecure_url(&config.node_endpoint),
+        oxid_adapter_platform_system::connect_json_rpc_websocket(&config.node_endpoint),
     )
     .await
     .map_err(|_| PassportVaultContractStateSourceError::Unavailable)?
     .map_err(|_| PassportVaultContractStateSourceError::Unavailable)?;
-    let rpc = LegacyRpcMethods::<SubstrateConfig>::new(rpc_client);
+    let rpc = LegacyRpcMethods::<SubstrateConfig>::new(RpcClient::new(rpc_client));
     let finalized_head = timeout(CONNECT_TIMEOUT, rpc.chain_get_finalized_head())
         .await
         .map_err(|_| PassportVaultContractStateSourceError::Unavailable)?
@@ -499,8 +496,9 @@ fn decode_indexer_response(
         .ok_or(PassportVaultContractStateSourceError::InvalidResponse)?;
     let returned_finalized_height = u64::try_from(finalized_block.height)
         .map_err(|_| PassportVaultContractStateSourceError::InvalidResponse)?;
-    let finalized_head_time_seconds = u64::try_from(finalized_block.timestamp)
+    let finalized_head_time_millis = u64::try_from(finalized_block.timestamp)
         .map_err(|_| PassportVaultContractStateSourceError::InvalidResponse)?;
+    let finalized_head_time_seconds = finalized_head_time_millis / 1_000;
     if returned_finalized_hash != finalized_head_hash_hex
         || returned_finalized_height != finalized_head_height
         || finalized_head_time_seconds == 0
@@ -642,6 +640,20 @@ mod tests {
     }
 
     #[test]
+    fn requests_latest_contract_action_beneath_the_node_finalized_anchor() {
+        assert!(
+            CONTRACT_STATE_AT_FINALIZED_HEIGHT_QUERY.contains("block(offset: { height: $height })")
+        );
+        assert!(
+            CONTRACT_STATE_AT_FINALIZED_HEIGHT_QUERY.contains("contractAction(address: $address)")
+        );
+        assert!(
+            !CONTRACT_STATE_AT_FINALIZED_HEIGHT_QUERY
+                .contains("contractAction(\n    address: $address\n    offset:")
+        );
+    }
+
+    #[test]
     fn decodes_a_bounded_snapshot_without_claiming_state_authentication() {
         let address = "11".repeat(32);
         let tx_hash = "22".repeat(32);
@@ -652,7 +664,7 @@ mod tests {
                 "block": {
                     "hash": finalized_hash,
                     "height": 42,
-                    "timestamp": 1_700_000_000_i64,
+                    "timestamp": 1_700_000_000_000_i64,
                     "ledgerParameters": "0506"
                 },
                 "contractAction": {
@@ -688,7 +700,7 @@ mod tests {
                     "block": {
                         "hash": "44".repeat(32),
                         "height": 5,
-                        "timestamp": 1_700_000_000_i64,
+                        "timestamp": 1_700_000_000_000_i64,
                         "ledgerParameters": "05"
                     },
                     "contractAction": {

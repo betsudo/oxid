@@ -294,6 +294,16 @@ fn capability(fake: &Arc<FakeServices>) -> WalletDustSettlementCapability {
 }
 
 fn automatic_capability(fake: &Arc<FakeServices>) -> WalletDustSettlementCapability {
+    automatic_capability_with_store(
+        fake,
+        Arc::new(InMemoryWalletDustRegistrationRecoveryStore::default()),
+    )
+}
+
+fn automatic_capability_with_store(
+    fake: &Arc<FakeServices>,
+    store: Arc<dyn WalletDustRegistrationRecoveryStore>,
+) -> WalletDustSettlementCapability {
     WalletDustSettlementCapability::with_automatic_development_authority_and_recovery_store(
         fake.clone(),
         fake.clone(),
@@ -303,9 +313,44 @@ fn automatic_capability(fake: &Arc<FakeServices>) -> WalletDustSettlementCapabil
         fake.clone(),
         fake.clone(),
         fake.clone(),
-        Arc::new(InMemoryWalletDustRegistrationRecoveryStore::default()),
+        store,
     )
     .unwrap()
+}
+
+#[test]
+fn funding_wakes_automatic_registration_and_restart_finishes_the_same_attempt() {
+    use oxid_wallet_application::WalletDustRegistrationSettlementState as State;
+
+    let fake = Arc::new(FakeServices::new());
+    let store: Arc<dyn WalletDustRegistrationRecoveryStore> =
+        Arc::new(InMemoryWalletDustRegistrationRecoveryStore::default());
+    *fake.selected.lock().unwrap() = selected_projection(1, 7, false);
+    *fake.reconcile_state.lock().unwrap() = "broadcasting".to_owned();
+    let first = automatic_capability_with_store(&fake, Arc::clone(&store));
+    let observe = |capability: &WalletDustSettlementCapability| {
+        block_on(capability.refresh("profile_test".to_owned())).unwrap()
+    };
+    assert_eq!(observe(&first).state, State::NotEligible);
+    assert!(fake.calls.lock().unwrap().is_empty());
+
+    *fake.selected.lock().unwrap() = selected_projection(1, 8, true);
+    let pending = observe(&first);
+    assert_eq!(pending.state, State::Confirming);
+    let submitted = pending.registration.unwrap().transaction_id.unwrap();
+    drop(first);
+
+    *fake.reconcile_state.lock().unwrap() = "included".to_owned();
+    let restarted = automatic_capability_with_store(&fake, store);
+    let ready = observe(&restarted);
+    assert_eq!(ready.state, State::Ready);
+    assert_eq!(ready.registration.unwrap().transaction_id, Some(submitted));
+    assert_eq!(observe(&restarted).state, State::Ready);
+
+    let calls = fake.calls.lock().unwrap();
+    for operation in ["prepare", "authorize", "submit"] {
+        assert_eq!(calls.iter().filter(|call| **call == operation).count(), 1);
+    }
 }
 
 fn capability_with_store(

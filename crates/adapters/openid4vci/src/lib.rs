@@ -170,19 +170,6 @@ struct BorrowedJwtProofs<'a> {
     jwt: [&'a serde_json::value::RawValue; 1],
 }
 
-#[derive(Serialize)]
-struct PortalMidnightRequest<'a> {
-    #[serde(rename = "holderBindingMethod")]
-    holder_binding_method: &'a str,
-}
-
-#[derive(Serialize)]
-struct PortalCredentialRequest<'a> {
-    credential_configuration_id: &'a str,
-    midnight: PortalMidnightRequest<'a>,
-    proofs: JwtProofs<'a>,
-}
-
 fn serialize_sensitive_json<T: Serialize + ?Sized>(
     value: &T,
 ) -> Result<Zeroizing<Vec<u8>>, serde_json::Error> {

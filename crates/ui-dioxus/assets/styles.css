@@ -1116,7 +1116,6 @@ textarea:focus-visible {
   letter-spacing: 0.05em;
 }
 
-.dust-pill,
 .status-pill {
   display: inline-flex;
   align-items: center;
@@ -1129,11 +1128,6 @@ textarea:focus-visible {
   color: var(--text-muted);
   font-size: var(--font-caption);
   font-weight: 700;
-}
-
-.dust-pill strong {
-  color: var(--text);
-  font-family: var(--font-mono-family);
 }
 
 .wallet-hero__hint {
@@ -1353,11 +1347,18 @@ textarea:focus-visible {
 .account-sync-card__row div {
   display: grid;
   gap: var(--space-1);
+  min-width: 0;
+}
+
+.account-sync-card__row .status-pill {
+  margin-top: 0;
+  text-align: end;
 }
 
 .account-sync-card__row small {
   color: var(--text-muted);
   line-height: 1.4;
+  overflow-wrap: anywhere;
 }
 
 .wallet-sync-row__heading {

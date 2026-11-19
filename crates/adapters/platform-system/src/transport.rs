@@ -4,9 +4,11 @@
 
 use std::{error::Error, fmt, net::IpAddr, sync::Arc};
 
+use jsonrpsee::ws_client::{WsClient, WsClientBuilder};
 use reqwest::{Certificate, ClientBuilder};
 use rustls::{ClientConfig, RootCertStore};
 use tokio_tungstenite::Connector;
+use tracing::{instrument::WithSubscriber, subscriber::NoSubscriber};
 use url::Url;
 
 /// The only TLS trust modes admitted by the native application.
@@ -20,12 +22,13 @@ pub enum TransportTrustPolicy {
     DevelopmentLoopback,
 }
 
-/// Endpoint or TLS construction failed before any network operation.
+/// Invalid or unavailable authenticated transport.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TransportTrustError {
     InvalidEndpoint,
     InsecureRemoteEndpoint,
     TlsConfigurationUnavailable,
+    ConnectionUnavailable,
 }
 
 impl fmt::Display for TransportTrustError {
@@ -34,6 +37,7 @@ impl fmt::Display for TransportTrustError {
             Self::InvalidEndpoint => "transport endpoint is invalid",
             Self::InsecureRemoteEndpoint => "plaintext transport is restricted to loopback",
             Self::TlsConfigurationUnavailable => "TLS trust configuration is unavailable",
+            Self::ConnectionUnavailable => "authenticated transport connection is unavailable",
         })
     }
 }
@@ -81,6 +85,27 @@ pub fn websocket_connector_for(endpoint: &Url) -> Result<Option<Connector>, Tran
                 .map(Some)
         }
     }
+}
+
+/// Connects JSON-RPC readers and submitters with the same roots as other
+/// WebSocket clients. Never follow redirects or trace an authenticated URL.
+pub async fn connect_json_rpc_websocket(endpoint: &str) -> Result<WsClient, TransportTrustError> {
+    let url = Url::parse(endpoint).map_err(|_| TransportTrustError::InvalidEndpoint)?;
+    // jsonrpsee counts the initial handshake as one connection attempt.
+    let builder = WsClientBuilder::default()
+        .max_redirections(1)
+        .max_buffer_capacity_per_subscription(4096)
+        .set_max_logging_length(0);
+    let builder = match websocket_connector_for(&url)? {
+        Some(Connector::Rustls(tls)) => builder.with_custom_cert_store(tls.as_ref().clone()),
+        None => builder,
+        Some(_) => return Err(TransportTrustError::TlsConfigurationUnavailable),
+    };
+    builder
+        .build(endpoint)
+        .with_subscriber(NoSubscriber::default())
+        .await
+        .map_err(|_| TransportTrustError::ConnectionUnavailable)
 }
 
 fn http_client_builder_with_roots<I, C>(roots: I) -> Result<ClientBuilder, TransportTrustError>
@@ -235,6 +260,7 @@ mod tests {
         InvalidEndpoint,
         InsecureRemoteEndpoint,
         TlsConfigurationUnavailable,
+        ConnectionUnavailable,
     }
 
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -396,6 +422,7 @@ mod tests {
                 TransportTrustError::TlsConfigurationUnavailable => {
                     Self::TlsConfigurationUnavailable
                 }
+                TransportTrustError::ConnectionUnavailable => Self::ConnectionUnavailable,
             }
         }
     }
@@ -609,6 +636,43 @@ mod tests {
             handle
                 .join()
                 .expect("test WebSocket TLS server should stop");
+        }
+    }
+
+    #[test]
+    fn json_rpc_websocket_rejects_missing_and_redirected_routes() {
+        use std::io::ErrorKind;
+
+        let redirect_target = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        redirect_target.set_nonblocking(true).unwrap();
+        let destination = redirect_target.local_addr().unwrap();
+        for response in [
+            "404 Not Found\r\n".to_owned(),
+            format!("302 Found\r\nLocation: ws://{destination}/unexpected\r\n"),
+        ] {
+            let route = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+            let endpoint = format!("ws://{}/node", route.local_addr().unwrap());
+            let server = thread::spawn(move || {
+                let (mut stream, _) = route.accept().unwrap();
+                bound_socket(&stream);
+                let mut request = [0_u8; 1024];
+                assert_ne!(stream.read(&mut request).unwrap(), 0);
+                write!(
+                    stream,
+                    "HTTP/1.1 {response}Content-Length: 0\r\nConnection: close\r\n\r\n"
+                )
+                .unwrap();
+            });
+            let result = runtime().block_on(connect_json_rpc_websocket(&endpoint));
+            assert!(matches!(
+                result,
+                Err(TransportTrustError::ConnectionUnavailable)
+            ));
+            server.join().unwrap();
+            assert_eq!(
+                redirect_target.accept().unwrap_err().kind(),
+                ErrorKind::WouldBlock
+            );
         }
     }
 }

@@ -416,12 +416,10 @@ jobs:
           primary-key: nix7-build-${{ runner.os }}-${{ hashFiles('flake.lock', 'flake.nix', 'nix/**/*.nix', 'Cargo.lock') }}
           restore-prefixes-first-match: nix7-build-${{ runner.os }}-
           save: false
-      - name: Build all locked Compact deliverables
+      - name: Build active locked Compact deliverables
         run: >-
           nix build
           .#presentation-compact-artifacts
-          .#passport-vault-compact-artifacts
-          .#passport-vault-call-composer
           --print-build-logs
 
   locked_nix_gate:

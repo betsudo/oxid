@@ -66,23 +66,10 @@ final class ProfileFlowTests: XCTestCase {
         }
         XCTAssertTrue(application.buttons["Open Wallet for Local (undeployed)"].exists)
         XCTAssertTrue(application.buttons["Open newest document"].exists)
-        XCTAssertTrue(application.buttons["Open Passport Vault"].exists)
+        XCTAssertFalse(application.buttons["Open Passport Vault"].exists)
         XCTAssertTrue(application.buttons["Open wallet security settings"].exists)
         XCTAssertTrue(application.buttons["See all activity"].exists)
         XCTAssertFalse(application.staticTexts["Backed up"].exists)
-    }
-
-    @MainActor
-    private func openPassportVault(in application: XCUIApplication) {
-        application.buttons["Home"].tap()
-        let vault = application.buttons["Open Passport Vault"]
-        let firstCard = application.buttons["Open Wallet for Local (undeployed)"]
-        XCTAssertTrue(vault.waitForExistence(timeout: 15))
-        for _ in 0..<5 where !vault.isHittable {
-            firstCard.swipeLeft()
-        }
-        XCTAssertTrue(vault.isHittable)
-        vault.tap()
     }
 
     @MainActor
@@ -449,63 +436,6 @@ final class ProfileFlowTests: XCTestCase {
         XCTAssertFalse(application.staticTexts["Alice"].exists)
         XCTAssertFalse(application.staticTexts["Example"].exists)
 
-        let home = application.buttons["Home"]
-        XCTAssertTrue(home.waitForExistence(timeout: 5))
-        openPassportVault(in: application)
-        XCTAssertTrue(
-            application.staticTexts["Owner-private saved conformance ledger · survives app restart · no on-chain transaction submitted"]
-                .waitForExistence(timeout: 5)
-        )
-        XCTAssertTrue(
-            application.staticTexts["Simulated — runs locally, nothing on Midnight"].waitForExistence(timeout: 5)
-        )
-        let readContractState = application.buttons["Read contract state"]
-        scrollTo(readContractState, in: application)
-        readContractState.tap()
-        application.swipeUp()
-        XCTAssertTrue(
-            application.buttons["Refresh contract state"]
-                .waitForExistence(timeout: 10)
-        )
-        let reviewContractCall = application.buttons["Review contract call"]
-        scrollTo(reviewContractCall, in: application)
-        reviewContractCall.tap()
-        let authorizeContractCall = application.buttons["Authorize exact call"]
-        XCTAssertTrue(authorizeContractCall.waitForExistence(timeout: 10))
-        scrollTo(authorizeContractCall, in: application)
-        authorizeContractCall.tap()
-        let submitContractCall = application.buttons["Prove and submit"]
-        XCTAssertTrue(submitContractCall.waitForExistence(timeout: 10))
-        scrollTo(submitContractCall, in: application)
-        submitContractCall.tap()
-        XCTAssertTrue(
-            application.staticTexts["Passport Vault call completed"]
-                .waitForExistence(timeout: 15)
-        )
-        application.swipeDown()
-        XCTAssertTrue(
-            application.staticTexts["Mode: Simulated — runs locally, nothing on Midnight. Final DUST fee: 0.000000001 DUST."]
-                .waitForExistence(timeout: 5)
-        )
-        let createLock = application.buttons["Create confirmed lock"]
-        XCTAssertTrue(createLock.waitForExistence(timeout: 5))
-        scrollTo(createLock, in: application)
-        createLock.tap()
-        XCTAssertTrue(application.staticTexts["100 NIGHT remaining"].waitForExistence(timeout: 5))
-        let deposit = application.buttons["Deposit"]
-        scrollTo(deposit, in: application)
-        deposit.tap()
-        XCTAssertTrue(application.staticTexts["110 NIGHT remaining"].waitForExistence(timeout: 5))
-        let claim = application.buttons["Claim with credential"]
-        scrollTo(claim, in: application)
-        claim.tap()
-        XCTAssertTrue(application.staticTexts["100 NIGHT remaining"].waitForExistence(timeout: 10))
-        let withdraw = application.buttons["Withdraw"]
-        scrollTo(withdraw, in: application)
-        withdraw.tap()
-        XCTAssertTrue(application.staticTexts["90 NIGHT remaining"].waitForExistence(timeout: 5))
-        XCTAssertTrue(application.staticTexts["Claims 1"].exists)
-
         application.terminate()
         application.launch()
 
@@ -532,13 +462,6 @@ final class ProfileFlowTests: XCTestCase {
         XCTAssertFalse(application.staticTexts["Alice"].exists)
         XCTAssertFalse(application.staticTexts["Example"].exists)
         XCTAssertTrue(application.buttons["Reverify"].waitForExistence(timeout: 5))
-        openPassportVault(in: application)
-        XCTAssertTrue(application.staticTexts["90 NIGHT remaining"].waitForExistence(timeout: 10))
-        XCTAssertTrue(application.staticTexts["Claims 1"].waitForExistence(timeout: 5))
-        XCTAssertTrue(
-            application.staticTexts["Owner-private saved conformance ledger · survives app restart · no on-chain transaction submitted"]
-                .waitForExistence(timeout: 5)
-        )
         XCTAssertTrue(application.buttons["Home"].exists)
         XCTAssertFalse(application.buttons["Create and continue"].exists)
     }

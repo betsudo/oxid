@@ -958,6 +958,11 @@ pub(super) fn security_error(id: Option<String>, error: WalletSecurityError) -> 
             "invalid_argument",
             "active profile identifier is invalid",
         ),
+        WalletSecurityError::RecoveryRequired => Response::error(
+            id,
+            "wallet_recovery_required",
+            "Restore this wallet to continue.",
+        ),
         WalletSecurityError::Operation(error) => security_port_error(id, error),
     }
 }

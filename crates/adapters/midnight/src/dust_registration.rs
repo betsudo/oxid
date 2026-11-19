@@ -11,12 +11,13 @@ use std::{
 
 use futures::future::{Either, select};
 use futures_timer::Delay;
-use midnight_base_crypto::{hash::HashOutput, schnorr::Signature, time::Timestamp};
+use midnight_base_crypto::{hash::HashOutput, time::Timestamp};
 use midnight_coin_structure::coin::{NIGHT, UserAddress};
 use midnight_ledger::{
     dust::{DustActions, DustPublicKey, DustRegistration},
     structure::{
-        IntentHash, StandardTransaction, Transaction, UnshieldedOffer, UtxoOutput, UtxoSpend,
+        IntentHash, Signature, SignatureVerifyingKey, StandardTransaction, Transaction,
+        UnshieldedOffer, UtxoOutput, UtxoSpend,
     },
 };
 use midnight_storage::{
@@ -49,7 +50,7 @@ use crate::{
         MidnightCompletionRequest, MidnightRegistrationContext, MidnightSpendableUtxo,
         MidnightSubmissionAttempt, MidnightSubmissionControl, MidnightSubmissionReconciliation,
         MidnightTransactionAuthorizer, MidnightTransactionSource, decode_signature,
-        decode_verifying_key,
+        decode_verifying_key, verify_signature,
     },
 };
 
@@ -280,7 +281,11 @@ where
             let signature = decode_signature(&wallet_signature).map_err(map_transaction_error)?;
             let verifying_key =
                 decode_verifying_key(&spendable.account).map_err(map_transaction_error)?;
-            if !verifying_key.verify(retained.signing_payload.as_slice(), &signature) {
+            if !verify_signature(
+                &verifying_key,
+                retained.signing_payload.as_slice(),
+                &signature,
+            ) {
                 return Err(WalletDustRegistrationPortError::InvalidData);
             }
             let mut intent = retained.unsigned_intent.clone();
@@ -593,7 +598,7 @@ async fn await_registration_completion<T>(
 
 fn plan_registration(
     network_id: &oxid_wallet_domain::ChainNetworkId,
-    night_key: midnight_base_crypto::schnorr::VerifyingKey,
+    night_key: SignatureVerifyingKey,
     dust_public_key: DustPublicKey,
     utxos: Vec<MidnightSpendableUtxo>,
     context: &MidnightRegistrationContext,
@@ -695,7 +700,7 @@ fn generated_dust(
 
 fn offer(
     utxos: &[(MidnightSpendableUtxo, u128)],
-    night_key: &midnight_base_crypto::schnorr::VerifyingKey,
+    night_key: &SignatureVerifyingKey,
 ) -> Result<UnshieldedOffer<Signature, DefaultDB>, WalletDustRegistrationPortError> {
     if utxos.is_empty() {
         return Err(WalletDustRegistrationPortError::InvalidData);
@@ -1285,9 +1290,11 @@ mod tests {
             timestamp: Timestamp::from_secs(1_700_000_100),
             parameters: INITIAL_PARAMETERS,
         };
-        let night_key = midnight_base_crypto::schnorr::SigningKey::from_bytes(&[3; 32])
-            .expect("test scalar is valid")
-            .verifying_key();
+        let night_key = SignatureVerifyingKey::Schnorr(
+            midnight_base_crypto::schnorr::SigningKey::from_bytes(&[3; 32])
+                .expect("test scalar is valid")
+                .verifying_key(),
+        );
         let dust = midnight_ledger::dust::DustSecretKey::derive_secret_key(&[4; 32]);
         let network =
             oxid_wallet_domain::ChainNetworkId::parse("undeployed").expect("network is valid");
@@ -1319,9 +1326,11 @@ mod tests {
         assert_eq!(
             plan_registration(
                 &network,
-                midnight_base_crypto::schnorr::SigningKey::from_bytes(&[3; 32])
-                    .expect("test scalar is valid")
-                    .verifying_key(),
+                SignatureVerifyingKey::Schnorr(
+                    midnight_base_crypto::schnorr::SigningKey::from_bytes(&[3; 32])
+                        .expect("test scalar is valid")
+                        .verifying_key(),
+                ),
                 DustPublicKey::from(midnight_ledger::dust::DustSecretKey::derive_secret_key(
                     &[4; 32]
                 ),),

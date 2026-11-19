@@ -32,6 +32,10 @@ use oxid_platform_ports::IdentityLinkIngressPort;
 const MOBILE_PORTAL_ISSUER_ORIGIN: &str = "http://127.0.0.1:18090";
 #[cfg(any(test, target_os = "ios", target_os = "android"))]
 const MOBILE_PORTAL_ISSUER_RESOLVER_ORIGIN: &str = "http://127.0.0.1:18093";
+#[cfg(any(test, target_os = "ios", target_os = "android"))]
+const SHARED_LEDGER9_PORTAL_ISSUER_ORIGIN: &str = "http://127.0.0.1:8090";
+#[cfg(any(test, target_os = "ios", target_os = "android"))]
+const SHARED_LEDGER9_PORTAL_ISSUER_RESOLVER_ORIGIN: &str = "http://127.0.0.1:9092";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum PortalIdentityConfigurationError {
@@ -122,11 +126,15 @@ impl PortalIdentityConfiguration {
         expected_sha256: &str,
         public_origin: &str,
     ) -> Result<Self, PortalIdentityConfigurationError> {
-        let deployment = PortalDeploymentManifest::from_bytes(bytes, expected_sha256)
-            .map_err(PortalIdentityConfigurationError::Manifest)?;
-        validate_tailnet_harness_origins(&deployment, public_origin)?;
         let ingress = NativeIdentityLinkIngress::standalone_portal_tailnet(public_origin)
             .map_err(|_| PortalIdentityConfigurationError::InvalidOfferIngress)?;
+        let deployment =
+            PortalDeploymentManifest::from_tailnet_bytes(bytes, expected_sha256, public_origin)
+                .map_err(PortalIdentityConfigurationError::Manifest)?;
+        validate_tailnet_harness_origins(&deployment, public_origin)?;
+        if deployment.is_ledger9_tailnet() {
+            return Self::new(deployment, Some(Arc::new(ingress)), None);
+        }
         let publisher = PortalTailnetDidPublisher::new(public_origin)
             .map_err(|_| PortalIdentityConfigurationError::InvalidDidPublisher)?;
         Self::new(
@@ -145,7 +153,12 @@ impl PortalIdentityConfiguration {
             .map(HttpDidResolver::new)
             .map_err(PortalIdentityConfigurationError::Resolver)?;
         let jwk = deployment.issuer_jubjub_jwk();
-        let trust_anchor = DigitalPassportIssuerTrustAnchor::from_portal_jubjub(
+        let trust_anchor_for_source = if deployment.uses_ledger9_jubjub_jwk() {
+            DigitalPassportIssuerTrustAnchor::from_ledger9_portal_jubjub
+        } else {
+            DigitalPassportIssuerTrustAnchor::from_portal_jubjub
+        };
+        let trust_anchor = trust_anchor_for_source(
             deployment.issuer_did(),
             deployment.issuer_method(),
             &jwk.x,
@@ -169,8 +182,20 @@ impl PortalIdentityConfiguration {
 fn validate_mobile_harness_origins(
     deployment: &PortalDeploymentManifest,
 ) -> Result<(), PortalIdentityConfigurationError> {
-    if deployment.issuer_origin() != MOBILE_PORTAL_ISSUER_ORIGIN
-        || deployment.issuer_resolver_origin() != MOBILE_PORTAL_ISSUER_RESOLVER_ORIGIN
+    let origins = (
+        deployment.issuer_origin(),
+        deployment.issuer_resolver_origin(),
+    );
+    if origins
+        != (
+            MOBILE_PORTAL_ISSUER_ORIGIN,
+            MOBILE_PORTAL_ISSUER_RESOLVER_ORIGIN,
+        )
+        && origins
+            != (
+                SHARED_LEDGER9_PORTAL_ISSUER_ORIGIN,
+                SHARED_LEDGER9_PORTAL_ISSUER_RESOLVER_ORIGIN,
+            )
     {
         return Err(PortalIdentityConfigurationError::MobileHarnessOriginMismatch);
     }
@@ -198,7 +223,13 @@ impl PortalCredentialMaterialDecoder for PortalPrivateMaterialDecoder {
         &self,
         signed_credential: &[u8],
         portal_private_json: &[u8],
+        expected_binding_method: &str,
     ) -> Result<Vec<u8>, PortalCredentialMaterialError> {
+        oxid_adapter_vc_midnight::validate_compact_holder_binding(
+            signed_credential,
+            expected_binding_method,
+        )
+        .map_err(|_| PortalCredentialMaterialError::Invalid)?;
         convert_portal_private_parts(signed_credential, portal_private_json)
             .map_err(|_| PortalCredentialMaterialError::Invalid)
     }
@@ -233,11 +264,19 @@ mod tests {
 
     #[test]
     fn mobile_manifest_requires_the_exact_local_harness_origins() {
-        let exact = deployment(
-            MOBILE_PORTAL_ISSUER_ORIGIN,
-            MOBILE_PORTAL_ISSUER_RESOLVER_ORIGIN,
-        );
-        validate_mobile_harness_origins(&exact).expect("exact mobile routes");
+        for (issuer, resolver) in [
+            (
+                MOBILE_PORTAL_ISSUER_ORIGIN,
+                MOBILE_PORTAL_ISSUER_RESOLVER_ORIGIN,
+            ),
+            (
+                SHARED_LEDGER9_PORTAL_ISSUER_ORIGIN,
+                SHARED_LEDGER9_PORTAL_ISSUER_RESOLVER_ORIGIN,
+            ),
+        ] {
+            validate_mobile_harness_origins(&deployment(issuer, resolver))
+                .expect("exact authenticated mobile routes");
+        }
 
         for (issuer, resolver) in [
             (
@@ -250,6 +289,15 @@ mod tests {
                 MOBILE_PORTAL_ISSUER_RESOLVER_ORIGIN,
             ),
             (MOBILE_PORTAL_ISSUER_ORIGIN, "https://resolver.example"),
+            (
+                SHARED_LEDGER9_PORTAL_ISSUER_ORIGIN,
+                MOBILE_PORTAL_ISSUER_RESOLVER_ORIGIN,
+            ),
+            (
+                MOBILE_PORTAL_ISSUER_ORIGIN,
+                SHARED_LEDGER9_PORTAL_ISSUER_RESOLVER_ORIGIN,
+            ),
+            (SHARED_LEDGER9_PORTAL_ISSUER_ORIGIN, "http://127.0.0.1:9093"),
         ] {
             let authenticated = deployment(issuer, resolver);
             assert_eq!(

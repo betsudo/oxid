@@ -5,12 +5,90 @@
     { pkgs, self', ... }:
     let
       midnightDidPackages = inputs.midnight-did-toolchain.packages.${pkgs.stdenv.hostPlatform.system};
+      rustToolchain = inputs.fenix.packages.${pkgs.stdenv.hostPlatform.system}.toolchainOf {
+        channel = "1.99.0";
+        sha256 = "sha256-zm3dyIY2T414ZRR3EhLOvptzG6gta4WZUcawzMUWtqI=";
+      };
+      rustPlatform = pkgs.makeRustPlatform {
+        cargo = rustToolchain.cargo;
+        rustc = rustToolchain.rustc;
+      };
+      compactSource =
+        (builtins.fromJSON (builtins.readFile ../../config/midnight-integration-compatibility.json))
+        .wallet.compact;
+      # Match both fields in nixpkgs' vendor lookup. One Ledger Git tree
+      # contains midnight-transient-crypto 2.2.0 and 3.1.0.
+      cargoVendorPath = pkgs.path + "/pkgs/build-support/rust";
+      cargoVendorSource = builtins.readFile (cargoVendorPath + "/import-cargo-lock.nix");
+      lookupByName = ''select(.name == "''${pkg.name}")'';
+      lookupByVersion = ''select(.name == "''${pkg.name}" and .version == "''${pkg.version}")'';
+      versionedCargoVendor =
+        assert builtins.length (pkgs.lib.splitString lookupByName cargoVendorSource) == 3;
+        import (
+          builtins.toFile "oxid-import-cargo-lock.nix" (
+            builtins.replaceStrings
+              [
+                lookupByName
+                "  jq,\n"
+                "readFile ./replace-workspace-values.py"
+              ]
+              [
+                lookupByVersion
+                "  jq,\n  workspaceValuesSource,\n"
+                "workspaceValuesSource"
+              ]
+              cargoVendorSource
+          )
+        );
+      buildRustPackage = rustPlatform.buildRustPackage.override {
+        importCargoLock = pkgs.buildPackages.callPackage versionedCargoVendor {
+          inherit (rustToolchain) cargo;
+          workspaceValuesSource = builtins.readFile (cargoVendorPath + "/replace-workspace-values.py");
+          # The legacy crate includes a public parameter from a sibling
+          # directory in Ledger's Git tree. Preserve those bytes in its
+          # standalone vendored package.
+          runCommand =
+            name: attrs: script:
+            pkgs.buildPackages.runCommand name attrs (
+              script
+              + pkgs.lib.optionalString (name == "midnight-transient-crypto-2.2.0") ''
+                parameter=bls_midnight_2p14
+                install -D -m 444 "$tree/../transient-crypto/static/$parameter" "$out/static/$parameter"
+                chmod u+w "$out/src"
+                substituteInPlace "$out/src/proofs.rs" \
+                  --replace-fail "../../transient-crypto/static/$parameter" "../static/$parameter"
+              ''
+            );
+          # Compact's retained CI evidence mentions Nix store paths. Fetch the
+          # reviewed Git tree directly so the evidence does not enter a fetchgit
+          # fixed-output derivation. Keep the exact revision and NAR hash.
+          fetchgit =
+            source:
+            if source.url == compactSource.repository && source.rev == compactSource.revision then
+              (builtins.fetchTree {
+                type = "git";
+                inherit (source) url rev;
+                allRefs = true;
+                submodules = true;
+                narHash = source.sha256;
+              }).outPath
+            else
+              pkgs.fetchgit source;
+        };
+      };
       midnightDidCompactArtifacts = pkgs.callPackage ./midnight-did-compact-artifacts.nix { };
+      midnightDidLedger9Zkir = pkgs.callPackage ./midnight-did-ledger9-zkir.nix {
+        midnightIdentitySource = inputs.midnight-identity-ledger9;
+        zkirCompiler = inputs.midnight-zkir-ledger9.packages.${pkgs.stdenv.hostPlatform.system}.zkir;
+        publicParams =
+          inputs.midnight-zkir-ledger9.packages.${pkgs.stdenv.hostPlatform.system}.public-params;
+      };
       cargoOutputHashes = {
-        "midnight-base-crypto-1.0.1" = "sha256-KVp5T/m9NzzUwn4dnlp5IVy9DoticxIquio7ms6g+1Q=";
-        "midnight-compact-runtime-0.16.102" = "sha256-e+2iLWOlwQGpbrsJvNN5ryAxm2jzBlE6g+eQC8x3l6I=";
-        "midnight-did-domain-0.5.0" = "sha256-eMZ7YjJ1QrWsBJu1cWOPHsU3zeyNa49aAKmV7+ZTNq8=";
-        "midnight-proofs-0.7.3" = "sha256-FWFXBZAoYmJJYuAry70jAKXPGhn6qSA18luxg3XalO4=";
+        "midnight-base-crypto-1.1.1" = "sha256-7nPujsILZToXHIBcRemu8NLrxmrg2+QM4sKPsJwGgu0=";
+        "midnight-compact-runtime-0.2.0" = "sha256-Z7UM69FOS0DWefFGW71GlEz2lYWTOFoi1XnekD2jgM8=";
+        "midnight-did-domain-0.5.0" = "sha256-J684SunbTIK8fblcMAtBg7lTFj0lzyzpiRNDW9w2Uv4=";
+        "midnight-proofs-0.8.2" = "sha256-lofqa58hDlJ0C3vIWFodsdwYYwYoPEDpS1PMGV9TULg=";
+        "midnight-zkir-3.2.1" = "sha256-GtULoNDWGXjgIf9Vh8C4OXKlRLwm37lDQ+f0DAay/9c=";
       };
       presentationCompactArtifacts = pkgs.callPackage ./presentation-compact-artifacts.nix {
         compactMidnight = midnightDidPackages.compact-midnight;
@@ -18,18 +96,7 @@
         midnightCircuitParams = midnightDidPackages.midnight-circuit-params;
         midnightVcSource = inputs.midnight-verifiable-credentials;
       };
-      passportVaultCompactArtifacts = pkgs.callPackage ./passport-vault-compact-artifacts.nix {
-        compactMidnight = midnightDidPackages.compact-midnight;
-        compactToolchain = midnightDidPackages.compact-toolchain;
-        midnightCircuitParams = midnightDidPackages.midnight-circuit-params;
-        midnightVcSource = inputs.midnight-verifiable-credentials;
-        passportVaultSource = ../../contracts/passport-vault;
-      };
-      passportVaultCallComposer = pkgs.callPackage ./passport-vault-call-composer.nix {
-        inherit passportVaultCompactArtifacts;
-        vaultContractStateFixture = ../../fixtures/passport-vault/contract-state-v1.hex;
-      };
-      oxidApp = pkgs.rustPlatform.buildRustPackage {
+      oxidApp = buildRustPackage {
         pname = "oxid";
         version = "0.2.0";
         src = pkgs.lib.cleanSource ../..;
@@ -43,9 +110,6 @@
           "oxid-app"
         ];
         cargoTestFlags = [ "--workspace" ];
-        OXID_PASSPORT_VAULT_ARTIFACTS_DIR = passportVaultCompactArtifacts;
-        OXID_PASSPORT_VAULT_COMPOSER = "${passportVaultCallComposer}/bin/oxid-passport-vault-call-composer";
-
         nativeBuildInputs = [ pkgs.pkg-config ] ++ linuxNativeBuildInputs;
         buildInputs = [ pkgs.openssl ] ++ linuxBuildInputs;
 
@@ -62,7 +126,7 @@
           mainProgram = "oxid-app";
         };
       };
-      brandCheck = pkgs.rustPlatform.buildRustPackage {
+      brandCheck = buildRustPackage {
         pname = "oxid-brand-check";
         version = "0.2.0";
         src = pkgs.lib.cleanSource ../..;
@@ -121,7 +185,7 @@
 
         brand-check = brandCheck;
 
-        headless = pkgs.rustPlatform.buildRustPackage {
+        headless = buildRustPackage {
           pname = "oxid-headless";
           version = "0.2.0";
           src = pkgs.lib.cleanSource ../..;
@@ -155,9 +219,7 @@
 
         midnight-did-compact-artifacts = midnightDidCompactArtifacts;
 
-        passport-vault-compact-artifacts = passportVaultCompactArtifacts;
-
-        passport-vault-call-composer = passportVaultCallComposer;
+        midnight-did-ledger9-zkir = midnightDidLedger9Zkir;
 
         dioxus-cli = pkgs.dioxus-cli;
 
@@ -180,8 +242,7 @@
         });
         presentation-compact-artifacts = presentationCompactArtifacts;
         midnight-did-compact-artifacts = midnightDidCompactArtifacts;
-        passport-vault-compact-artifacts = passportVaultCompactArtifacts;
-        passport-vault-call-composer = passportVaultCallComposer;
+        midnight-did-ledger9-zkir = midnightDidLedger9Zkir;
         brand-packs =
           pkgs.runCommand "oxid-brand-packs-check"
             {

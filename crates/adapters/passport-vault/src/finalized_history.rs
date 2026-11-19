@@ -724,9 +724,9 @@ async fn rpc_result<T, E>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use midnight_base_crypto::{hash::HashOutput, schnorr::Signature, time::Timestamp};
+    use midnight_base_crypto::{hash::HashOutput, time::Timestamp};
     use midnight_ledger::structure::{
-        ContractDeploy, Intent, ProofPreimageMarker, StandardTransaction, Transaction,
+        ContractDeploy, Intent, ProofPreimageMarker, Signature, StandardTransaction, Transaction,
     };
     use midnight_serialize::tagged_serialize;
     use midnight_storage::{

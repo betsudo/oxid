@@ -4,7 +4,7 @@ use std::{error::Error, fmt, sync::Arc};
 
 use crate::{
     DeleteKeyApproval, SignDataApproval, WalletApprovalCapability, WalletApprovalError,
-    WalletApprovalService,
+    WalletApprovalService, WalletProfileAssociationRepository,
 };
 use oxid_foundation::OpaqueIdError;
 use oxid_wallet_domain::{
@@ -449,6 +449,7 @@ pub trait DeleteWalletKeyUseCase: Send + Sync {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum WalletSecurityError {
     InvalidProfileIdentifier(OpaqueIdError),
+    RecoveryRequired,
     Operation(WalletSecurityPortError),
 }
 
@@ -456,6 +457,7 @@ impl fmt::Display for WalletSecurityError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::InvalidProfileIdentifier(error) => error.fmt(formatter),
+            Self::RecoveryRequired => formatter.write_str("Restore this wallet to continue."),
             Self::Operation(error) => error.fmt(formatter),
         }
     }
@@ -519,6 +521,7 @@ impl Error for SensitiveWalletOperationError {}
 pub struct WalletProtectionService<P: ?Sized> {
     protection: Arc<P>,
     approvals: Option<Arc<WalletApprovalService>>,
+    associations: Option<Arc<dyn WalletProfileAssociationRepository>>,
 }
 
 impl<P: ?Sized> WalletProtectionService<P> {
@@ -527,6 +530,7 @@ impl<P: ?Sized> WalletProtectionService<P> {
         Self {
             protection,
             approvals: None,
+            associations: None,
         }
     }
 
@@ -535,7 +539,17 @@ impl<P: ?Sized> WalletProtectionService<P> {
         Self {
             protection,
             approvals: Some(approvals),
+            associations: None,
         }
+    }
+
+    #[must_use]
+    pub fn with_profile_associations(
+        mut self,
+        associations: Arc<dyn WalletProfileAssociationRepository>,
+    ) -> Self {
+        self.associations = Some(associations);
+        self
     }
 
     fn invalidate_approvals(&self) -> Result<(), WalletSecurityError> {
@@ -573,6 +587,20 @@ where
         command: WalletProfileSecurityCommand,
     ) -> Result<WalletSecurityStatusView, WalletSecurityError> {
         let profile_id = parse_profile_id(command.profile_id)?;
+        if let Some(associations) = self.associations.as_ref()
+            && self
+                .protection
+                .status(&profile_id)
+                .map_err(WalletSecurityError::Operation)?
+                .state()
+                == WalletProtectionState::Uninitialized
+            && associations
+                .load_associations(&profile_id)
+                .map_err(|_| WalletSecurityError::Operation(WalletSecurityPortError::Unavailable))?
+                .is_some_and(|saved| !saved.accounts().is_empty())
+        {
+            return Err(WalletSecurityError::RecoveryRequired);
+        }
         self.invalidate_approvals()?;
         self.protection
             .initialize(&profile_id)

@@ -6,39 +6,24 @@
 //! seeds are borrowed only by the custody signer; they never cross a DTO,
 //! filesystem, environment, WebView, or child-process boundary.
 
-use std::{
-    borrow::Cow,
-    future::Future,
-    io::Cursor,
-    pin::Pin,
-    sync::{Arc, Mutex},
-};
+use std::{future::Future, io::Cursor, pin::Pin, sync::Arc};
 
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
-use midnight_base_crypto::{hash::HashOutput, schnorr::Signature, time::Timestamp};
-use midnight_compact_runtime::{ContractAddress, Fr, WitnessContext};
-use midnight_did_domain::did_document::{CurveType, KeyType, VerificationMethodType};
+use midnight_base_crypto::{hash::HashOutput, time::Timestamp};
+use midnight_compact_runtime as runtime;
 use midnight_did_jubjub_schnorr::{
     derive_public_key_from_seed, field_from_scalar, sign_authorization_digest_from_seed,
 };
-#[cfg(test)]
-use midnight_did_runtime::LedgerDeploymentConfig;
-use midnight_did_runtime::{
-    BackendError, DidAuthorizationSigner, DidContractCall, DidContractExecutor,
-    DidPrivateStateStore, GeneratedDidExecutor, JubjubPointHex, LedgerContractCallConfig,
-    LedgerPublicKeyJwk, LedgerSchnorrJubjubVerificationMethod, LedgerVerificationMethod,
-    LedgerVerificationMethodRelation, MapMutation, NewJubjubPointHex, SetMutation,
-};
-use midnight_ledger::{
-    construct::SegmentSpecifier,
-    structure::{LedgerParameters, ProofPreimageMarker, StandardTransaction, Transaction},
+use midnight_did_runtime::{ledger_contract, pure_circuits, types};
+use midnight_ledger::structure::{
+    Intent, ProofPreimageMarker, Signature, StandardTransaction, Transaction,
 };
 use midnight_serialize::{Deserializable as _, tagged_deserialize, tagged_serialize};
 use midnight_storage::{DefaultDB, storage::HashMap as LedgerHashMap};
 use midnight_transient_crypto::{
     commitment::PedersenRandomness,
     curve::EmbeddedGroupAffine,
-    proofs::{KeyLocation, ProofPreimage, VerifierKey},
+    proofs::{ProofPreimage, VerifierKey},
 };
 use oxid_identity_application::DidLifecyclePortError;
 use oxid_wallet_application::{
@@ -72,6 +57,9 @@ type UnprovenTransaction =
 pub struct MidnightDidCallContext {
     pub contract_state: Vec<u8>,
     pub contract_address: [u8; 32],
+    pub observation_transaction_hash: [u8; 32],
+    pub observation_block_hash: [u8; 32],
+    pub observation_block_height: u64,
     pub zswap_chain_state: Option<Vec<u8>>,
     pub ledger_parameters: Option<Vec<u8>>,
     pub network_id: String,
@@ -86,6 +74,9 @@ impl MidnightDidCallContext {
         if self.contract_state.is_empty()
             || self.contract_state.len() > MAX_CONTRACT_STATE_BYTES
             || self.contract_address == [0; 32]
+            || self.observation_transaction_hash == [0; 32]
+            || self.observation_block_hash == [0; 32]
+            || self.observation_block_height == 0
             || self.network_id.is_empty()
             || self.network_id.len() > 64
             || !self
@@ -180,52 +171,64 @@ impl MidnightDidCallOperation {
         Ok(())
     }
 
-    fn into_runtime(self) -> Result<DidContractCall, DidLifecyclePortError> {
+    fn into_runtime(self) -> Result<RuntimeDidOperation, DidLifecyclePortError> {
         Ok(match self {
             Self::AddAuthenticationMethod { method_id, x } => {
-                DidContractCall::SetVerificationMethod {
-                    method: LedgerVerificationMethod {
-                        id: method_id,
-                        typ: VerificationMethodType::JsonWebKey,
-                        public_key_jwk: LedgerPublicKeyJwk {
-                            kty: KeyType::OKP,
-                            crv: CurveType::Ed25519,
-                            x: URL_SAFE_NO_PAD.encode(x),
-                            y: String::new(),
+                RuntimeDidOperation::SetVerificationMethod {
+                    method: types::VerificationMethod {
+                        id: runtime::OpaqueString::from(method_id),
+                        typ: types::VerificationMethodType::JsonWebKey,
+                        publicKeyJwk: types::PublicKeyJwk {
+                            kty: types::KeyType::OKP,
+                            crv: types::CurveType::Ed25519,
+                            x: runtime::OpaqueString::from(URL_SAFE_NO_PAD.encode(x)),
+                            y: runtime::OpaqueString::from(""),
                         },
                     },
-                    mutation: MapMutation::Insert,
+                    mutation: types::MapMutation::Insert,
                 }
             }
             Self::AddAuthenticationRelationship { method_id } => {
-                DidContractCall::SetVerificationMethodRelation {
-                    relation: LedgerVerificationMethodRelation::Authentication,
-                    method_id,
-                    mutation: SetMutation::Insert,
+                RuntimeDidOperation::SetVerificationMethodRelation {
+                    relation: types::VerificationMethodRelation::Authentication,
+                    method_id: runtime::OpaqueString::from(method_id),
+                    mutation: types::SetMutation::Insert,
                 }
             }
             Self::AddAssertionMethod { method_id, x, y } => {
-                DidContractCall::SetSchnorrJubjubVerificationMethod {
-                    method: LedgerSchnorrJubjubVerificationMethod {
-                        id: method_id,
-                        public_key: JubjubPointHex::new(NewJubjubPointHex {
-                            x: hex::encode(x),
-                            y: hex::encode(y),
-                        })
-                        .map_err(|_| DidLifecyclePortError::InvalidOperation)?,
+                RuntimeDidOperation::SetSchnorrJubjubVerificationMethod {
+                    method: types::SchnorrJubjubVerificationMethod {
+                        id: runtime::OpaqueString::from(method_id),
+                        publicKey: jubjub_point(x, y)?,
                     },
-                    mutation: MapMutation::Insert,
+                    mutation: types::MapMutation::Insert,
                 }
             }
             Self::AddAssertionRelationship { method_id } => {
-                DidContractCall::SetVerificationMethodRelation {
-                    relation: LedgerVerificationMethodRelation::AssertionMethod,
-                    method_id,
-                    mutation: SetMutation::Insert,
+                RuntimeDidOperation::SetVerificationMethodRelation {
+                    relation: types::VerificationMethodRelation::AssertionMethod,
+                    method_id: runtime::OpaqueString::from(method_id),
+                    mutation: types::SetMutation::Insert,
                 }
             }
         })
     }
+}
+
+enum RuntimeDidOperation {
+    SetVerificationMethod {
+        method: types::VerificationMethod,
+        mutation: types::MapMutation,
+    },
+    SetSchnorrJubjubVerificationMethod {
+        method: types::SchnorrJubjubVerificationMethod,
+        mutation: types::MapMutation,
+    },
+    SetVerificationMethodRelation {
+        relation: types::VerificationMethodRelation,
+        method_id: runtime::OpaqueString,
+        mutation: types::SetMutation,
+    },
 }
 
 pub struct NativeMidnightDidCallRequest {
@@ -359,7 +362,7 @@ impl NativeMidnightDidCallComposer {
         let mut hasher = Sha256::new();
         hasher.update(b"oxid:did-call:replay:v1");
         hasher.update(operation_scope.as_bytes());
-        hasher.update(operation.circuit().id().as_bytes());
+        hasher.update(operation.circuit().artifact_id().as_bytes());
         self.compose(&NativeMidnightDidCallRequest {
             profile_id,
             account_index,
@@ -439,26 +442,100 @@ impl NativeMidnightDidCallComposer {
             recovery_public_key: self.public_key(&request.profile_id, &recovery)?,
             timestamp_millis: request.context.timestamp_millis,
         };
-        let signer = Arc::new(CustodyAuthorizationSigner {
+        let signer = CustodyAuthorizationSigner {
             custody: Arc::clone(&self.custody),
             profile_id: request.profile_id.clone(),
             controller_path: controller,
-            recovery_path: recovery,
-        });
-        let executor = GeneratedDidExecutor::new(
-            NativeDidWitnesses,
-            Arc::new(NativeDidPrivateStateStore(Mutex::new(private_state))),
-            signer,
-            ContractAddress(HashOutput(request.context.contract_address)),
-        );
-        let state = midnight_did_runtime::state_decode::charged_state_from_bytes(
+        };
+        let observed = runtime::transaction::ObservedContractState::decode_with_limit(
+            runtime::ledger::ContractAddress(HashOutput(request.context.contract_address)),
             &request.context.contract_state,
+            runtime::transaction::Observation {
+                transaction_hash: request.context.observation_transaction_hash,
+                block_hash: request.context.observation_block_hash,
+                block_height: request.context.observation_block_height,
+            },
+            runtime::transaction::EncodedSizeLimit::new(MAX_CONTRACT_STATE_BYTES),
         )
-        .map_err(map_backend_error)?;
+        .map_err(|_| DidLifecyclePortError::InvalidOperation)?
+        .with_coin_public_key(runtime::context::CoinPublicKey(HashOutput(
+            request.context.coin_public_key,
+        )));
+        let view = ledger_contract::PublicStateView::from(&observed);
+        let id = view
+            .id()
+            .map_err(|_| DidLifecyclePortError::InvalidOperation)?;
+        let version = view
+            .version()
+            .map_err(|_| DidLifecyclePortError::InvalidOperation)?;
         let circuit = request.operation.circuit();
-        let call = executor
-            .execute(state, request.operation.clone().into_runtime()?)
-            .map_err(map_backend_error)?;
+        let operation = request.operation.clone().into_runtime()?;
+        let contract = ledger_contract::Contract::from(NativeDidWitnesses);
+        let recorded = match operation {
+            RuntimeDidOperation::SetVerificationMethod { method, mutation } => {
+                let digest = pure_circuits::setVerificationMethodAuthorizationDigest(
+                    id.clone(),
+                    version,
+                    method.clone(),
+                    mutation,
+                )
+                .map_err(|_| DidLifecyclePortError::InvalidOperation)?;
+                let signature = signer.sign(&signer.controller_path, digest.0)?;
+                contract.recording().setVerificationMethod_call(
+                    &observed,
+                    private_state,
+                    method,
+                    mutation,
+                    signature,
+                    version,
+                )
+            }
+            RuntimeDidOperation::SetSchnorrJubjubVerificationMethod { method, mutation } => {
+                let digest = pure_circuits::setSchnorrJubjubVerificationMethodAuthorizationDigest(
+                    id.clone(),
+                    version,
+                    method.clone(),
+                    mutation,
+                )
+                .map_err(|_| DidLifecyclePortError::InvalidOperation)?;
+                let signature = signer.sign(&signer.controller_path, digest.0)?;
+                contract
+                    .recording()
+                    .setSchnorrJubjubVerificationMethod_call(
+                        &observed,
+                        private_state,
+                        method,
+                        mutation,
+                        signature,
+                        version,
+                    )
+            }
+            RuntimeDidOperation::SetVerificationMethodRelation {
+                relation,
+                method_id,
+                mutation,
+            } => {
+                let digest = pure_circuits::setVerificationMethodRelationAuthorizationDigest(
+                    id,
+                    version,
+                    relation,
+                    method_id.clone(),
+                    mutation,
+                )
+                .map_err(|_| DidLifecyclePortError::InvalidOperation)?;
+                let signature = signer.sign(&signer.controller_path, digest.0)?;
+                contract.recording().setVerificationMethodRelation_call(
+                    &observed,
+                    private_state,
+                    relation,
+                    method_id,
+                    mutation,
+                    signature,
+                    version,
+                )
+            }
+        }
+        .map_err(|_| DidLifecyclePortError::InvalidOperation)?;
 
         let verifier = self
             .artifacts
@@ -472,18 +549,6 @@ impl NativeMidnightDidCallComposer {
         {
             return Err(DidLifecyclePortError::InvalidOperation);
         }
-        let parameters_bytes = request
-            .context
-            .ledger_parameters
-            .as_deref()
-            .ok_or(DidLifecyclePortError::InvalidOperation)?;
-        let mut parameters_cursor = Cursor::new(parameters_bytes);
-        let parameters: LedgerParameters = tagged_deserialize(&mut parameters_cursor)
-            .map_err(|_| DidLifecyclePortError::InvalidOperation)?;
-        if usize::try_from(parameters_cursor.position()).ok() != Some(parameters_bytes.len()) {
-            return Err(DidLifecyclePortError::InvalidOperation);
-        }
-
         let mut seeds = None;
         self.custody
             .use_derived_secret(&request.profile_id, &replay, &mut |secret| {
@@ -498,39 +563,25 @@ impl NativeMidnightDidCallComposer {
             seeds.ok_or(DidLifecyclePortError::ProtectionUnavailable)?;
         let mut communication_bytes = *communication_seed;
         communication_bytes[31] = 0;
-        let communication_commitment_rand = Fr::from_le_bytes(&communication_bytes)
+        let communication_commitment_rand = runtime::Field::from_le_bytes(&communication_bytes)
             .ok_or(DidLifecyclePortError::InvalidOperation)?;
         communication_bytes.zeroize();
-        let prepartition = call.into_ledger_prepartition_contract_call(LedgerContractCallConfig {
-            operation: midnight_compact_runtime::ContractOperation::new(Some(verifier_key)),
-            communication_commitment_rand,
-            key_location: KeyLocation(Cow::Owned(circuit.artifact_id().to_owned())),
-        });
-        let empty: StandardTransaction<
-            Signature,
-            ProofPreimageMarker,
-            PedersenRandomness,
-            DefaultDB,
-        > = StandardTransaction::new(
-            request.context.network_id.clone(),
-            LedgerHashMap::new(),
+        let call = recorded
+            .prepare(verifier_key, communication_commitment_rand)
+            .map_err(|_| DidLifecyclePortError::InvalidOperation)?;
+        let mut intent_rng = ProtectedDeterministicRng::new(intent_seed);
+        let intent: Intent<Signature, ProofPreimageMarker, PedersenRandomness, DefaultDB> =
+            Intent::empty(
+                &mut intent_rng,
+                Timestamp::from_secs(request.context.expires_at_millis / 1_000),
+            )
+            .add_call::<ProofPreimage>(call);
+        let transaction = Transaction::Standard(StandardTransaction::new(
+            &request.context.network_id,
+            LedgerHashMap::from_iter([(1_u16, intent)]),
             None,
             LedgerHashMap::new(),
-        );
-        let mut intent_rng = ProtectedDeterministicRng::new(intent_seed);
-        let transaction = empty
-            .add_calls::<ProofPreimage>(
-                &mut intent_rng,
-                SegmentSpecifier::First,
-                &[prepartition],
-                &parameters,
-                Timestamp::from_secs(request.context.expires_at_millis / 1_000),
-                &[],
-                &[],
-                &[],
-            )
-            .map_err(|_| DidLifecyclePortError::InvalidOperation)?;
-        let transaction = Transaction::Standard(transaction);
+        ));
         let mut encoded = Zeroizing::new(Vec::new());
         tagged_serialize(&transaction, &mut *encoded)
             .map_err(|_| DidLifecyclePortError::InvalidOperation)?;
@@ -593,58 +644,76 @@ struct NativeDidPrivateState {
 #[derive(Clone, Copy)]
 struct NativeDidWitnesses;
 
-impl midnight_did_runtime::contract::Witnesses<NativeDidPrivateState> for NativeDidWitnesses {
-    fn get_schnorr_reduction<'a>(
+impl ledger_contract::Witnesses<NativeDidPrivateState> for NativeDidWitnesses {
+    fn getSchnorrReduction(
         &self,
-        _: &WitnessContext<midnight_did_runtime::contract::Ledger<'a>, NativeDidPrivateState>,
-        _: Fr,
-    ) -> (NativeDidPrivateState, (u8, u128)) {
-        unreachable!("unreachable for the pinned Ledger8 DID Compact output")
+        context: runtime::context::WitnessContext<
+            '_,
+            NativeDidPrivateState,
+            ledger_contract::LedgerView<'_>,
+        >,
+        challenge_hash: runtime::Field,
+    ) -> (
+        NativeDidPrivateState,
+        (
+            runtime::BoundedUint<127>,
+            runtime::WideUint<
+                1329227995784915872903807060280344575u128,
+                340282366920938463463374607431768211455u128,
+            >,
+        ),
+    ) {
+        let mut bytes = challenge_hash.as_le_bytes();
+        bytes.resize(32, 0);
+        let quotient = runtime::BoundedUint::new(bytes[31] as u128)
+            .expect("field quotient fits the generated bound");
+        bytes[31] = 0;
+        let remainder = runtime::WideUint::from_le_bytes(&bytes)
+            .expect("field remainder fits the generated bound");
+        (context.private_state.clone(), (quotient, remainder))
     }
-    fn local_controller_public_key<'a>(
+    fn localControllerPublicKey(
         &self,
-        context: &WitnessContext<midnight_did_runtime::contract::Ledger<'a>, NativeDidPrivateState>,
-    ) -> (NativeDidPrivateState, EmbeddedGroupAffine) {
+        context: runtime::context::WitnessContext<
+            '_,
+            NativeDidPrivateState,
+            ledger_contract::LedgerView<'_>,
+        >,
+    ) -> (NativeDidPrivateState, runtime::JubjubPoint) {
         (
             context.private_state.clone(),
-            context.private_state.controller_public_key,
+            context.private_state.controller_public_key.into(),
         )
     }
-    fn local_recovery_authority_public_key<'a>(
+    fn localRecoveryAuthorityPublicKey(
         &self,
-        context: &WitnessContext<midnight_did_runtime::contract::Ledger<'a>, NativeDidPrivateState>,
-    ) -> (NativeDidPrivateState, EmbeddedGroupAffine) {
+        context: runtime::context::WitnessContext<
+            '_,
+            NativeDidPrivateState,
+            ledger_contract::LedgerView<'_>,
+        >,
+    ) -> (NativeDidPrivateState, runtime::JubjubPoint) {
         (
             context.private_state.clone(),
-            context.private_state.recovery_public_key,
+            context.private_state.recovery_public_key.into(),
         )
     }
-    fn current_timestamp<'a>(
+    fn currentTimestamp(
         &self,
-        context: &WitnessContext<midnight_did_runtime::contract::Ledger<'a>, NativeDidPrivateState>,
-    ) -> (NativeDidPrivateState, u64) {
+        context: runtime::context::WitnessContext<
+            '_,
+            NativeDidPrivateState,
+            ledger_contract::LedgerView<'_>,
+        >,
+    ) -> (
+        NativeDidPrivateState,
+        runtime::BoundedUint<18446744073709551615>,
+    ) {
         (
             context.private_state.clone(),
-            context.private_state.timestamp_millis,
+            runtime::BoundedUint::new(context.private_state.timestamp_millis as u128)
+                .expect("u64 timestamp fits the generated bound"),
         )
-    }
-}
-
-struct NativeDidPrivateStateStore(Mutex<NativeDidPrivateState>);
-impl DidPrivateStateStore<NativeDidPrivateState> for NativeDidPrivateStateStore {
-    fn load(&self) -> Result<NativeDidPrivateState, BackendError> {
-        self.0
-            .lock()
-            .map(|state| state.clone())
-            .map_err(|_| BackendError::Other("DID private-state lock poisoned".to_owned()))
-    }
-    fn store(&self, state: NativeDidPrivateState) -> Result<(), BackendError> {
-        *self
-            .0
-            .lock()
-            .map_err(|_| BackendError::Other("DID private-state lock poisoned".to_owned()))? =
-            state;
-        Ok(())
     }
 }
 
@@ -652,44 +721,37 @@ struct CustodyAuthorizationSigner {
     custody: Arc<dyn WalletDerivedSecretUsePort>,
     profile_id: WalletProfileId,
     controller_path: WalletHdPath,
-    recovery_path: WalletHdPath,
 }
 impl CustodyAuthorizationSigner {
     fn sign(
         &self,
         path: &WalletHdPath,
-        digest: [Fr; 4],
-    ) -> Result<midnight_compact_runtime::SchnorrSignature, BackendError> {
+        digest: [runtime::Field; 4],
+    ) -> Result<types::SchnorrSignature, DidLifecyclePortError> {
         let mut signature = None;
         self.custody
             .use_derived_secret(&self.profile_id, path, &mut |secret| {
                 let signed = sign_authorization_digest_from_seed(secret, &digest)
                     .map_err(|_| WalletSecurityPortError::InvalidOperation)?;
-                signature = Some(midnight_compact_runtime::SchnorrSignature {
-                    announcement: signed.announcement,
+                signature = Some(types::SchnorrSignature {
+                    announcement: signed.announcement.into(),
                     response: field_from_scalar(&signed.response),
                 });
                 Ok(())
             })
-            .map_err(|_| BackendError::Other("DID authorization custody unavailable".to_owned()))?;
-        signature.ok_or_else(|| {
-            BackendError::Other("DID authorization signature unavailable".to_owned())
-        })
+            .map_err(map_security_error)?;
+        signature.ok_or(DidLifecyclePortError::ProtectionUnavailable)
     }
 }
-impl DidAuthorizationSigner for CustodyAuthorizationSigner {
-    fn sign_controller(
-        &self,
-        digest: [Fr; 4],
-    ) -> Result<midnight_compact_runtime::SchnorrSignature, BackendError> {
-        self.sign(&self.controller_path, digest)
+
+fn jubjub_point(x: [u8; 32], y: [u8; 32]) -> Result<runtime::JubjubPoint, DidLifecyclePortError> {
+    let x = runtime::Field::from_le_bytes(&x).ok_or(DidLifecyclePortError::InvalidOperation)?;
+    let y = runtime::Field::from_le_bytes(&y).ok_or(DidLifecyclePortError::InvalidOperation)?;
+    let point = EmbeddedGroupAffine::new(x, y).ok_or(DidLifecyclePortError::InvalidOperation)?;
+    if point.is_identity() {
+        return Err(DidLifecyclePortError::InvalidOperation);
     }
-    fn sign_recovery(
-        &self,
-        digest: [Fr; 4],
-    ) -> Result<midnight_compact_runtime::SchnorrSignature, BackendError> {
-        self.sign(&self.recovery_path, digest)
-    }
+    Ok(point.into())
 }
 
 fn jubjub_coordinates(
@@ -748,15 +810,13 @@ const fn map_security_error(error: WalletSecurityPortError) -> DidLifecyclePortE
         | WalletSecurityPortError::InvalidOperation => DidLifecyclePortError::InvalidOperation,
     }
 }
-fn map_backend_error(_: BackendError) -> DidLifecyclePortError {
-    DidLifecyclePortError::InvalidOperation
-}
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use midnight_ledger::structure::INITIAL_PARAMETERS;
-    use midnight_onchain_state::state::ContractMaintenanceAuthority;
+    use midnight_onchain_state::state::{
+        ContractMaintenanceAuthority, ContractOperation, ContractState, EntryPointBuf,
+    };
     use oxid_adapter_platform_system::{OsRandom, SystemClock};
     use oxid_adapter_storage_dev::DevelopmentWalletSecurity;
     use oxid_wallet_application::WalletProtectionPort;
@@ -766,6 +826,9 @@ mod tests {
         let context = MidnightDidCallContext {
             contract_state: vec![1],
             contract_address: [2; 32],
+            observation_transaction_hash: [7; 32],
+            observation_block_hash: [8; 32],
+            observation_block_height: 1,
             zswap_chain_state: None,
             ledger_parameters: None,
             network_id: "undeployed".to_owned(),
@@ -787,7 +850,7 @@ mod tests {
         };
         assert!(matches!(
             operation.into_runtime().expect("runtime call"),
-            DidContractCall::SetVerificationMethod { .. }
+            RuntimeDidOperation::SetVerificationMethod { .. }
         ));
     }
 
@@ -824,31 +887,29 @@ mod tests {
                 .expect("recovery key"),
             timestamp_millis: 10_000,
         };
-        let signer = Arc::new(CustodyAuthorizationSigner {
-            custody,
-            profile_id: profile_id.clone(),
-            controller_path: controller,
-            recovery_path: recovery,
-        });
-        let executor = GeneratedDidExecutor::new(
-            NativeDidWitnesses,
-            Arc::new(NativeDidPrivateStateStore(Mutex::new(private_state))),
-            signer,
-            ContractAddress::default(),
+        let initial = ledger_contract::initial_state(
+            runtime::context::ConstructorContext::new(private_state),
+            &NativeDidWitnesses,
+        )
+        .expect("generated initial state");
+        let verifier = composer
+            .artifacts
+            .verifier_key(MidnightDidBootstrapCircuit::VerificationMethod)
+            .expect("verification method verifier");
+        let mut cursor = Cursor::new(verifier.as_slice());
+        let verifier: VerifierKey = tagged_deserialize(&mut cursor).expect("decode verifier");
+        let operations = LedgerHashMap::new().insert(
+            EntryPointBuf(b"setVerificationMethod".to_vec()),
+            ContractOperation::new(Some(verifier), None),
         );
-        let deployment = executor.deployment_request().expect("generated deployment");
-        let deploy = deployment.to_contract_deploy(LedgerDeploymentConfig {
-            operations: LedgerHashMap::new(),
-            maintenance_authority: ContractMaintenanceAuthority::default(),
-            nonce: HashOutput([7; 32]),
-        });
-        let contract_address = deploy.address().0.0;
+        let contract = ContractState::new(
+            initial.ledger_state.get_ref().clone(),
+            operations,
+            ContractMaintenanceAuthority::default(),
+        );
+        let contract_address = [2; 32];
         let mut contract_state = Vec::new();
-        tagged_serialize(&deploy.initial_state, &mut contract_state)
-            .expect("serialize contract state");
-        let mut ledger_parameters = Vec::new();
-        tagged_serialize(&INITIAL_PARAMETERS, &mut ledger_parameters)
-            .expect("serialize ledger parameters");
+        tagged_serialize(&contract, &mut contract_state).expect("serialize contract state");
 
         let plan = composer
             .compose_bootstrap(
@@ -859,8 +920,11 @@ mod tests {
                 MidnightDidCallContext {
                     contract_state,
                     contract_address,
+                    observation_transaction_hash: [7; 32],
+                    observation_block_hash: [8; 32],
+                    observation_block_height: 1,
                     zswap_chain_state: None,
-                    ledger_parameters: Some(ledger_parameters),
+                    ledger_parameters: Some(vec![1]),
                     network_id: "undeployed".to_owned(),
                     timestamp_millis: 11_000,
                     expires_at_millis: 3_611_000,

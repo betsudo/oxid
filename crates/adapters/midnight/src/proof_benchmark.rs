@@ -311,14 +311,7 @@ fn build_ir_for_k(k: u8) -> Result<(IrSource, u32), ProofBenchmarkError> {
         return Ok(cached);
     }
     let hash_count = HASHES_FOR_K[usize::from(k)];
-    let ir = if k == PROOF_BENCHMARK_MIN_K {
-        IrSource::load(
-            &br#"{"version":{"major":2,"minor":0},"num_inputs":1,"do_communications_commitment":false,"instructions":[{"op":"assert","cond":0}]}"#[..],
-        )
-    } else {
-        build_hash_chain_ir(hash_count)
-    }
-    .map_err(|_| ProofBenchmarkError::ProvingFailed)?;
+    let ir = build_hash_chain_ir(hash_count).map_err(|_| ProofBenchmarkError::ProvingFailed)?;
     let result = (ir, hash_count);
     if let Ok(mut cache) = IR_CACHE.get_or_init(|| Mutex::new(HashMap::new())).lock() {
         cache.insert(k, result.clone());
@@ -327,21 +320,20 @@ fn build_ir_for_k(k: u8) -> Result<(IrSource, u32), ProofBenchmarkError> {
 }
 
 fn build_hash_chain_ir(hash_count: u32) -> io::Result<IrSource> {
-    let mut instructions = String::with_capacity(64 * (hash_count as usize + 1));
-    instructions.push_str(r#"{"op":"assert","cond":0}"#);
-    let mut previous = 0_u32;
+    let mut instructions = String::with_capacity(80 * (hash_count as usize + 2));
+    instructions.push_str(r#"{"op":"assert","cond":"%v0"}"#);
     for output in 1..=hash_count {
-        instructions.push(',');
         use std::fmt::Write as _;
+        let previous = output - 1;
         write!(
             instructions,
-            r#"{{"op":"transient_hash","inputs":[{previous}]}}"#
+            r#",{{"op":"transient_hash","inputs":["%v{previous}"],"output":"%v{output}"}}"#
         )
         .map_err(io::Error::other)?;
-        previous = output;
     }
+    instructions.push_str(r#",{"op":"output","vals":[]}"#);
     let json = format!(
-        r#"{{"version":{{"major":2,"minor":0}},"num_inputs":1,"do_communications_commitment":false,"instructions":[{instructions}]}}"#
+        r#"{{"version":{{"major":3,"minor":2}},"inputs":[{{"name":"%v0","type":"Scalar<BLS12-381>"}}],"outputs":[],"do_communications_commitment":false,"instructions":[{instructions}]}}"#
     );
     IrSource::load(json.as_bytes())
 }

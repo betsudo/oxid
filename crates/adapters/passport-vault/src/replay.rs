@@ -12,9 +12,11 @@
 
 use std::{collections::BTreeSet, error::Error, fmt, io::Cursor};
 
-use midnight_base_crypto::{hash::HashOutput, schnorr::Signature, time::Timestamp};
+use midnight_base_crypto::{hash::HashOutput, time::Timestamp};
 use midnight_coin_structure::contract::ContractAddress;
-use midnight_ledger::structure::{ContractAction, ContractCall, Intent, ProofMarker, Transaction};
+use midnight_ledger::structure::{
+    ContractAction, ContractCall, Intent, ProofMarker, Signature, Transaction,
+};
 use midnight_onchain_runtime::{
     context::{BlockContext, QueryContext},
     cost_model::INITIAL_COST_MODEL,
@@ -728,7 +730,11 @@ mod tests {
             },
             Op::Push {
                 storage: true,
-                value: StateValue::Cell(Sp::new(1u32.into())),
+                value: StateValue::Cell(Sp::new(
+                    midnight_base_crypto::fab::AlignedValue::from(1_u32)
+                        .try_into()
+                        .expect("a u32 is a canonical aligned value"),
+                )),
             },
             Op::Ins {
                 cached: false,

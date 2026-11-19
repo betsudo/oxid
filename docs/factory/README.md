@@ -25,6 +25,7 @@ current-head review evidence are the delivery gates.
 | [demo-inventory.md](demo-inventory.md) | Validated use-case → scenario → product-demo inventory and safe preparation briefs. |
 | [portal-macos-laptop.md](portal-macos-laptop.md) | Owner-invoked local Portal macOS prequalification. |
 | [portal-mobile-simulators.md](portal-mobile-simulators.md) | Owner-invoked packaged iOS Simulator and Android QEMU Portal evidence. |
+| [ledger9-local-issuance.md](ledger9-local-issuance.md) | Shared-stack Ledger 9 holder DID and packaged iOS credential-issuance qualification. |
 | [portal-android-tailnet-physical.md](portal-android-tailnet-physical.md) | Owner-invoked physical Android Tailnet Portal conformance evidence. |
 | [../../demo/README.md](../../demo/README.md) | Provider-neutral physical Android demo for Tailnet Midnight services and standalone OpenID4VC protocols. |
 

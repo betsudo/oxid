@@ -650,13 +650,43 @@ where
 {
     let key_operations: Arc<dyn WalletKeyOperationPort> = security.clone();
     let challenge_signing: Arc<dyn WalletJubjubChallengeSigningPort> = security.clone();
-    let did_lifecycle = Arc::new(StandaloneDidLifecycle::with_jubjub_challenge_signing(
-        key_operations,
-        challenge_signing,
-    ));
+    let did_lifecycle =
+        StandaloneDidLifecycle::with_jubjub_challenge_signing(key_operations, challenge_signing);
+    #[cfg(all(
+        not(target_arch = "wasm32"),
+        any(
+            all(not(target_os = "ios"), not(target_os = "android")),
+            all(
+                feature = "mobile-portal",
+                any(target_os = "ios", target_os = "android")
+            )
+        )
+    ))]
+    let did_lifecycle = match &credential_profile {
+        HeadlessCredentialProfile::Portal(portal)
+            if portal.client_factory.deployment().uses_ledger9_jubjub_jwk() =>
+        {
+            did_lifecycle.with_ledger9_jubjub_jwk()
+        }
+        _ => did_lifecycle,
+    };
+    let did_lifecycle = Arc::new(did_lifecycle);
     let did_lifecycle_port: Arc<dyn DidLifecyclePort> = did_lifecycle.clone();
     let did_jubjub_challenge_signing: Arc<dyn DidJubjubChallengeSigningPort> = did_lifecycle;
-    let did_resolver = headless_did_resolver();
+    let did_resolver = match &credential_profile {
+        HeadlessCredentialProfile::Standalone => headless_did_resolver(),
+        #[cfg(all(
+            not(target_arch = "wasm32"),
+            any(
+                all(not(target_os = "ios"), not(target_os = "android")),
+                all(
+                    feature = "mobile-portal",
+                    any(target_os = "ios", target_os = "android")
+                )
+            )
+        ))]
+        HeadlessCredentialProfile::Portal(portal) => Arc::clone(&portal.issuer_resolver),
+    };
     let (
         compact_issuer_resolver,
         trust_anchor,
@@ -878,10 +908,18 @@ where
         Arc::new(UnavailablePortableWalletBackupDocuments);
     let presentation_credential_repository = Arc::clone(&credential_repository);
     let vault_credential_repository = Arc::clone(&credential_repository);
-    let standalone_passport_vault = !matches!(
-        &credential_issuance,
-        CredentialIssuanceComposition::Unavailable
-    );
+    #[cfg(all(feature = "mobile-portal-tailnet", target_os = "android"))]
+    let ledger9_tailnet_issuance = match &credential_issuance {
+        CredentialIssuanceComposition::Portal(factory) => factory.deployment().is_ledger9_tailnet(),
+        _ => false,
+    };
+    #[cfg(not(all(feature = "mobile-portal-tailnet", target_os = "android")))]
+    let ledger9_tailnet_issuance = false;
+    let standalone_passport_vault = !ledger9_tailnet_issuance
+        && !matches!(
+            &credential_issuance,
+            CredentialIssuanceComposition::Unavailable
+        );
     #[cfg(not(target_arch = "wasm32"))]
     let compact_presentation_proof_available = match &credential_presentation {
         CredentialPresentationComposition::StandaloneZk(_) => true,
@@ -932,10 +970,10 @@ where
         Arc::clone(&clock),
     ));
     let protection_port = protection_for_security(Arc::clone(&security));
-    let protection = Arc::new(WalletProtectionService::with_approvals(
-        protection_port,
-        approvals.clone(),
-    ));
+    let protection = Arc::new(
+        WalletProtectionService::with_approvals(protection_port, approvals.clone())
+            .with_profile_associations(repository.clone()),
+    );
     let portable_backup = Arc::new(WalletPortableBackupService::new(Arc::clone(&security)));
     let sensitive_keys = Arc::new(oxid_wallet_application::WalletSensitiveKeyService::new(
         security.clone(),
@@ -992,9 +1030,10 @@ where
             publisher,
         )) as Arc<dyn PublishDidUseCase>
     });
-    let credential_issuance_authority = did_approvals
-        .as_ref()
-        .map(|_| Arc::new(CredentialIssuanceFlowService::new(clock.clone())));
+    // The protocol mints this single-use authority only after accepting the
+    // exact prepared offer. Generic DID approvals remain unavailable on Tailnet.
+    let credential_issuance_authority = (did_approvals.is_some() || ledger9_tailnet_issuance)
+        .then(|| Arc::new(CredentialIssuanceFlowService::new(clock.clone())));
     let self_issued_authentication_authority = did_approvals
         .as_ref()
         .map(|_| Arc::new(SelfIssuedAuthenticationFlowService::new(clock.clone())));

@@ -3,24 +3,27 @@
 //! Bounded standalone completion of an authorized Midnight transfer.
 
 use std::{
-    fmt, io,
+    fmt,
+    future::Future,
+    io,
     net::IpAddr,
     sync::{
         Arc, Mutex,
         atomic::{AtomicBool, Ordering},
     },
+    thread,
     time::{Duration, Instant},
 };
 
 use futures::{SinkExt, StreamExt};
-use midnight_base_crypto::{schnorr::Signature, time::Timestamp};
+use midnight_base_crypto::time::Timestamp;
 use midnight_coin_structure::coin::TokenType;
 use midnight_ledger::{
     dust::{DustActions, DustLocalState, DustOutput, DustParameters, DustPublicKey, DustSecretKey},
     events::Event,
     structure::{
         Intent, LedgerParameters, ProofPreimageMarker, ProofPreimageVersioned, ProofVersioned,
-        StandardTransaction, Transaction,
+        Signature, StandardTransaction, Transaction,
     },
 };
 use midnight_onchain_runtime::cost_model::INITIAL_COST_MODEL;
@@ -32,16 +35,20 @@ use midnight_storage::{
 use midnight_transient_crypto::{
     commitment::PedersenRandomness,
     curve::Fr,
-    proofs::{Proof, ProofPreimage, ProvingKeyMaterial, ProvingProvider, WrappedIr},
+    proofs::{
+        KeyLocation, Proof, ProofPreimage, ProvingKeyMaterial, ProvingProvider, Resolver, WrappedIr,
+    },
 };
-use oxid_adapter_platform_system::{http_client_builder_for, websocket_connector_for};
+use oxid_adapter_platform_system::{
+    connect_json_rpc_websocket, http_client_builder_for, websocket_connector_for,
+};
 use oxid_platform_ports::ClockPort;
 use oxid_wallet_application::WalletTransactionPortError;
 use oxid_wallet_domain::WalletTransferSubmissionMode;
 use rand::rngs::OsRng;
 use reqwest::{Method, StatusCode, Url, header::CONTENT_TYPE};
 use serde_json::{Value, json};
-use subxt::{OnlineClient, SubstrateConfig, dynamic};
+use subxt::{OnlineClient, SubstrateConfig, backend::rpc::RpcClient, dynamic};
 use tokio::time::timeout;
 use tokio_tungstenite::tungstenite::{
     Message, client::IntoClientRequest, protocol::WebSocketConfig,
@@ -88,10 +95,38 @@ const MAX_PROOF_REQUEST_BYTES: usize = 16 * 1024 * 1024;
 const MAX_PROOF_RESPONSE_BYTES: usize = 16 * 1024 * 1024;
 const MAX_TRANSACTION_BYTES: usize = 16 * 1024 * 1024;
 const MAX_BALANCE_ITERATIONS: usize = 16;
+const MAX_FEE_RECONCILIATION_ITERATIONS: usize = 3;
 const MAX_RECONCILIATION_BLOCKS: usize = 2_048;
+const MIDNIGHT_RUNTIME_STACK_BYTES: usize = 8 * 1024 * 1024;
 
 type UnprovenTransaction =
     Transaction<Signature, ProofPreimageMarker, PedersenRandomness, DefaultDB>;
+
+fn run_isolated_midnight_runtime<Output, Factory, Operation>(
+    operation: Factory,
+) -> Result<Output, WalletTransactionPortError>
+where
+    Output: Send,
+    Factory: FnOnce() -> Operation + Send,
+    Operation: Future<Output = Result<Output, WalletTransactionPortError>>,
+{
+    thread::scope(|scope| {
+        let worker = thread::Builder::new()
+            .name("oxid-midnight-runtime".to_owned())
+            .stack_size(MIDNIGHT_RUNTIME_STACK_BYTES)
+            .spawn_scoped(scope, move || {
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .map_err(|_| WalletTransactionPortError::Unavailable)?;
+                runtime.block_on(operation())
+            })
+            .map_err(|_| WalletTransactionPortError::Unavailable)?;
+        worker
+            .join()
+            .map_err(|_| WalletTransactionPortError::Unavailable)?
+    })
+}
 
 /// Explicit source of authenticated public proving material for application
 /// circuits that are not built into the standalone proof server.
@@ -282,13 +317,10 @@ pub async fn authenticate_midnight_chain_identity(
 ) -> Result<(), MidnightChainIdentityError> {
     super::indexer::validate_websocket_url(node_websocket_url)
         .map_err(|_| MidnightChainIdentityError::InvalidNodeEndpoint)?;
-    let client = timeout(
-        CONNECT_TIMEOUT,
-        OnlineClient::<SubstrateConfig>::from_insecure_url(node_websocket_url),
-    )
-    .await
-    .map_err(|_| MidnightChainIdentityError::NodeUnavailable)?
-    .map_err(|_| MidnightChainIdentityError::NodeUnavailable)?;
+    let client = timeout(CONNECT_TIMEOUT, connect_midnight_node(node_websocket_url))
+        .await
+        .map_err(|_| MidnightChainIdentityError::NodeUnavailable)?
+        .map_err(|_| MidnightChainIdentityError::NodeUnavailable)?;
     let genesis_hash = client.genesis_hash();
     let observed: &[u8] = genesis_hash.as_ref();
     if observed == expected_genesis_hash {
@@ -296,6 +328,19 @@ pub async fn authenticate_midnight_chain_identity(
     } else {
         Err(MidnightChainIdentityError::GenesisMismatch)
     }
+}
+
+async fn connect_midnight_node(endpoint: &str) -> Result<OnlineClient<SubstrateConfig>, ()> {
+    let url = Url::parse(endpoint).map_err(|_| ())?;
+    if url.scheme() == "ws" && url.query().is_none() {
+        return OnlineClient::from_insecure_url(endpoint)
+            .await
+            .map_err(|_| ());
+    }
+    let client = connect_json_rpc_websocket(endpoint).await.map_err(|_| ())?;
+    OnlineClient::from_rpc_client(RpcClient::new(client))
+        .await
+        .map_err(|_| ())
 }
 
 #[derive(Clone)]
@@ -374,11 +419,9 @@ impl MidnightSubmissionReconciler for LiveMidnightSubmissionReconciler {
         entry: &StoredSubmissionJournalEntry,
     ) -> Result<MidnightSubmissionReconciliation, WalletTransactionPortError> {
         self.validate_entry(entry)?;
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .map_err(|_| WalletTransactionPortError::Unavailable)?;
-        runtime.block_on(reconcile_live_submission(&self.config, entry))
+        run_isolated_midnight_runtime(move || async move {
+            reconcile_live_submission(&self.config, entry).await
+        })
     }
 
     fn reconcile_async<'a>(
@@ -398,7 +441,7 @@ async fn reconcile_live_submission(
 ) -> Result<MidnightSubmissionReconciliation, WalletTransactionPortError> {
     let client = timeout(
         CONNECT_TIMEOUT,
-        OnlineClient::<SubstrateConfig>::from_insecure_url(config.node_websocket_url()),
+        connect_midnight_node(config.node_websocket_url()),
     )
     .await
     .map_err(|_| WalletTransactionPortError::Timeout)?
@@ -495,18 +538,17 @@ where
                 None
             };
         let dust_key = DustSecretKey::derive_secret_key(dust_seed);
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .map_err(|_| WalletTransactionPortError::Unavailable)?;
-        runtime.block_on(complete_live(
-            &self.config,
-            request,
-            &dust_key,
-            self.dust_checkpoints.as_ref(),
-            self.clock.as_ref(),
-            self.remote_proving_material.as_ref(),
-        ))
+        run_isolated_midnight_runtime(move || async move {
+            complete_live(
+                &self.config,
+                request,
+                &dust_key,
+                self.dust_checkpoints.as_ref(),
+                self.clock.as_ref(),
+                self.remote_proving_material.as_ref(),
+            )
+            .await
+        })
     }
 }
 
@@ -556,7 +598,7 @@ where
         &mut persist_progress,
     )
     .await?;
-    let mut dust_state = synchronized.state;
+    let dust_state = synchronized.state;
     ensure_submission_active(&cancellation)?;
     if dust_state.params != chain_tip.parameters.dust {
         return Err(WalletTransactionPortError::InvalidChainState);
@@ -580,33 +622,56 @@ where
     if ttl <= current_time {
         return Err(WalletTransactionPortError::DraftExpired);
     }
-    let (balanced, fee_specks) = balance_dust(
-        request.transaction.clone(),
-        &mut dust_state,
-        dust_key,
-        &chain_tip.parameters,
-        current_time,
-        ttl,
-        config.indexer.network_id().as_str(),
-    )?;
-    let sealed = match config.proving() {
-        MidnightProvingMode::Local(local_config) => {
-            let outcome =
-                local_proving::prove_transaction(balanced, local_config, &cancellation).await?;
-            let _metrics = outcome.metrics;
-            outcome.transaction
+    // Ledger 9 fee calculation is accurate only for proven transactions. The
+    // first pass therefore uses the unproven estimate to construct the DUST
+    // intent, then bounded reconciliation passes rebuild that intent with the
+    // actual sealed fee. Re-proving is intentional: changing the DUST spend
+    // changes the transaction binding input, so the first proof cannot be
+    // submitted with the corrected fee.
+    let original_transaction = request.transaction.clone();
+    let original_dust_state = dust_state.clone();
+    let mut required_fee = None;
+    let mut reconciled = None;
+    for _ in 0..MAX_FEE_RECONCILIATION_ITERATIONS {
+        ensure_submission_active(&cancellation)?;
+        let mut candidate_dust_state = original_dust_state.clone();
+        let (balanced, funded_fee) = balance_dust(
+            original_transaction.clone(),
+            &mut candidate_dust_state,
+            dust_key,
+            &chain_tip.parameters,
+            current_time,
+            ttl,
+            config.indexer.network_id().as_str(),
+            required_fee,
+        )?;
+        let sealed = match config.proving() {
+            MidnightProvingMode::Local(local_config) => {
+                let outcome =
+                    local_proving::prove_transaction(balanced, local_config, &cancellation).await?;
+                let _metrics = outcome.metrics;
+                outcome.transaction
+            }
+            MidnightProvingMode::Remote { proof_server_url } => {
+                prove_via_http(balanced, proof_server_url, remote_proving_material.cloned()).await?
+            }
+        };
+        ensure_submission_active(&cancellation)?;
+        let sealed_fee = sealed
+            .fees(&chain_tip.parameters, false)
+            .map_err(|_| WalletTransactionPortError::InvalidChainState)?;
+        let sealed_balance = sealed
+            .balance(Some(sealed_fee))
+            .map_err(|_| WalletTransactionPortError::InvalidChainState)?;
+        let final_fee_is_covered =
+            funded_fee >= sealed_fee && sealed_balance.values().all(|balance| *balance >= 0);
+        if final_fee_is_covered {
+            reconciled = Some((sealed, sealed_fee));
+            break;
         }
-        MidnightProvingMode::Remote { proof_server_url } => {
-            prove_via_http(balanced, proof_server_url, remote_proving_material.cloned()).await?
-        }
-    };
-    ensure_submission_active(&cancellation)?;
-    let sealed_fee = sealed
-        .fees(&chain_tip.parameters, false)
-        .map_err(|_| WalletTransactionPortError::InvalidChainState)?;
-    if sealed_fee != fee_specks {
-        return Err(WalletTransactionPortError::InvalidChainState);
+        required_fee = Some(sealed_fee);
     }
+    let (sealed, fee_specks) = reconciled.ok_or(WalletTransactionPortError::InvalidChainState)?;
     let mut transaction_bytes = Vec::new();
     midnight_serialize::tagged_serialize(&sealed, &mut transaction_bytes)
         .map_err(|_| WalletTransactionPortError::InvalidData)?;
@@ -1256,15 +1321,17 @@ fn balance_dust(
     current_time: Timestamp,
     ttl: Timestamp,
     network_id: &str,
+    required_fee: Option<u128>,
 ) -> Result<(UnprovenTransaction, u128), WalletTransactionPortError> {
     let original_transaction = transaction.clone();
     let original_dust = dust_state.clone();
     let mut current = transaction;
     let mut accumulated_dust = 0_u128;
     for _ in 0..MAX_BALANCE_ITERATIONS {
-        let fees = current
+        let estimated_fees = current
             .fees(parameters, false)
             .map_err(|_| WalletTransactionPortError::InvalidChainState)?;
+        let fees = required_fee.unwrap_or(estimated_fees);
         let balance = current
             .balance(Some(fees))
             .map_err(|_| WalletTransactionPortError::InvalidChainState)?;
@@ -1424,6 +1491,22 @@ impl ProvingProvider for HttpDustProvingProvider {
     fn split(&mut self) -> Self {
         self.clone()
     }
+
+    fn resolver(&self) -> &impl Resolver {
+        self
+    }
+}
+
+impl Resolver for HttpDustProvingProvider {
+    async fn resolve_key(&self, key: KeyLocation) -> io::Result<Option<ProvingKeyMaterial>> {
+        if Self::is_builtin_key(key.0.as_ref()) {
+            return Ok(None);
+        }
+        self.remote_proving_material
+            .as_ref()
+            .ok_or_else(|| io::Error::other("external proving material is unavailable"))?
+            .resolve_key(key.0.as_ref())
+    }
 }
 
 impl HttpDustProvingProvider {
@@ -1495,13 +1578,10 @@ async fn submit_unsigned(
     request: &MidnightCompletionRequest,
     fee_specks: u128,
 ) -> Result<([u8; 32], [u8; 32], u64), WalletTransactionPortError> {
-    let client = timeout(
-        CONNECT_TIMEOUT,
-        OnlineClient::<SubstrateConfig>::from_insecure_url(endpoint),
-    )
-    .await
-    .map_err(|_| WalletTransactionPortError::Timeout)?
-    .map_err(|_| WalletTransactionPortError::Unavailable)?;
+    let client = timeout(CONNECT_TIMEOUT, connect_midnight_node(endpoint))
+        .await
+        .map_err(|_| WalletTransactionPortError::Timeout)?
+        .map_err(|_| WalletTransactionPortError::Unavailable)?;
     let call = dynamic::tx(
         "Midnight",
         "send_mn_transaction",
@@ -1780,6 +1860,17 @@ mod tests {
             .enable_all()
             .build()
             .expect("test runtime builds")
+    }
+
+    #[test]
+    fn synchronous_adapter_boundary_is_safe_inside_an_async_runtime() {
+        let result = runtime().block_on(async {
+            run_isolated_midnight_runtime(|| async {
+                Ok::<_, WalletTransactionPortError>("completed")
+            })
+        });
+
+        assert_eq!(result, Ok("completed"));
     }
 
     #[allow(clippy::result_large_err)] // tungstenite's test-server callback owns the error type.
@@ -2744,9 +2835,73 @@ mod tests {
                 Timestamp::from_secs(1_700_000_000),
                 Timestamp::from_secs(1_700_003_600),
                 "undeployed",
+                None,
             )
             .err(),
             Some(WalletTransactionPortError::InsufficientDust)
+        );
+    }
+
+    #[test]
+    fn dust_reconciliation_uses_the_proven_fee_instead_of_the_unproven_estimate() {
+        use midnight_base_crypto::{hash::HashOutput, time::Timestamp};
+        use midnight_ledger::dust::{
+            DustGenerationInfo, InitialNonce, QualifiedDustOutput, dust_first_nonce,
+        };
+
+        let dust_key = DustSecretKey::derive_secret_key(&[0x5a; 32]);
+        let owner = DustPublicKey::from(dust_key.clone());
+        let backing_night = InitialNonce(HashOutput([0x2a; 32]));
+        let created_at = Timestamp::from_secs(1);
+        let generation = DustGenerationInfo {
+            value: 1_000_000_000_000_000,
+            owner,
+            nonce: backing_night,
+            dtime: Timestamp::MAX,
+        };
+        let output = QualifiedDustOutput {
+            initial_value: generation.value,
+            owner,
+            nonce: dust_first_nonce(&backing_night, &owner),
+            seq: 0,
+            ctime: created_at,
+            backing_night,
+            mt_index: 0,
+        };
+        let mut dust_state = DustLocalState::<DefaultDB>::new(INITIAL_PARAMETERS.dust)
+            .insert_generation_info(0, generation, Some(backing_night))
+            .expect("generation info inserts")
+            .insert_commitment(0, output, true)
+            .expect("commitment inserts")
+            .add_utxo(&output.nullifier(&dust_key), &output, None)
+            .expect("DUST output inserts");
+        let transaction = Transaction::Standard(StandardTransaction::new(
+            "undeployed",
+            LedgerHashMap::new(),
+            None,
+            LedgerHashMap::new(),
+        ));
+        let proven_fee = 123_456_789_u128;
+
+        let (balanced, funded_fee) = balance_dust(
+            transaction,
+            &mut dust_state,
+            &dust_key,
+            &INITIAL_PARAMETERS,
+            Timestamp::from_secs(2),
+            Timestamp::from_secs(3_600),
+            "undeployed",
+            Some(proven_fee),
+        )
+        .expect("the proven fee is funded");
+
+        assert_eq!(funded_fee, proven_fee);
+        assert!(
+            balanced
+                .balance(Some(proven_fee))
+                .expect("balanced transaction has a ledger balance")
+                .values()
+                .all(|value| *value >= 0)
         );
     }
 }

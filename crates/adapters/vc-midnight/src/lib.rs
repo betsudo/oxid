@@ -42,6 +42,7 @@ mod protected_presentation;
 
 pub use compact_digital_passport::{
     MidnightCompactCredentialVerifier, StandaloneBoundCompactCredentialIssuer,
+    validate_compact_holder_binding,
 };
 #[cfg(not(target_arch = "wasm32"))]
 pub use compact_presentation::NativeCompactPresentationVerifier;

@@ -310,11 +310,8 @@ impl NativePassportVaultCompactArtifacts {
         }
         validate_contract_info(&read_artifact(&artifact_root, CONTRACT_INFO)?)?;
         for circuit in PassportVaultCompactCircuit::ALL {
-            let ir = IrSource::load_from_tagged(Cursor::new(read_artifact(
-                &artifact_root,
-                circuit.ir(),
-            )?))
-            .map_err(|_| PassportVaultCompactArtifactError::CircuitMismatch)?;
+            let ir = IrSource::load(Cursor::new(read_artifact(&artifact_root, circuit.ir())?))
+                .map_err(|_| PassportVaultCompactArtifactError::CircuitMismatch)?;
             // Row counts are bound by the exact IR digest and manifest. Building
             // the full claim constraint model here costs roughly a minute on a
             // phone-class CPU, so runtime admission checks the encoded degree

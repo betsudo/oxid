@@ -16,6 +16,13 @@ test("Portal iOS holder preparation follows the current DID detail contract", as
   ]);
 
   assert.match(fixture, /buttons\["Copy DID"\]/u);
+  assert.doesNotMatch(fixture, /buttons\["Use public demo wallet"\]/u);
+  assert.match(fixture, /WalletOnboardingFixture\.completeDevelopmentRecoveryCeremony/u);
+  assert.match(fixture, /requestFixedGrant\(for: address\)/u);
+  assert.match(fixture, /staticTexts\["Transfer confirmed"\]/u);
+  assert.match(fixture, /func testFundedWalletRecoversAcrossRestart\(\)/u);
+  assert.match(fixture, /\["DUST Ready"\]/u);
+  assert.match(fixture, /readReceiveLabel\(\) == before/u);
   assert.doesNotMatch(fixture, /staticTexts\["Identity"\]/u);
   assert.match(
     fixture,
@@ -29,15 +36,20 @@ test("Portal iOS holder preparation follows the current DID detail contract", as
     fixture,
     /buttons\["Leave credential review"\]\.waitForNonExistence/u,
   );
-  assert.doesNotMatch(fixture, /buttons\["Receive"\]\.waitForExistence/u);
+  assert.match(fixture, /application\.buttons\["Receive"\]/u);
   assert.match(dids, /aria_label: "Copy DID"/u);
+  assert.match(dids, /DID_REALM_PREFLIGHT_ATTEMPTS: usize = 360/u);
 });
 
 test("Portal acceptance uses only named development authority and bounded cleanup", async () => {
-  const [appManifest, profile, headless, lifecycle, liveFlow] = await Promise.all([
+  const [appManifest, profile, headlessProfile, headless, lifecycle, liveFlow] = await Promise.all([
     readFile(new URL("apps/oxid/Cargo.toml", root), "utf8"),
     readFile(
       new URL("crates/composition/src/profile_mobile.rs", root),
+      "utf8",
+    ),
+    readFile(
+      new URL("crates/composition/src/profile_headless.rs", root),
       "utf8",
     ),
     readFile(new URL("scripts/e2e/portal-headless-e2e.sh", root), "utf8"),
@@ -67,6 +79,18 @@ test("Portal acceptance uses only named development authority and bounded cleanu
   assert.match(
     profile,
     /let did_approvals = Some\(super::profile_headless::development_did_approval_service\(\)\)/u,
+  );
+  assert.match(
+    headlessProfile,
+    /all\(not\(target_os = "ios"\), not\(target_os = "android"\)\),\s*feature = "standalone-development",\s*feature = "mobile-portal"/u,
+  );
+  assert.match(
+    headlessProfile,
+    /any\(target_os = "ios", target_os = "android"\),\s*not\(feature = "standalone-development"\),\s*not\(feature = "mobile-portal"\)/u,
+  );
+  assert.match(
+    headlessProfile,
+    /DevelopmentWalletSecurity::persistent\([\s\S]*?directory\.join\("private"\)/u,
   );
   assert.match(headless, /--features development-did-approval-fixture/u);
   assert.match(lifecycle, /timeout -k 5s 40s docker compose/u);

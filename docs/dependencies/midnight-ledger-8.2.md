@@ -1,4 +1,9 @@
-# Midnight ledger and cryptography dependency review
+# Midnight Ledger 8 dependency review (historical)
+
+> Superseded for milestone 0.3.0 by
+> [the Ledger 9 dependency review](midnight-ledger-9.1.md) and ADR-0123. This
+> file records the qualified milestone 0.2.0 graph only; it is not a source
+> selection for new production code.
 
 - Project: [midnight-ledger](https://github.com/MediaNoxLabs/midnight-ledger)
 - Selected revision: `b85f5d8e503fd1d7a1b128bbc1d7156baf823a65`

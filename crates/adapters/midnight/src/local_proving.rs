@@ -13,22 +13,20 @@ use midnight_base_crypto::data_provider::{FetchMode, MidnightDataProvider, Outpu
 use midnight_ledger::{
     dust::{DUST_EXPECTED_FILES, DustResolver},
     prove::Resolver as LedgerResolver,
-    structure::{ProofMarker, ProofPreimageMarker, Transaction},
+    structure::{ProofMarker, ProofPreimageMarker, Signature, Transaction},
 };
 use midnight_storage::DefaultDB;
 use midnight_transient_crypto::{
     commitment::{PedersenRandomness, PureGeneratorPedersen},
     proofs::Zkir as _,
 };
-use midnight_zkir::{IrSource, LocalProvingProvider};
+use midnight_zkir_v2::{IrSource, LocalProvingProvider};
 use midnight_zswap::{ZSWAP_EXPECTED_FILES, prove::ZswapResolver};
 use oxid_adapter_platform_system::http_client_builder_for;
 use oxid_wallet_application::WalletTransactionPortError;
 use rand::{RngCore as _, rngs::OsRng};
 use reqwest::Url;
 use sha2::{Digest as _, Sha256};
-
-use midnight_base_crypto::signatures::Signature;
 
 const PARAMETER_SOURCE: &str = "https://srs.midnight.network/";
 const DUST_CIRCUIT_K: u8 = 13;
@@ -548,7 +546,7 @@ fn inspect_dust_circuit(directory: &Path) -> Result<(u8, u64), WalletTransaction
     if bytes.len() as u64 > MAX_IR_BYTES {
         return Err(WalletTransactionPortError::ProvingFailed);
     }
-    let ir = IrSource::load_from_tagged(Cursor::new(bytes))
+    let ir = IrSource::load(Cursor::new(bytes))
         .map_err(|_| WalletTransactionPortError::ProvingFailed)?;
     let k = ir.k();
     #[cfg(feature = "proving-bench")]

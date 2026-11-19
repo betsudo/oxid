@@ -1,36 +1,64 @@
 {
-  "schema": "oxid-midnight-integration-compatibility-v1",
-  "contractRelease": "0.4.0",
+  "schema": "oxid-midnight-integration-compatibility-v2",
+  "contractRelease": "0.5.0",
+  "rust": {
+    "channel": "1.99",
+    "minimumVersion": "1.99"
+  },
   "wallet": {
-    "ledgerRevision": "8655615e7c4cbf3a1187b3203bf72e69dc09b8dc",
-    "ledgerVersion": "8.2.0-rc.1",
-    "didToolchainRevision": "05b237a5e51f9c22853b424e7d4236dfa9384c24",
-    "didToolchainPackageVersion": "0.4.0",
-    "nativeDidRuntime": {
-      "repository": "https://github.com/MediaNoxLabs/midnight-identity.git",
-      "revision": "fcf3c51cb9368a3e7574f06f82434f92386d0a2b",
+    "ledgerFamily": "ledger9",
+    "ledger": {
+      "repository": "https://github.com/betsudo/midnight-ledger",
+      "revision": "6fbc2e3900845a858f70eebf8a0deab1d4d3c0d6",
+      "package": "midnight-ledger-v9",
+      "packageVersion": "1.0.2",
+      "protocolVersion": 2001100
+    },
+    "compact": {
+      "repository": "https://github.com/betsudo/compact",
+      "revision": "d6513a24debac14d43a8199460d9dc2c6d9af2b1",
+      "runtimeVersion": "0.2.0",
+      "runtimeAbi": 54
+    },
+    "proofs": {
+      "repository": "https://github.com/betsudo/midnight-zk",
+      "revision": "bca8db4d9e2c1ecaa5d1db5ba7a201935b6c6c8a",
+      "packageVersion": "0.8.2"
+    },
+    "zkir": {
+      "repository": "https://github.com/betsudo/midnight-zkir",
+      "revision": "3377ad9e48741f60e0aa17010b6f23e34223d906",
+      "packageVersion": "3.2.1",
+      "schema": 20
+    },
+    "nativeIdentity": {
+      "repository": "https://github.com/betsudo/midnight-identity",
+      "revision": "e7e28eea94515d59b5e7360a717f5c0dee3eecdf",
       "packageVersion": "0.5.0",
-      "artifactRelease": "0.5.0",
-      "artifactGitSha": "a14267cec3c1ab7e00bb0f058a54267d913a321b"
+      "upstreamPullRequest": 110,
+      "mergeRequiredBeforeRelease": false
     }
   },
-  "standalone": {
+  "sharedStack": {
+    "ownerProject": "midnight-network",
     "networkId": "undeployed",
-    "nodeImage": "midnightntwrk/midnight-node:0.22.3",
-    "indexerImage": "midnightntwrk/indexer-standalone:4.0.0",
-    "proofServerImage": "midnightntwrk/proof-server:8.0.3"
+    "nodeRpcUrl": "http://127.0.0.1:9944",
+    "nodeRelease": "2.1.101",
+    "indexerHttpUrl": "http://127.0.0.1:8088/api/v4/graphql",
+    "indexerWsUrl": "ws://127.0.0.1:8088/api/v4/graphql/ws",
+    "proofServerUrl": "http://127.0.0.1:6300",
+    "proofServerRelease": "9.0.2"
   },
   "portal": {
     "repository": "https://github.com/input-output-hk/lace-id-portal.git",
     "commit": "25499870f84d77173c46e4af3021311decfb840b",
     "tree": "2d845d2293603dfd8adce5362c8a9941e6ba78a9",
-    "didSourceRevision": "cf00aacb3e1bb300e87bc4dd11ec0897fab6e233",
-    "didPackageVersion": "0.4.0",
-    "didManagerPackageManifestSha256": "9640d912ac9bb225e6382cf80c5c30929127701c8a72d85c121cfda335b28ef9"
+    "migrationState": "ledger9-pending",
+    "upstreamPullRequest": 127
   },
   "demoReadiness": {
     "nativeHolderDidRequired": true,
-    "nativeHolderDidImplemented": true,
+    "nativeHolderDidImplemented": false,
     "portalUnderstandsNativeDidRelease": false,
     "exactTailnetIssuanceQualified": false,
     "outOfBandHolderPublicationAllowed": false

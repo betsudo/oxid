@@ -92,6 +92,26 @@ its owning upstream graph drops the crate.
 - Enabling Subxt light-client support is forbidden under these exceptions. It
   requires an ADR/dependency review and removal or replacement of the affected
   packages first.
+- `RUSTSEC-2026-0344` affects `ruzstd 0.8.3`, which is locked through the same
+  optional light-client graph. The gate treats this exact advisory and version
+  as inactive only if a locked inverse Cargo tree is empty with all workspace
+  features, platforms, and dependency kinds enabled for inspection. A failed
+  graph query or any reachable path fails the gate. Remove this check when
+  Subxt stops resolving the affected decompressor. See #1197.
+
+## Temporary Ledger 9 proving dependency exception
+
+- [RUSTSEC-2026-0387](https://rustsec.org/advisories/RUSTSEC-2026-0387.html)
+  applies to the active `crypto-bigint 0.5.5` dependency reached through the
+  pinned Midnight ZK and Compact curve dependencies. It can expose
+  secret-dependent timing. Oxid's direct custody dependencies resolve to the
+  fixed version, and the upstream selected graph still includes `0.5.5`.
+- The gate reports and accepts only that advisory and package version through
+  December 2, 2026 UTC. It denies the finding again on December 3. The
+  exception accepts residual risk while the shared Ledger 9 dependency cohort
+  is repaired. [Oxid #1197](https://github.com/betsudo/oxid/issues/1197) tracks
+  compatible upstream pins, focused cryptographic regression tests, and
+  removal of the exception.
 
 ## Yanked crate versions
 

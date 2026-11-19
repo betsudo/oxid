@@ -20,7 +20,11 @@ use midnight_transient_crypto::proofs::ProvingKeyMaterial;
 
 const EXPECTED_SCHEMA: &str = "midnight-did-zk-artifacts";
 const EXPECTED_VERSION: &str = "0.5.0";
-const EXPECTED_GIT_SHA: &str = "a14267cec3c1ab7e00bb0f058a54267d913a321b";
+// The Ledger 9 proving closure is built hermetically from the exact same
+// reviewed midnight-identity revision as the Rust adapter. The older public
+// v0.5.0 archive contains Ledger 8 verifier keys and must never be admitted by
+// this loader.
+const EXPECTED_GIT_SHA: &str = "e7e28eea94515d59b5e7360a717f5c0dee3eecdf";
 const MAX_MANIFEST_BYTES: u64 = 256 * 1024;
 const MAX_VERIFIER_KEY_BYTES: u64 = 16 * 1024 * 1024;
 const MAX_PROVER_KEY_BYTES: u64 = 16 * 1024 * 1024;
@@ -34,15 +38,6 @@ pub enum MidnightDidBootstrapCircuit {
 }
 
 impl MidnightDidBootstrapCircuit {
-    #[must_use]
-    pub const fn id(self) -> &'static str {
-        match self {
-            Self::VerificationMethod => "set_verification_method",
-            Self::SchnorrJubjubVerificationMethod => "set_schnorr_jubjub_verification_method",
-            Self::VerificationMethodRelation => "set_verification_method_relation",
-        }
-    }
-
     #[must_use]
     pub const fn artifact_id(self) -> &'static str {
         match self {
@@ -424,6 +419,22 @@ struct CircuitDigests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn artifact_ids_are_the_canonical_on_chain_entry_points() {
+        assert_eq!(
+            MidnightDidBootstrapCircuit::VerificationMethod.artifact_id(),
+            "setVerificationMethod"
+        );
+        assert_eq!(
+            MidnightDidBootstrapCircuit::SchnorrJubjubVerificationMethod.artifact_id(),
+            "setSchnorrJubjubVerificationMethod"
+        );
+        assert_eq!(
+            MidnightDidBootstrapCircuit::VerificationMethodRelation.artifact_id(),
+            "setVerificationMethodRelation"
+        );
+    }
 
     #[test]
     fn rejects_relative_roots() {

@@ -172,11 +172,11 @@ impl NativeCompactPresentationRuntime {
     fn from_authenticated_artifacts(
         [prover_key, verifier_key_bytes, ir_bytes, parameter_bytes]: [RuntimeArtifactBytes; 4],
     ) -> Result<Self, CompactPresentationRuntimeError> {
-        let ir = IrSource::load_from_tagged(Cursor::new(ir_bytes.as_slice()))
+        let ir = IrSource::load(Cursor::new(ir_bytes.as_slice()))
             .map_err(|_| CompactPresentationRuntimeError::CircuitMismatch)?;
         let model = ir.model();
         if model.k() != EXPECTED_CIRCUIT_K
-            || ir.num_inputs as usize != EXPECTED_INPUT_FIELDS
+            || ir.inputs.len() != EXPECTED_INPUT_FIELDS
             || !ir.do_communications_commitment
             || u64::try_from(model.rows()).ok() != Some(EXPECTED_CIRCUIT_ROWS)
         {

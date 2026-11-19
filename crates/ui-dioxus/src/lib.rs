@@ -106,8 +106,9 @@ use oxid_diagnostics_application::{
 };
 use oxid_identity_application::{
     CreateDidCommand, CreateDidUseCase, DeactivateDidCommand, DeactivateDidUseCase,
-    DidKeyAlgorithm, DidOperationError, DidRecordQuery, DidRecordView, DidRefreshAvailability,
-    DidUpdate, ForgetDidUseCase, ListDidRecordsQuery, ListDidRecordsUseCase,
+    DeployDidCommand, DeployDidUseCase, DidDeploymentState, DidKeyAlgorithm, DidOperationError,
+    DidRecordQuery, DidRecordView, DidRefreshAvailability, DidUpdate, ForgetDidUseCase,
+    IdentityProfileId, ListDidRecordsQuery, ListDidRecordsUseCase, MidnightNetwork,
     PUBLISH_DID_TO_TEST_ISSUER_INTENT, PublishDidCommand, PublishDidUseCase, ResolveDidCommand,
     ResolveDidUseCase, SignDidPayloadCommand, SignDidPayloadUseCase, UpdateDidCommand,
     UpdateDidUseCase,
@@ -204,18 +205,12 @@ use profile_quick_switcher::{ProfilePage, ProfileSwitcherMenu, profile_switch_is
 #[cfg(any(target_os = "ios", target_os = "android"))]
 use screen_privacy::protect_suspended_snapshot;
 use screen_privacy::route_forces_screen_privacy;
-use selected_realm_sync::{
-    AccountSyncCardState, account_sync_card_accepts_projection,
-    begin_account_sync_card_observation, dust_status_pill_class, finish_account_sync_card_action,
-    non_native_shielded_balances, poll_account_sync, reload_account_sync_card,
-    selected_realm_chain_tip, selected_realm_dust_balance, selected_realm_dust_note,
-    selected_realm_dust_state, selected_realm_is_syncing, selected_realm_lifecycle_presentation,
-    selected_realm_provenance, selected_realm_shielded_balance, selected_realm_shielded_note,
-    selected_realm_shielded_state, selected_realm_sync_progress, selected_realm_sync_state,
-};
 #[cfg(test)]
 use selected_realm_sync::{
-    dust_progress_percent, dust_sync_note, shielded_progress_percent, shielded_sync_note,
+    dust_progress_percent, dust_sync_note, non_native_shielded_balances, selected_realm_chain_tip,
+    selected_realm_dust_balance, selected_realm_dust_note, selected_realm_provenance,
+    selected_realm_sync_progress, selected_realm_sync_state, shielded_progress_percent,
+    shielded_sync_note,
 };
 use wallet_realm_lifecycle::{WalletRealmLifecycleWake, WalletRealmProjectionWake};
 
@@ -372,6 +367,7 @@ pub struct WalletUiServices {
     list_wallet_transfer_submissions: Arc<dyn ListWalletTransferSubmissionsUseCase>,
     reconcile_wallet_transfer_submission: Arc<dyn ReconcileWalletTransferSubmissionUseCase>,
     create_did: Arc<dyn CreateDidUseCase>,
+    deploy_did: Arc<dyn DeployDidUseCase>,
     resolve_did: Arc<dyn ResolveDidUseCase>,
     list_did_records: Arc<dyn ListDidRecordsUseCase>,
     publish_did: Option<Arc<dyn PublishDidUseCase>>,
@@ -477,6 +473,7 @@ impl WalletDustSettlementUiServices {
 /// DID inventory and resolution use cases consumed by the DIDs page.
 pub struct DidUiServices {
     create_did: Arc<dyn CreateDidUseCase>,
+    deploy_did: Arc<dyn DeployDidUseCase>,
     resolve_did: Arc<dyn ResolveDidUseCase>,
     list_did_records: Arc<dyn ListDidRecordsUseCase>,
     publish_did: Option<Arc<dyn PublishDidUseCase>>,
@@ -736,6 +733,7 @@ impl DidUiServices {
     #[must_use]
     pub const fn new(
         create_did: Arc<dyn CreateDidUseCase>,
+        deploy_did: Arc<dyn DeployDidUseCase>,
         resolve_did: Arc<dyn ResolveDidUseCase>,
         list_did_records: Arc<dyn ListDidRecordsUseCase>,
         update_did: Arc<dyn UpdateDidUseCase>,
@@ -745,6 +743,7 @@ impl DidUiServices {
     ) -> Self {
         Self {
             create_did,
+            deploy_did,
             resolve_did,
             list_did_records,
             publish_did: None,
@@ -1111,6 +1110,7 @@ impl WalletUiServices {
             list_wallet_transfer_submissions: transactions.list_wallet_transfer_submissions,
             reconcile_wallet_transfer_submission: transactions.reconcile_wallet_transfer_submission,
             create_did: dids.create_did,
+            deploy_did: dids.deploy_did,
             resolve_did: dids.resolve_did,
             list_did_records: dids.list_did_records,
             publish_did: dids.publish_did,
@@ -1431,6 +1431,11 @@ impl WalletUiServices {
     #[must_use]
     pub fn create_did(&self) -> Arc<dyn CreateDidUseCase> {
         Arc::clone(&self.create_did)
+    }
+
+    #[must_use]
+    pub fn deploy_did(&self) -> Arc<dyn DeployDidUseCase> {
+        Arc::clone(&self.deploy_did)
     }
 
     #[must_use]
@@ -4964,6 +4969,8 @@ fn HomePage(
     on_scan: EventHandler<MouseEvent>,
 ) -> Element {
     let services = consume_context::<WalletUiServices>();
+    let brand = consume_context::<BrandProfile>();
+    let show_vault = brand.show_vault_card();
     let mut state = use_signal(|| HomePageState::Loading);
     let profile_id = active_profile.id.clone();
     let services_for_load = services.clone();
@@ -4972,7 +4979,7 @@ fn HomePage(
         let profile_id = profile_id.clone();
         spawn(async move {
             state.set(
-                run_ui_blocking(move || load_home_page(&services, &profile_id))
+                run_ui_blocking(move || load_home_page(&services, &profile_id, show_vault))
                     .await
                     .unwrap_or(HomePageState::Failed),
             );
@@ -4988,7 +4995,11 @@ fn HomePage(
             }
             HomeQuickActions { scan_busy, on_receive, on_send, on_present, on_scan }
             section { class: "home-card-stack", aria_label: "Loading wallet products", aria_busy: "true",
-                for label in ["Wallet", "Newest document", "Passport Vault"] {
+                for label in if show_vault {
+                    vec!["Wallet", "Newest document", "Passport Vault"]
+                } else {
+                    vec!["Wallet", "Newest document"]
+                } {
                     article { class: "home-card home-card--loading", key: "{label}",
                         p { class: "card-eyebrow", "{label}" }
                         span { class: "loading-mark", aria_hidden: "true" }
@@ -5026,7 +5037,7 @@ fn HomePage(
                         state.set(HomePageState::Loading);
                         spawn(async move {
                             state.set(
-                                run_ui_blocking(move || load_home_page(&services, &profile_id))
+                                run_ui_blocking(move || load_home_page(&services, &profile_id, show_vault))
                                     .await
                                     .unwrap_or(HomePageState::Failed),
                             );
@@ -5876,6 +5887,7 @@ fn DocumentsPage(
 #[component]
 fn ActivityPage(active_profile: WalletProfileView) -> Element {
     let services = consume_context::<WalletUiServices>();
+    let brand = consume_context::<BrandProfile>();
     let mut state = use_signal(|| AccountPageState::Loading);
     let profile_id = active_profile.id.clone();
     let services_for_load = services.clone();
@@ -5895,7 +5907,7 @@ fn ActivityPage(active_profile: WalletProfileView) -> Element {
     rsx! {
         section { class: "page-heading",
             p { class: "eyebrow", "Wallet history" }
-            p { "Midnight transfers, Passport Vault operations, credential issuance, and recoverable submissions appear here." }
+            p { "Midnight transfers, credential issuance, and recoverable submissions appear here." }
         }
         match state.read().clone() {
             AccountPageState::Loading => rsx! {
@@ -5932,7 +5944,9 @@ fn ActivityPage(active_profile: WalletProfileView) -> Element {
                 rsx! { AccountActivityCard { account: *account, unavailable } }
             },
         }
-        PassportVaultActivitySection { profile_id: active_profile.id.clone() }
+        if brand.show_vault_card() {
+            PassportVaultActivitySection { profile_id: active_profile.id.clone() }
+        }
         CredentialIssuanceActivitySection { profile_id: active_profile.id.clone() }
         CredentialPresentationActivitySection { profile_id: active_profile.id.clone() }
         SubmissionRecoveryPane { profile_id: active_profile.id.clone() }
@@ -5947,10 +5961,9 @@ fn AccountActivityCard(account: WalletAccountView, unavailable: bool) -> Element
         article { class: "surface-card",
             p { class: "card-eyebrow", "Wallet activity" }
             h2 { "On-chain transfers" }
-            p { class: "activity-source-note", "Source: Midnight wallet account. Passport Vault and credential issuance activity are listed separately below." }
+            p { class: "activity-source-note", "Source: Midnight wallet account. Credential issuance activity is listed separately below." }
             div { class: "activity-filters", role: "group", aria_label: "Activity sources",
                 span { class: "status-pill", "Wallet" }
-                span { class: "status-pill", "Passport Vault" }
                 span { class: "status-pill", "Credential issuance" }
             }
             if account.transactions.is_empty() {
@@ -6144,251 +6157,6 @@ fn SubmissionRecoveryPane(profile_id: String) -> Element {
     }
 }
 
-#[component]
-fn AccountSyncCard(
-    profile_id: String,
-    secret_mode: SecretModeController,
-    can_sync: bool,
-    account_unavailable: bool,
-    on_account_updated: EventHandler<WalletAccountView>,
-) -> Element {
-    let services = consume_context::<WalletUiServices>();
-    let mut realm_lifecycle_wake = consume_context::<Signal<WalletRealmLifecycleWake>>();
-    let WalletRealmProjectionWake(realm_projection_wake) =
-        consume_context::<WalletRealmProjectionWake>();
-    let state = use_signal(|| AccountSyncCardState::Loading);
-    let load_services = services.clone();
-    let load_profile = profile_id.clone();
-    use_effect(move || {
-        let _projection_generation = realm_projection_wake();
-        begin_account_sync_card_observation(
-            load_services.clone(),
-            load_profile.clone(),
-            state,
-            on_account_updated,
-        );
-    });
-
-    match state.read().clone() {
-        AccountSyncCardState::Loading => rsx! {
-            article { class: "surface-card account-sync-card", role: "status", aria_busy: "true",
-                p { class: "card-eyebrow", "Account sync" }
-                h2 { "Loading wallet status…" }
-            }
-        },
-        AccountSyncCardState::Failed(message) => {
-            let retry_services = services.clone();
-            let retry_profile = profile_id.clone();
-            rsx! {
-                article { class: "surface-card account-sync-card", role: "alert",
-                    div { class: "wallet-sync-row__heading",
-                        div {
-                            p { class: "card-eyebrow", "Account sync" }
-                            h2 { "Status unavailable" }
-                        }
-                        span { class: "status-pill", "Error" }
-                    }
-                    p { "{message}" }
-                    button {
-                        class: "secondary-action",
-                        r#type: "button",
-                        onclick: move |_| {
-                            reload_account_sync_card(
-                                retry_services.clone(),
-                                retry_profile.clone(),
-                                state,
-                                on_account_updated,
-                            );
-                        },
-                        "Retry"
-                    }
-                }
-            }
-        }
-        AccountSyncCardState::Ready {
-            realm: projection,
-            action_busy,
-            operation_error,
-        } => {
-            let retained_projection = projection.clone();
-            let realm = &projection.view;
-            let syncing = selected_realm_is_syncing(realm);
-            let overall_state = selected_realm_sync_state(realm);
-            let lifecycle = selected_realm_lifecycle_presentation(overall_state);
-            let provenance = selected_realm_provenance(realm);
-            let chain_tip = selected_realm_chain_tip(realm);
-            let progress = selected_realm_sync_progress(realm);
-            let dust_balance = selected_realm_dust_balance(&realm.dust);
-            let dust_state = selected_realm_dust_state(&realm.dust);
-            let dust_note = selected_realm_dust_note(&realm.dust);
-            let shielded_night = selected_realm_shielded_balance(&realm.shielded);
-            let shielded_state = selected_realm_shielded_state(&realm.shielded);
-            let shielded_note = selected_realm_shielded_note(&realm.shielded);
-            let owned_notes = match &realm.shielded {
-                WalletRealmFamilyView::Ready(status) => status
-                    .owned_note_count
-                    .map_or_else(|| "—".to_owned(), |count| count.to_string()),
-                _ => "—".to_owned(),
-            };
-            let retained_realm = retained_projection.clone();
-            let action_services = services.clone();
-            let action_profile = profile_id.clone();
-            let mut action_state = state;
-            rsx! {
-                article { class: "surface-card account-sync-card",
-                    div { class: "wallet-sync-row__heading",
-                        div {
-                            p { class: "card-eyebrow", "Selected realm" }
-                            h2 { "Wallet status" }
-                        }
-                        span { class: "{dust_status_pill_class(overall_state)}", "{lifecycle.label}" }
-                    }
-                    p { class: "account-sync-card__summary", "{lifecycle.note}" }
-                    if cfg!(feature = "ui-profile-dev") {
-                    details { class: "account-sync-card__details",
-                        summary { "Synchronization details" }
-                        p { class: "account-sync-card__provenance", "{provenance}" }
-                        p { class: "account-sync-card__provenance", "{chain_tip}" }
-                        div { class: "account-sync-card__rows",
-                            div { class: "account-sync-card__row",
-                                div {
-                                    strong {
-                                        class: "privacy-value",
-                                        aria_hidden: if secret_mode.is_masked() { "true" } else { "false" },
-                                        "{dust_balance}"
-                                    }
-                                    small { "{dust_note}" }
-                                }
-                                span { class: "{dust_status_pill_class(dust_state)}", "{ui::sync_state(dust_state)}" }
-                            }
-                            div { class: "account-sync-card__row",
-                                div {
-                                    strong {
-                                        class: "privacy-value",
-                                        aria_hidden: if secret_mode.is_masked() { "true" } else { "false" },
-                                        "{shielded_night}"
-                                    }
-                                    small {
-                                        aria_hidden: if secret_mode.is_masked() { "true" } else { "false" },
-                                        "Shielded NIGHT · {owned_notes} protected notes"
-                                    }
-                                    small { "{shielded_note}" }
-                                }
-                                span { class: "{dust_status_pill_class(shielded_state)}", "{ui::sync_state(shielded_state)}" }
-                            }
-                        }
-                        if let WalletRealmFamilyView::Ready(shielded) = &realm.shielded {
-                            if non_native_shielded_balances(shielded).next().is_some() {
-                                div { class: "activity-list", aria_label: "Shielded token balances",
-                                    for balance in non_native_shielded_balances(shielded) {
-                                        div { class: "activity-row", key: "{balance.token_type_hex}",
-                                            span { class: "activity-row__mark", aria_hidden: "true", "◈" }
-                                            div {
-                                                strong {
-                                                    class: "privacy-value",
-                                                    aria_hidden: if secret_mode.is_masked() { "true" } else { "false" },
-                                                    "{ui::format_shielded_amount(&balance.token_type_hex, &balance.atomic_units)}"
-                                                }
-                                                small { title: "{balance.token_type_hex}", "Protected token" }
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                    }
-                    if let Some(percent) = progress {
-                        div { class: "wallet-sync-progress", aria_label: "Account synchronization progress",
-                            div { class: "wallet-sync-progress__bar", style: "width: {percent}%" }
-                        }
-                    }
-                    if let Some(message) = operation_error {
-                        p { class: "wallet-sync-error", role: "alert", "{message}" }
-                    }
-                    if lifecycle.retry && !syncing && can_sync && !account_unavailable {
-                    button {
-                        class: "secondary-action wallet-sync-action",
-                        r#type: "button",
-                        disabled: action_busy,
-                        onclick: move |_| {
-                            action_state.set(AccountSyncCardState::Ready {
-                                realm: retained_realm.clone(),
-                                action_busy: true,
-                                operation_error: None,
-                            });
-                            let services = action_services.clone();
-                            let profile_id = action_profile.clone();
-                            let retained = retained_realm.clone();
-                            spawn(async move {
-                                let command = SelectedWalletRealmSyncCommand {
-                                    profile_id: profile_id.clone(),
-                                };
-                                let result = run_ui_future(
-                                    wallet_realm_lifecycle::explicit_retry(
-                                        services.clone(),
-                                        command,
-                                    ),
-                                )
-                                .await;
-                                realm_lifecycle_wake.set(
-                                    realm_lifecycle_wake().realm_changed(),
-                                );
-                                match result {
-                                    Ok(Ok(updated)) => {
-                                        if !account_sync_card_accepts_projection(
-                                            &action_state.read(),
-                                            &updated,
-                                        ) {
-                                            finish_account_sync_card_action(action_state, &retained, None);
-                                            return;
-                                        }
-                                        let should_poll = updated.observation.poll_after().is_some();
-                                        if let WalletRealmFamilyView::Ready(account) = &updated.view.account {
-                                            on_account_updated.call(account.clone());
-                                        }
-                                        let poll_projection = updated.clone();
-                                        action_state.set(AccountSyncCardState::Ready {
-                                            realm: Box::new(updated),
-                                            action_busy: false,
-                                            operation_error: None,
-                                        });
-                                        if should_poll {
-                                            poll_account_sync(
-                                                services,
-                                                profile_id,
-                                                poll_projection,
-                                                action_state,
-                                                on_account_updated,
-                                            );
-                                        }
-                                    }
-                                    Ok(Err(error)) => finish_account_sync_card_action(
-                                        action_state,
-                                        &retained,
-                                        Some(error.to_string()),
-                                    ),
-                                    Err(error) => finish_account_sync_card_action(
-                                        action_state,
-                                        &retained,
-                                        Some(error.to_string()),
-                                    ),
-                                }
-                            });
-                        },
-                        if action_busy {
-                            "Retrying…"
-                        } else {
-                            "Retry"
-                        }
-                    }
-                    }
-                }
-            }
-        }
-    }
-}
-
 fn load_account_page(services: &WalletUiServices, profile_id: &str) -> AccountPageState {
     let query = WalletAccountQuery {
         profile_id: profile_id.to_owned(),
@@ -6450,7 +6218,11 @@ fn account_placeholder_recovery_required(
     }
 }
 
-fn load_home_page(services: &WalletUiServices, profile_id: &str) -> HomePageState {
+fn load_home_page(
+    services: &WalletUiServices,
+    profile_id: &str,
+    include_vault: bool,
+) -> HomePageState {
     let (account, security) = match load_account_page(services, profile_id) {
         AccountPageState::Ready {
             account, security, ..
@@ -6469,12 +6241,16 @@ fn load_home_page(services: &WalletUiServices, profile_id: &str) -> HomePageStat
             profile_id: profile_id.to_owned(),
         })
         .map_or(HomeResource::Unavailable, HomeResource::Ready);
-    let vault = services
-        .list_passport_vault_locks()
-        .execute()
-        .map_or(HomeResource::Unavailable, |vault| {
-            HomeResource::Ready(Box::new(vault))
-        });
+    let vault = if include_vault {
+        services
+            .list_passport_vault_locks()
+            .execute()
+            .map_or(HomeResource::Unavailable, |vault| {
+                HomeResource::Ready(Box::new(vault))
+            })
+    } else {
+        HomeResource::Unavailable
+    };
 
     HomePageState::Ready(Box::new(HomePageProjection {
         account,
@@ -12421,6 +12197,100 @@ mod tests {
             dust: WalletRealmFamilyView::Ready(dust),
             shielded: WalletRealmFamilyView::Ready(shielded),
         }
+    }
+
+    #[test]
+    fn wallet_status_separates_live_night_dust_balance_and_registration() {
+        use oxid_wallet_application::{
+            ChainNetworkId, SelectedWalletRealmActionReadiness, SelectedWalletRealmIdentity,
+            SelectedWalletRealmObservation, SelectedWalletRealmSpendableNightView,
+            WalletDustRegistrationSettlementIdentity, WalletDustRegistrationSettlementState,
+            WalletProfileId,
+        };
+        use selected_realm_sync::{wallet_dust_observed_amount, wallet_dust_status};
+
+        let identity = SelectedWalletRealmIdentity {
+            profile: WalletProfileId::parse("profile_wallet_status").unwrap(),
+            realm: ChainNetworkId::parse("undeployed").unwrap(),
+        };
+        let mut dust = dust_status("synced", Some(2), Some(2));
+        dust.balance_atomic_units = Some("0".to_owned());
+        let mut realm = SelectedWalletRealmProjection {
+            generation: 7,
+            revision: 2,
+            fresh: true,
+            consistent: true,
+            actionable: SelectedWalletRealmActionReadiness::Ready,
+            observation: SelectedWalletRealmObservation::Settled,
+            spendable_night: SelectedWalletRealmSpendableNightView::Zero,
+            view: selected_realm_status(
+                WalletSyncState::Synced,
+                dust.clone(),
+                shielded_status("synced", Some(2), Some(2)),
+            ),
+            identity,
+        };
+        let mut settlement = WalletDustSettlementProjection::default();
+        settlement.identity = Some(WalletDustRegistrationSettlementIdentity {
+            profile: realm.identity.profile.clone(),
+            realm: realm.identity.realm.clone(),
+            generation: realm.generation,
+        });
+
+        assert_eq!(
+            selected_realm_sync::selected_realm_account_state(&realm.view.account),
+            "synced"
+        );
+        assert_eq!(
+            wallet_dust_observed_amount(&realm.view.dust).as_deref(),
+            Some("0 DUST")
+        );
+        for (state, expected) in [
+            (
+                WalletDustRegistrationSettlementState::NotEligible,
+                "Waiting for eligible NIGHT",
+            ),
+            (
+                WalletDustRegistrationSettlementState::Submitting,
+                "Registering",
+            ),
+            (
+                WalletDustRegistrationSettlementState::Confirming,
+                "Waiting for Midnight",
+            ),
+            (
+                WalletDustRegistrationSettlementState::Degraded,
+                "Needs attention",
+            ),
+            (
+                WalletDustRegistrationSettlementState::Ready,
+                "No spendable DUST",
+            ),
+        ] {
+            settlement.state = state;
+            assert_eq!(wallet_dust_status(&realm, &settlement).0, expected);
+        }
+
+        dust.balance_atomic_units = None;
+        realm.view.dust = WalletRealmFamilyView::Ready(dust.clone());
+        assert_eq!(wallet_dust_observed_amount(&realm.view.dust), None);
+        assert_eq!(
+            wallet_dust_status(&realm, &settlement).0,
+            "Updating balance"
+        );
+        dust.balance_atomic_units = Some("1".to_owned());
+        realm.view.dust = WalletRealmFamilyView::Ready(dust);
+        assert_eq!(wallet_dust_status(&realm, &settlement).0, "Ready");
+
+        settlement.state = WalletDustRegistrationSettlementState::Degraded;
+        realm.generation += 1;
+        assert_eq!(wallet_dust_status(&realm, &settlement).0, "Ready");
+        settlement.identity.as_mut().unwrap().generation = realm.generation;
+        realm.identity.profile = WalletProfileId::parse("profile_other").unwrap();
+        assert_eq!(wallet_dust_status(&realm, &settlement).0, "Ready");
+        settlement.identity.as_mut().unwrap().profile = realm.identity.profile.clone();
+        realm.identity.realm = ChainNetworkId::parse("preprod").unwrap();
+        assert_eq!(wallet_dust_status(&realm, &settlement).0, "Ready");
     }
 
     #[test]

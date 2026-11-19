@@ -2,6 +2,114 @@
 
 use super::*;
 
+// A freshly funded local wallet can require up to ten minutes before its NIGHT
+// grant produces spendable DUST. Keep the user action admitted once and let the
+// query-only observation loop cover that maturity window with a small finality
+// margin instead of turning normal chain progress into a retry prompt.
+const DID_REALM_PREFLIGHT_ATTEMPTS: usize = 360;
+const DID_REALM_PREFLIGHT_POLL_INTERVAL: Duration = Duration::from_secs(2);
+
+fn did_realm_prerequisites_ready(realm: &SelectedWalletRealmSyncView) -> bool {
+    let account_ready = matches!(
+        &realm.account,
+        WalletRealmFamilyView::Ready(account)
+            if account.source == WalletAccountSource::Live
+                && account.sync.state == WalletSyncState::Synced
+    );
+    let dust_ready = matches!(
+        &realm.dust,
+        WalletRealmFamilyView::Ready(dust)
+            if dust.state == "synced"
+                && dust
+                    .balance_atomic_units
+                    .as_deref()
+                    .and_then(|amount| amount.parse::<u128>().ok())
+                    .is_some_and(|amount| amount > 0)
+    );
+    account_ready && dust_ready
+}
+
+fn did_realm_preflight_status(realm: &SelectedWalletRealmSyncView) -> String {
+    let account = match &realm.account {
+        WalletRealmFamilyView::Ready(account) => account.sync.state.as_str(),
+        family => family.state_name(),
+    };
+    let (dust, has_dust, dust_progress) = match &realm.dust {
+        WalletRealmFamilyView::Ready(dust) => (
+            dust.state.as_str(),
+            dust.balance_atomic_units
+                .as_deref()
+                .and_then(|amount| amount.parse::<u128>().ok())
+                .is_some_and(|amount| amount > 0),
+            match (dust.current_cursor, dust.target_cursor) {
+                (Some(current), Some(target)) => format!(" {current}/{target}"),
+                _ => String::new(),
+            },
+        ),
+        family => (family.state_name(), false, String::new()),
+    };
+    format!(
+        "Preparing the Midnight wallet automatically: account {account}; DUST {dust}{dust_progress}{}.",
+        if has_dust {
+            " with spendable balance"
+        } else {
+            ""
+        }
+    )
+}
+
+async fn await_did_realm_prerequisites(
+    services: WalletUiServices,
+    profile_id: String,
+    mut notice: Signal<Option<String>>,
+) -> Result<(), String> {
+    let command = SelectedWalletRealmSyncCommand { profile_id };
+    let mut last_error = None;
+    let mut last_status = None;
+    notice.set(Some(
+        "Preparing the Midnight wallet: synchronizing NIGHT and DUST automatically.".to_owned(),
+    ));
+    match run_ui_future(wallet_realm_lifecycle::explicit_retry(
+        services.clone(),
+        command.clone(),
+    ))
+    .await
+    {
+        Ok(Ok(projection)) if did_realm_prerequisites_ready(&projection.view) => return Ok(()),
+        Ok(Ok(projection)) => {
+            let status = did_realm_preflight_status(&projection.view);
+            notice.set(Some(status.clone()));
+            last_status = Some(status);
+        }
+        Ok(Err(error)) => last_error = Some(error),
+        Err(error) => last_error = Some(error.to_string()),
+    }
+
+    // Action preflight is a command: admit it once. Subsequent observations
+    // are queries so a finishing DUST worker can publish `synced` instead of
+    // being replaced by another newly admitted synchronization request.
+    for _attempt in 0..DID_REALM_PREFLIGHT_ATTEMPTS {
+        tokio::time::sleep(DID_REALM_PREFLIGHT_POLL_INTERVAL).await;
+        let query = services.get_selected_wallet_realm_sync();
+        let query_command = command.clone();
+        match run_ui_blocking(move || query.execute(query_command)).await {
+            Ok(Ok(projection)) if did_realm_prerequisites_ready(&projection.view) => return Ok(()),
+            Ok(Ok(projection)) => {
+                let status = did_realm_preflight_status(&projection.view);
+                notice.set(Some(status.clone()));
+                last_status = Some(status);
+                last_error = None;
+            }
+            Ok(Err(error)) => last_error = Some(error.to_string()),
+            Err(error) => last_error = Some(error.to_string()),
+        }
+    }
+    Err(last_error.or(last_status).unwrap_or_else(|| {
+        "The Midnight wallet did not finish NIGHT and DUST synchronization before the deployment deadline. Progress is retained and will resume automatically."
+            .to_owned()
+    }))
+}
+
 #[derive(Clone, PartialEq)]
 enum DidJourney {
     Inventory,
@@ -217,6 +325,14 @@ pub(super) fn DidsPage(
             let create_services = services.clone();
             let create_profile = profile_id.clone();
             let create_records = records.clone();
+            let deploy_services = services.clone();
+            let deploy_profile = profile_id.clone();
+            let deploy_records = records.clone();
+            let deployment_network = selected_network.read().clone();
+            let ledger_deployment_available = deployment_network
+                .as_deref()
+                .and_then(MidnightNetwork::parse)
+                .is_some_and(|network| network != MidnightNetwork::Offchain);
             let active_managed_did =
                 active_managed_issuance_methods(&records).map(|(did, _, _)| did);
             let issuance_did_ready = active_managed_did.is_some();
@@ -260,10 +376,137 @@ pub(super) fn DidsPage(
                         "data-testid": "identity-did-create",
                     p { class: "card-eyebrow", "Managed identity" }
                     h2 { "Create your identity" }
-                    p { class: "form-hint", "This off-chain demo identity carries its public DID document in the identifier. It is self-contained, not published to Midnight, and private keys remain in protected custody." }
+                    p { class: "form-hint", "Publish a protected DID to the selected Midnight network. The wallet submits the ordered Ledger effects, waits for finality, and verifies the finished document through live resolution before it becomes available for credentials." }
                     if creation == DidCreationState::Ready {
                         button {
-                            class: "primary-action", r#type: "button", disabled: resolving,
+                            class: "primary-action", r#type: "button",
+                            disabled: resolving || !ledger_deployment_available,
+                            aria_label: "Create Midnight DID",
+                            onclick: move |_| {
+                                {
+                                    let mut creation = did_creation.write();
+                                    if !begin_did_creation_value(&mut creation) {
+                                        return;
+                                    }
+                                }
+                                did_creation_notice.set(None);
+                                let readiness_services = deploy_services.clone();
+                                let service = deploy_services.deploy_did();
+                                let resolver = deploy_services.resolve_did();
+                                let profile_id = deploy_profile.clone();
+                                let network = deployment_network.clone();
+                                let records = deploy_records.clone();
+                                spawn(async move {
+                                    let Some(network) = network.as_deref().and_then(MidnightNetwork::parse) else {
+                                        did_creation.set(DidCreationState::Failed);
+                                        did_creation_notice.set(Some("Select a ledger-backed Midnight network before creating this DID.".to_owned()));
+                                        return;
+                                    };
+                                    if network == MidnightNetwork::Offchain {
+                                        did_creation.set(DidCreationState::Failed);
+                                        did_creation_notice.set(Some("The selected network cannot publish a ledger-backed DID.".to_owned()));
+                                        return;
+                                    }
+                                    if let Err(error) = await_did_realm_prerequisites(
+                                        readiness_services,
+                                        profile_id.clone(),
+                                        did_creation_notice,
+                                    )
+                                    .await
+                                    {
+                                        did_creation.set(DidCreationState::Failed);
+                                        did_creation_notice.set(Some(error));
+                                        return;
+                                    }
+                                    let Ok(identity_profile_id) = IdentityProfileId::parse(profile_id.clone()) else {
+                                        did_creation.set(DidCreationState::Failed);
+                                        did_creation_notice.set(Some("The active profile cannot create a ledger-backed DID.".to_owned()));
+                                        return;
+                                    };
+                                    let command = DeployDidCommand {
+                                        profile_id: identity_profile_id,
+                                        network,
+                                        account_index: 0,
+                                    };
+                                    for _attempt in 0..300 {
+                                        let service = service.clone();
+                                        let command = command.clone();
+                                        match run_ui_future(async move { service.execute(command).await }).await {
+                                            Ok(Ok(operation)) if operation.state() == DidDeploymentState::Ready => {
+                                                let Some(did) = operation.did().map(|did| did.as_str().to_owned()) else {
+                                                    did_creation.set(DidCreationState::Failed);
+                                                    did_creation_notice.set(Some("Midnight confirmed the deployment without a resolvable DID.".to_owned()));
+                                                    return;
+                                                };
+                                                let resolver = resolver.clone();
+                                                let resolve_profile = profile_id.clone();
+                                                let resolve_did = did.clone();
+                                                match run_ui_future(async move {
+                                                    resolver.execute(ResolveDidCommand {
+                                                        profile_id: resolve_profile,
+                                                        did: resolve_did,
+                                                    }).await
+                                                }).await {
+                                                    Ok(Ok(record)) => {
+                                                        let mut updated = records;
+                                                        updated.retain(|existing| existing.document.id != record.document.id);
+                                                        updated.push(record);
+                                                        updated.sort_by(|left, right| left.document.id.cmp(&right.document.id));
+                                                        state.set(DidPageState::Ready { records: updated, resolving: false, operation_error: None });
+                                                        did_creation.set(DidCreationState::Created);
+                                                        did_creation_notice.set(Some("Midnight DID published and verified.".to_owned()));
+                                                        journey.set(DidJourney::Detail(did));
+                                                    }
+                                                    Ok(Err(error)) => {
+                                                        did_creation.set(DidCreationState::Failed);
+                                                        did_creation_notice.set(Some(did_operation_message(error)));
+                                                    }
+                                                    Err(error) => {
+                                                        did_creation.set(DidCreationState::Failed);
+                                                        did_creation_notice.set(Some(error.to_string()));
+                                                    }
+                                                }
+                                                return;
+                                            }
+                                            Ok(Ok(operation)) if operation.state() == DidDeploymentState::RetryableFailure => {
+                                                let failure = operation.failure().map_or("unknown", |failure| failure.as_str());
+                                                did_creation_notice.set(Some(format!("Waiting for Midnight to converge: {failure}. Progress is retained and will resume automatically.")));
+                                            }
+                                            Ok(Ok(operation)) => {
+                                                did_creation_notice.set(Some(format!(
+                                                    "Publishing to Midnight: {} · {}.",
+                                                    operation.state().as_str(),
+                                                    operation.effect().as_str(),
+                                                )));
+                                            }
+                                            Ok(Err(error)) => {
+                                                did_creation.set(DidCreationState::Failed);
+                                                did_creation_notice.set(Some(error.to_string()));
+                                                return;
+                                            }
+                                            Err(error) => {
+                                                did_creation.set(DidCreationState::Failed);
+                                                did_creation_notice.set(Some(error.to_string()));
+                                                return;
+                                            }
+                                        }
+                                        tokio::time::sleep(Duration::from_secs(2)).await;
+                                    }
+                                    did_creation.set(DidCreationState::Failed);
+                                    did_creation_notice.set(Some("Midnight DID deployment did not finish within ten minutes. Progress was retained for a safe retry.".to_owned()));
+                                });
+                            },
+                            "Create Midnight DID"
+                        }
+                        p { class: "form-hint",
+                            if let Some(network) = selected_network.read().as_deref() {
+                                "Selected network: {network}."
+                            } else {
+                                "Waiting for the selected Midnight network."
+                            }
+                        }
+                        button {
+                            class: "secondary-action", r#type: "button", disabled: resolving,
                             onclick: move |_| {
                                 {
                                     let mut creation = did_creation.write();
@@ -1043,7 +1286,7 @@ pub(super) fn DidsPage(
 mod tests {
     use super::{
         DidRefreshControl, copy_public_did, did_inventory_accessible_label, did_inventory_preview,
-        did_method_name,
+        did_method_name, did_realm_preflight_status, did_realm_prerequisites_ready,
     };
     use dioxus::{
         dioxus_core::{AttributeValue, Mutation},
@@ -1052,6 +1295,10 @@ mod tests {
     use oxid_identity_application::DidRefreshAvailability;
     use oxid_platform_ports::{
         PublicDid, PublicReceiveAddress, PublicTextExportError, PublicTextExportPort,
+    };
+    use oxid_wallet_application::{
+        SelectedWalletRealmSyncView, WalletAccountSource, WalletAccountView, WalletDustSyncView,
+        WalletRealmFamilyView, WalletSyncState, WalletSyncStatusView,
     };
     use std::sync::Mutex;
 
@@ -1277,5 +1524,104 @@ mod tests {
             ["Network refresh is unavailable until this DID's publication state is known."]
         );
         assert!(!actionable);
+    }
+
+    fn did_realm_preflight_fixture(
+        account_source: WalletAccountSource,
+        account_state: WalletSyncState,
+        dust_state: &str,
+        dust_balance: Option<&str>,
+    ) -> SelectedWalletRealmSyncView {
+        SelectedWalletRealmSyncView {
+            account: WalletRealmFamilyView::Ready(WalletAccountView {
+                chain: "midnight".to_owned(),
+                network_id: "undeployed".to_owned(),
+                network_name: "Standalone".to_owned(),
+                network_environment: "development".to_owned(),
+                account_id: Some("account_1".to_owned()),
+                source: account_source,
+                addresses: Vec::new(),
+                balances: Vec::new(),
+                sync: WalletSyncStatusView {
+                    state: account_state,
+                    current_cursor: Some(2),
+                    target_cursor: Some(2),
+                    chain_tip_height: Some(5_255),
+                    updated_at_millis: Some(42),
+                },
+                transactions: Vec::new(),
+            }),
+            dust: WalletRealmFamilyView::Ready(WalletDustSyncView {
+                network_id: "undeployed".to_owned(),
+                state: dust_state.to_owned(),
+                current_cursor: Some(2),
+                target_cursor: Some(2),
+                events_processed: 2,
+                balance_atomic_units: dust_balance.map(str::to_owned),
+                updated_at_millis: Some(42),
+                failure: None,
+            }),
+            shielded: WalletRealmFamilyView::Unsupported,
+        }
+    }
+
+    #[test]
+    fn ledger_did_preflight_requires_live_account_and_spendable_dust() {
+        assert!(did_realm_prerequisites_ready(&did_realm_preflight_fixture(
+            WalletAccountSource::Live,
+            WalletSyncState::Synced,
+            "synced",
+            Some("1"),
+        )));
+        assert!(!did_realm_prerequisites_ready(
+            &did_realm_preflight_fixture(
+                WalletAccountSource::Cached,
+                WalletSyncState::Synced,
+                "synced",
+                Some("1"),
+            )
+        ));
+        assert!(!did_realm_prerequisites_ready(
+            &did_realm_preflight_fixture(
+                WalletAccountSource::Live,
+                WalletSyncState::Syncing,
+                "synced",
+                Some("1"),
+            )
+        ));
+        assert!(!did_realm_prerequisites_ready(
+            &did_realm_preflight_fixture(
+                WalletAccountSource::Live,
+                WalletSyncState::Synced,
+                "syncing",
+                Some("1"),
+            )
+        ));
+        assert!(!did_realm_prerequisites_ready(
+            &did_realm_preflight_fixture(
+                WalletAccountSource::Live,
+                WalletSyncState::Synced,
+                "synced",
+                Some("0"),
+            )
+        ));
+        assert_eq!(
+            did_realm_preflight_status(&did_realm_preflight_fixture(
+                WalletAccountSource::Live,
+                WalletSyncState::Synced,
+                "synced",
+                Some("1"),
+            )),
+            "Preparing the Midnight wallet automatically: account synced; DUST synced 2/2 with spendable balance."
+        );
+        assert_eq!(
+            did_realm_preflight_status(&did_realm_preflight_fixture(
+                WalletAccountSource::Live,
+                WalletSyncState::Syncing,
+                "never_synced",
+                None,
+            )),
+            "Preparing the Midnight wallet automatically: account syncing; DUST never_synced 2/2."
+        );
     }
 }

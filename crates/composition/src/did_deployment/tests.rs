@@ -36,6 +36,26 @@ use zeroize::Zeroizing;
 
 use super::*;
 
+#[test]
+fn funding_failures_preserve_actionable_safe_categories() {
+    assert_eq!(
+        map_transaction_failure(WalletTransactionPortError::InsufficientFunds),
+        DidDeploymentFailure::InsufficientNight
+    );
+    assert_eq!(
+        map_transaction_failure(WalletTransactionPortError::InvalidChainState),
+        DidDeploymentFailure::ChainStateUnavailable
+    );
+    assert_eq!(
+        map_transaction_failure(WalletTransactionPortError::UnsupportedNetwork),
+        DidDeploymentFailure::UnsupportedNetwork
+    );
+    assert_eq!(
+        map_transaction_failure(WalletTransactionPortError::InvalidData),
+        DidDeploymentFailure::InvalidFundingPlan
+    );
+}
+
 struct FixedClock;
 
 impl ClockPort for FixedClock {
@@ -117,6 +137,9 @@ impl DidDeploymentContextSource for ReadyContextSource {
             Ok(MidnightDidCallContext {
                 contract_state: vec![1],
                 contract_address: [2; 32],
+                observation_transaction_hash: [7; 32],
+                observation_block_hash: [8; 32],
+                observation_block_height: 1,
                 zswap_chain_state: Some(vec![3]),
                 ledger_parameters: Some(vec![4]),
                 network_id: "undeployed".to_owned(),
@@ -400,6 +423,17 @@ impl DidResolutionPort for LiveResolver {
     }
 }
 
+struct MismatchedSubjectResolver;
+
+impl DidResolutionPort for MismatchedSubjectResolver {
+    fn resolve<'a>(&'a self, _: &'a MidnightDid) -> DidResolutionPortFuture<'a> {
+        let other = MidnightDid::parse(format!("did:midnight:undeployed:{}", "f".repeat(64)))
+            .expect("different DID");
+        let resolution = live_resolution(other, true);
+        Box::pin(async move { resolution })
+    }
+}
+
 fn live_resolution(
     did: MidnightDid,
     complete: bool,
@@ -610,19 +644,41 @@ fn indexed_receipt_barrier_prevents_the_next_transaction_from_being_composed() {
 }
 
 #[test]
-fn incomplete_live_resolution_pauses_without_exposing_the_did_as_ready() {
+fn incomplete_live_resolution_waits_without_resubmitting_or_exposing_ready() {
     let submissions = Arc::new(IncludedSubmission {
         submissions: AtomicUsize::new(0),
     });
     let operations = Arc::new(MemoryOperations::default());
     let service = service(
         Arc::new(LiveResolver { complete: false }),
-        submissions,
+        Arc::clone(&submissions),
         operations,
     );
 
     let operation =
         futures::executor::block_on(service.execute(command())).expect("durable failure snapshot");
+
+    assert_eq!(operation.state(), DidDeploymentState::Resolving);
+    assert_eq!(operation.failure(), None);
+    assert_eq!(operation.resume_from(), None);
+    assert_eq!(operation.receipts().len(), 8);
+    assert_eq!(submissions.submissions.load(Ordering::SeqCst), 8);
+}
+
+#[test]
+fn different_live_subject_still_pauses_as_a_resolution_mismatch() {
+    let submissions = Arc::new(IncludedSubmission {
+        submissions: AtomicUsize::new(0),
+    });
+    let operations = Arc::new(MemoryOperations::default());
+    let service = service(
+        Arc::new(MismatchedSubjectResolver),
+        Arc::clone(&submissions),
+        operations,
+    );
+
+    let operation =
+        futures::executor::block_on(service.execute(command())).expect("durable mismatch");
 
     assert_eq!(operation.state(), DidDeploymentState::RetryableFailure);
     assert_eq!(
@@ -630,6 +686,7 @@ fn incomplete_live_resolution_pauses_without_exposing_the_did_as_ready() {
         Some(DidDeploymentFailure::ResolutionMismatch)
     );
     assert_eq!(operation.resume_from(), Some(DidDeploymentState::Resolving));
+    assert_eq!(submissions.submissions.load(Ordering::SeqCst), 8);
 }
 
 #[test]
@@ -657,4 +714,79 @@ fn outcome_unknown_reconciles_without_a_second_submission() {
     assert_eq!(reconciled.state(), DidDeploymentState::Ready);
     assert_eq!(reconciled.operation_id(), unknown.operation_id());
     assert_eq!(submissions.submissions.load(Ordering::SeqCst), 8);
+}
+
+#[test]
+fn restored_submitting_operation_reconciles_before_continuing() {
+    let submissions = Arc::new(IncludedSubmission {
+        submissions: AtomicUsize::new(0),
+    });
+    let operations = Arc::new(MemoryOperations::default());
+    let deploy = command();
+    let operation = DidDeploymentOperation::new(
+        DidDeploymentOperationId::parse("deployment-restored-submitting").expect("operation id"),
+        deploy.profile_id.clone(),
+        deploy.network,
+        UnixTimestampMillis::new(10_000),
+    )
+    .expect("operation");
+    let did =
+        MidnightDid::parse(format!("did:midnight:undeployed:{}", "a".repeat(64))).expect("DID");
+    let submission_id = effect_submission_id(&operation);
+    let operation = operation
+        .composed(did, submission_id, UnixTimestampMillis::new(10_000))
+        .expect("composed")
+        .transition(
+            DidDeploymentState::Proving,
+            UnixTimestampMillis::new(10_000),
+        )
+        .expect("proving")
+        .transition(
+            DidDeploymentState::Submitting,
+            UnixTimestampMillis::new(10_000),
+        )
+        .expect("submitting");
+    operations
+        .upsert(operation)
+        .expect("persist interrupted state");
+    let service = NativeDidDeploymentService::with_effects(
+        Arc::new(AllEffectsComposer),
+        Arc::new(PassthroughFunding),
+        Arc::clone(&submissions) as Arc<dyn MidnightContractCallSubmissionPort>,
+        Arc::new(LiveResolver { complete: true }),
+        operations,
+        Arc::new(FixedClock),
+        Arc::new(FixedRandom),
+    );
+
+    let recovered = futures::executor::block_on(service.execute(deploy))
+        .expect("reconciled deployment completes");
+
+    assert_eq!(recovered.state(), DidDeploymentState::Ready);
+    assert_eq!(submissions.submissions.load(Ordering::SeqCst), 7);
+}
+
+#[test]
+fn operation_model_failures_are_not_misreported_as_storage_outages() {
+    for error in [
+        DidDeploymentOperationError::Integrity,
+        DidDeploymentOperationError::InvalidData,
+        DidDeploymentOperationError::InvalidTransition,
+    ] {
+        assert!(matches!(
+            NativeDidDeploymentError::from(error),
+            NativeDidDeploymentError::Integrity
+        ));
+    }
+    for error in [
+        DidDeploymentOperationError::Unavailable,
+        DidDeploymentOperationError::NotFound,
+        DidDeploymentOperationError::Conflict,
+        DidDeploymentOperationError::CapacityExceeded,
+    ] {
+        assert!(matches!(
+            NativeDidDeploymentError::from(error),
+            NativeDidDeploymentError::Operation
+        ));
+    }
 }

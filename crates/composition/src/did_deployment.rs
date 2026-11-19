@@ -251,6 +251,9 @@ impl DidDeploymentContextSource for NodeAnchoredDidDeploymentContextSource {
             Ok(MidnightDidCallContext {
                 contract_state: snapshot.serialized_contract_state,
                 contract_address: did_contract_address(did)?,
+                observation_transaction_hash: decode_hex_32(&snapshot.transaction_hash_hex)?,
+                observation_block_hash: decode_hex_32(&snapshot.action_block_hash_hex)?,
+                observation_block_height: snapshot.action_block_height,
                 zswap_chain_state: Some(chain.zswap_chain_state().to_vec()),
                 ledger_parameters: Some(chain.ledger_parameters().to_vec()),
                 network_id: wallet.network_id().as_str().to_owned(),
@@ -378,7 +381,7 @@ impl DidDeploymentEffectComposer for NativeDidDeploymentEffects {
                 operation.network().as_str(),
                 account_index,
                 address,
-                circuit.id(),
+                circuit.artifact_id(),
                 artifacts
                     .verifier_key(circuit)
                     .map_err(|_| NativeDidDeploymentError::Unavailable)?,
@@ -482,6 +485,22 @@ impl NativeDidDeploymentService {
                     }
                     continue;
                 }
+                DidDeploymentState::Submitting | DidDeploymentState::Confirming => {
+                    // These states can be restored after the process is suspended or
+                    // terminated while a submission is in flight. Re-funding and
+                    // broadcasting here could duplicate the contract effect, so the
+                    // durable submission receipt must be reconciled first.
+                    operation = self.reconcile(operation)?;
+                    if matches!(
+                        operation.state(),
+                        DidDeploymentState::Submitting
+                            | DidDeploymentState::Confirming
+                            | DidDeploymentState::OutcomeUnknown
+                    ) {
+                        return Ok(operation);
+                    }
+                    continue;
+                }
                 DidDeploymentState::RetryableFailure => {
                     let resume = operation
                         .resume_from()
@@ -492,9 +511,7 @@ impl NativeDidDeploymentService {
                 }
                 DidDeploymentState::Composing
                 | DidDeploymentState::Funding
-                | DidDeploymentState::Proving
-                | DidDeploymentState::Submitting
-                | DidDeploymentState::Confirming => {}
+                | DidDeploymentState::Proving => {}
             }
 
             let plan = match self.effects.compose(&operation, account_index).await {
@@ -629,10 +646,14 @@ impl NativeDidDeploymentService {
                 self.operations.upsert(included.clone())?;
                 Ok(included)
             }
+            MidnightContractCallSubmissionState::OutcomeUnknown => {
+                let unknown = operation.outcome_unknown(self.now()?)?;
+                self.operations.upsert(unknown.clone())?;
+                Ok(unknown)
+            }
             MidnightContractCallSubmissionState::Running
             | MidnightContractCallSubmissionState::CancellationRequested
-            | MidnightContractCallSubmissionState::Broadcasting
-            | MidnightContractCallSubmissionState::OutcomeUnknown => Ok(operation),
+            | MidnightContractCallSubmissionState::Broadcasting => Ok(operation),
             MidnightContractCallSubmissionState::Rejected
             | MidnightContractCallSubmissionState::Expired => {
                 self.pause(operation, DidDeploymentFailure::SubmissionRejected)
@@ -651,15 +672,20 @@ impl NativeDidDeploymentService {
         let resolution = match self.resolver.resolve(&did).await {
             Ok(resolution) => resolution,
             Err(DidResolutionPortError::Unavailable | DidResolutionPortError::NotFound) => {
-                return self.pause(operation, DidDeploymentFailure::ResolutionUnavailable);
+                return Ok(operation);
             }
             Err(_) => return Err(NativeDidDeploymentError::Resolution),
         };
-        if resolution.source() != DidResolutionSource::Live
-            || resolution.document().id() != &did
-            || !required_holder_methods_resolve(&resolution)
-        {
+        if resolution.source() != DidResolutionSource::Live || resolution.document().id() != &did {
             return self.pause(operation, DidDeploymentFailure::ResolutionMismatch);
+        }
+        // The resolver may observe each included maintenance transaction at a
+        // different indexed height. A live document that still lacks one of
+        // the required holder methods is therefore an incomplete projection,
+        // not evidence of corruption. Keep the durable operation in Resolving
+        // so the caller can query again without resubmitting any transaction.
+        if !required_holder_methods_resolve(&resolution) {
+            return Ok(operation);
         }
         let ready = operation.transition(DidDeploymentState::Ready, self.now()?)?;
         self.operations.upsert(ready.clone())?;
@@ -735,6 +761,13 @@ fn did_contract_address(did: &MidnightDid) -> Result<[u8; 32], NativeDidDeployme
         .ok_or(NativeDidDeploymentError::Integrity)?;
     let decoded = hex::decode(encoded).map_err(|_| NativeDidDeploymentError::Integrity)?;
     decoded
+        .try_into()
+        .map_err(|_| NativeDidDeploymentError::Integrity)
+}
+
+fn decode_hex_32(value: &str) -> Result<[u8; 32], NativeDidDeploymentError> {
+    let bytes = hex::decode(value).map_err(|_| NativeDidDeploymentError::Integrity)?;
+    bytes
         .try_into()
         .map_err(|_| NativeDidDeploymentError::Integrity)
 }
@@ -832,6 +865,14 @@ fn map_transaction_failure(error: WalletTransactionPortError) -> DidDeploymentFa
             DidDeploymentFailure::ProtectionLocked
         }
         WalletTransactionPortError::InsufficientDust => DidDeploymentFailure::InsufficientDust,
+        WalletTransactionPortError::InsufficientFunds => DidDeploymentFailure::InsufficientNight,
+        WalletTransactionPortError::InvalidChainState => {
+            DidDeploymentFailure::ChainStateUnavailable
+        }
+        WalletTransactionPortError::UnsupportedNetwork => DidDeploymentFailure::UnsupportedNetwork,
+        WalletTransactionPortError::InvalidData | WalletTransactionPortError::DraftConflict => {
+            DidDeploymentFailure::InvalidFundingPlan
+        }
         WalletTransactionPortError::ProvingFailed => DidDeploymentFailure::ProvingUnavailable,
         WalletTransactionPortError::SubmissionRejected
         | WalletTransactionPortError::DraftExpired => DidDeploymentFailure::SubmissionRejected,
@@ -874,8 +915,16 @@ impl fmt::Display for NativeDidDeploymentError {
 impl Error for NativeDidDeploymentError {}
 
 impl From<DidDeploymentOperationError> for NativeDidDeploymentError {
-    fn from(_: DidDeploymentOperationError) -> Self {
-        Self::Operation
+    fn from(error: DidDeploymentOperationError) -> Self {
+        match error {
+            DidDeploymentOperationError::Integrity
+            | DidDeploymentOperationError::InvalidData
+            | DidDeploymentOperationError::InvalidTransition => Self::Integrity,
+            DidDeploymentOperationError::Unavailable
+            | DidDeploymentOperationError::NotFound
+            | DidDeploymentOperationError::Conflict
+            | DidDeploymentOperationError::CapacityExceeded => Self::Operation,
+        }
     }
 }
 

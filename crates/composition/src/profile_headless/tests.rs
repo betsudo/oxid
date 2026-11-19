@@ -14,9 +14,11 @@ fn ordinary_standalone_composition_keeps_os_random_profile_custody() {
     use oxid_platform_ports::{PlatformError, RandomPort};
     use oxid_wallet_application::WalletProfileId;
     use oxid_wallet_application::{
-        CreateWalletProfileCommand, WalletDerivedSecretUsePort, WalletHdPath,
-        WalletHdPathComponent, WalletProfileSecurityCommand,
+        ChainNetworkId, CreateWalletProfileCommand, WalletAccountAssociation,
+        WalletDerivedSecretUsePort, WalletHdPath, WalletHdPathComponent, WalletProfileAssociations,
+        WalletProfileSecurityCommand, WalletSecurityError,
     };
+    use oxid_wallet_domain::WalletProtectionState;
 
     struct FixedRandom(Mutex<u8>);
 
@@ -71,7 +73,7 @@ fn ordinary_standalone_composition_keeps_os_random_profile_custody() {
         config,
         clock,
         Arc::clone(&security),
-        profiles,
+        profiles.clone(),
         |security| security,
     );
     let profile = application
@@ -100,6 +102,41 @@ fn ordinary_standalone_composition_keeps_os_random_profile_custody() {
         first_child(security.as_ref(), &profile_id),
         first_child(&expected, &profile_id)
     );
+
+    let legacy = application
+        .create_wallet_profile()
+        .execute(CreateWalletProfileCommand {
+            display_name: "Legacy funded wallet".to_owned(),
+        })
+        .expect("create legacy profile fixture");
+    let legacy_id = WalletProfileId::parse(legacy.id.clone()).unwrap();
+    let network = ChainNetworkId::parse("undeployed").unwrap();
+    let saved = WalletProfileAssociations::new(
+        network.clone(),
+        vec![WalletAccountAssociation::new(network, 0, 0).unwrap()],
+    )
+    .unwrap();
+    profiles
+        .save_associations(&legacy_id, saved.clone())
+        .unwrap();
+    let command = WalletProfileSecurityCommand {
+        profile_id: legacy.id,
+    };
+    assert_eq!(
+        application
+            .initialize_wallet_security()
+            .execute(command.clone()),
+        Err(WalletSecurityError::RecoveryRequired)
+    );
+    assert_eq!(
+        application
+            .get_wallet_security_status()
+            .execute(command)
+            .unwrap()
+            .state,
+        WalletProtectionState::Uninitialized
+    );
+    assert_eq!(profiles.load_associations(&legacy_id).unwrap(), Some(saved));
 }
 
 #[cfg(not(target_arch = "wasm32"))]

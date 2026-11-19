@@ -24,7 +24,8 @@ Current reviews and source policies:
 - [url 2.5](url-2.5.md)
 - [Tokio and tokio-tungstenite](tokio-tungstenite-0.30.md)
 - [Midnight Git sources](midnight-git-sources.md)
-- [Midnight ledger transaction packages](midnight-ledger-8.2.md)
+- [Midnight Ledger 9 transaction and SSI cohort](midnight-ledger-9.1.md)
+- [Midnight Ledger 8 transaction packages](midnight-ledger-8.2.md) — historical milestone 0.2.0 record
 - [Midnight standalone submission stack](midnight-standalone-submission.md)
 - [Midnight local proving](midnight-local-proving.md)
 - [Midnight Compact Digital Passport presentation](midnight-compact-presentation.md)

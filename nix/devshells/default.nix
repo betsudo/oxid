@@ -5,6 +5,24 @@
     { pkgs, self', ... }:
     let
       midnightDidPackages = inputs.midnight-did-toolchain.packages.${pkgs.stdenv.hostPlatform.system};
+      fenix = inputs.fenix.packages.${pkgs.stdenv.hostPlatform.system};
+      rustToolchainSpec = {
+        channel = "1.99.0";
+        sha256 = "sha256-zm3dyIY2T414ZRR3EhLOvptzG6gta4WZUcawzMUWtqI=";
+      };
+      rustToolchain = fenix.toolchainOf rustToolchainSpec;
+      rustComponentNames = [
+        "cargo"
+        "clippy"
+        "rust-src"
+        "rustc"
+        "rustfmt"
+      ];
+      rustComponents = rustToolchain.withComponents rustComponentNames;
+      wasmToolchain = fenix.targets.wasm32-unknown-unknown.toolchainOf rustToolchainSpec;
+      uiRustComponents = fenix.combine (
+        (map (name: rustToolchain.${name}) rustComponentNames) ++ [ wasmToolchain.rust-std ]
+      );
       linuxLibraries = pkgs.lib.optionals pkgs.stdenv.hostPlatform.isLinux [
         pkgs.glib
         pkgs.gtk3
@@ -12,25 +30,27 @@
         pkgs.webkitgtk_4_1
         pkgs.xdotool
       ];
-      ciRustPackages = with pkgs; [
-        cargo
-        clippy
+      ciToolPackages = with pkgs; [
         git
         nodejs_24
         pkg-config
         ripgrep
-        rustc
-        rustfmt
         sccache
       ];
+      ciRustPackages = ciToolPackages ++ [ rustComponents ];
       ciQualityPackages =
         ciRustPackages
         ++ (with pkgs; [
           cargo-audit
           cargo-deny
         ]);
+      rustLlvmBin = "${rustToolchain.llvm-tools-preview}/lib/rustlib/${pkgs.stdenv.hostPlatform.rust.rustcTarget}/bin";
+      coverageShellHook = ''
+        export LLVM_COV=${rustLlvmBin}/llvm-cov
+        export LLVM_PROFDATA=${rustLlvmBin}/llvm-profdata
+      '';
       ciRustShellHook = ''
-        export RUST_SRC_PATH=${pkgs.rustPlatform.rustLibSrc}
+        export RUST_SRC_PATH=${rustToolchain.rust-src}/lib/rustlib/src/rust/library
         export RUSTC_WRAPPER=${pkgs.sccache}/bin/sccache
         # rustc incremental artifacts are target-directory state and cannot be
         # reused by sccache. CI prefers cross-run object reuse; the interactive
@@ -65,7 +85,7 @@
       };
 
       devShells.ci-ui = pkgs.mkShell {
-        packages = ciRustPackages;
+        packages = ciToolPackages ++ [ uiRustComponents ];
         buildInputs = [ pkgs.openssl ] ++ linuxLibraries;
         shellHook = ''
           ${ciRustShellHook}
@@ -78,17 +98,15 @@
       devShells.ci-coverage = pkgs.mkShell {
         packages = ciRustPackages ++ [
           pkgs.cargo-llvm-cov
-          pkgs.llvmPackages.llvm
         ];
         buildInputs = [ pkgs.openssl ];
         shellHook = ''
           ${ciRustShellHook}
-          export LLVM_COV=${pkgs.llvmPackages.llvm}/bin/llvm-cov
-          export LLVM_PROFDATA=${pkgs.llvmPackages.llvm}/bin/llvm-profdata
+          ${coverageShellHook}
           # Coverage must exercise the same pinned native DID paths as the
           # developer shell. Without these inputs the artifact-backed tests
           # return early while still reporting success.
-          export OXID_MIDNIGHT_DID_ARTIFACTS_DIR=${self'.packages.midnight-did-compact-artifacts}
+          export OXID_MIDNIGHT_DID_ARTIFACTS_DIR=${self'.packages.midnight-did-ledger9-zkir}
         '';
       };
 
@@ -111,13 +129,11 @@
         packages =
           with pkgs;
           [
-            cargo
             cargo-audit
             cargo-deny
             cargo-edit
             cargo-llvm-cov
             cargo-nextest
-            clippy
             dioxus-cli
             git
             gh
@@ -137,8 +153,7 @@
             (python3.withPackages (pythonPackages: [ pythonPackages.pillow ]))
             ripgrep
             rust-analyzer
-            rustc
-            rustfmt
+            rustComponents
             sccache
           ]
           ++ pkgs.lib.optionals pkgs.stdenv.hostPlatform.isDarwin [
@@ -149,16 +164,13 @@
         buildInputs = linuxLibraries;
 
         shellHook = ''
-          export RUST_SRC_PATH=${pkgs.rustPlatform.rustLibSrc}
-          export LLVM_COV=${pkgs.llvmPackages.llvm}/bin/llvm-cov
-          export LLVM_PROFDATA=${pkgs.llvmPackages.llvm}/bin/llvm-profdata
+          export RUST_SRC_PATH=${rustToolchain.rust-src}/lib/rustlib/src/rust/library
+          ${coverageShellHook}
           export JAVA_HOME=${pkgs.jdk17.home}
           export PATH="$JAVA_HOME/bin:$PATH"
           export COMPACT_DIRECTORY=${midnightDidPackages.compact-toolchain}
-          export OXID_MIDNIGHT_DID_ARTIFACTS_DIR=${self'.packages.midnight-did-compact-artifacts}
+          export OXID_MIDNIGHT_DID_ARTIFACTS_DIR=${self'.packages.midnight-did-ledger9-zkir}
           export OXID_PRESENTATION_ARTIFACTS_DIR=${self'.packages.presentation-compact-artifacts}
-          export OXID_PASSPORT_VAULT_ARTIFACTS_DIR=${self'.packages.passport-vault-compact-artifacts}
-          export OXID_PASSPORT_VAULT_COMPOSER=${self'.packages.passport-vault-call-composer}/bin/oxid-passport-vault-call-composer
           # Keep only runtime state in the Git common directory. PI_CODING_AGENT_DIR
           # remains user-scoped because it owns authentication and user policy;
           # sessions and pi-subagents lifecycle state are checkout-scoped instead.

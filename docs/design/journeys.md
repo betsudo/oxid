@@ -84,17 +84,18 @@ ambiguity handling. The wizard is a *view* over the same states.
 
 ## 4. Sync (DUST / shielded) — from foreground chore to background state
 
-**Today:** two symmetric panes with cursor numbers and Sync/Resync/Cancel
-buttons, gated on unlock (lib.rs:2798-3231).
+**Wallet status** shows NIGHT synchronization and DUST settlement in separate
+rows. NIGHT can be **Up to date** while DUST is still **Waiting for eligible
+NIGHT**, **Registering**, **Waiting for Midnight**, or **Updating balance**.
+**Ready** requires a positive synced DUST balance. A synced zero displays
+**0 DUST**, and an unknown amount displays **Balance unavailable**. Session
+privacy masks the amounts and leaves the status labels readable.
 
-**Delivered core (ADR-0090 / issue #82):** sync is one account card with a
-single **Sync now** action over public account refresh plus the independently
-authoritative DUST and shielded sessions. While either session runs, the action
-becomes **Cancel sync**. Combined progress and human states replace cursor and
-event-count prose; cached/cancelled/stalled remain non-authoritative. Native
-background scheduling, pull-to-refresh, relative-freshness copy, and the Send
-amount-step treatment remain follow-up work because no reviewed platform event
-or freshness projection exists yet.
+The selected profile, realm, and generation determine which settlement
+observation is shown. The wallet automatically refreshes while it is active.
+The development realm registers eligible NIGHT automatically. If automatic
+recovery stops, the wallet can offer one contextual retry. Detailed DUST and
+shielded synchronization diagnostics are available in the developer profile.
 
 ## 5. Add a document (credential issuance)
 

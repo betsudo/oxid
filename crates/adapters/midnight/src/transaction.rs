@@ -16,15 +16,16 @@ use std::{
 use bech32::{Bech32m, primitives::decode::CheckedHrpstring};
 use midnight_base_crypto::{
     hash::HashOutput,
-    schnorr::{Signature, VerifyingKey},
+    schnorr::{Signature as SchnorrSignature, VerifyingKey},
     time::Timestamp,
 };
 use midnight_coin_structure::coin::{NIGHT, TokenType, UserAddress};
 use midnight_ledger::{
     dust::{DustPublicKey, DustSecretKey},
     structure::{
-        INITIAL_PARAMETERS, Intent, IntentHash, LedgerParameters, ProofPreimageMarker,
-        StandardTransaction, Transaction, UnshieldedOffer, UtxoOutput, UtxoSpend,
+        INITIAL_PARAMETERS, Intent, IntentHash, LedgerParameters, ProofPreimageMarker, Signature,
+        SignatureVerifyingKey, StandardTransaction, Transaction, UnshieldedOffer, UtxoOutput,
+        UtxoSpend,
     },
 };
 use midnight_serialize::Deserializable;
@@ -1591,7 +1592,7 @@ where
     }
     let signature = decode_signature(&signature)?;
     let verifying_key = decode_verifying_key(account)?;
-    if !verifying_key.verify(&signing_payload, &signature) {
+    if !verify_signature(&verifying_key, &signing_payload, &signature) {
         return Err(WalletTransactionPortError::InvalidData);
     }
     let offer = if guaranteed {
@@ -1985,7 +1986,11 @@ where
         }
         let ledger_signature = decode_signature(&signature)?;
         let verifying_key = decode_verifying_key(&retained.account)?;
-        if !verifying_key.verify(retained.signing_payload.as_slice(), &ledger_signature) {
+        if !verify_signature(
+            &verifying_key,
+            retained.signing_payload.as_slice(),
+            &ledger_signature,
+        ) {
             return Err(WalletTransactionPortError::InvalidData);
         }
 
@@ -2684,12 +2689,13 @@ fn select_utxos(
 
 pub(crate) fn decode_verifying_key(
     account: &DerivedChainAccount,
-) -> Result<VerifyingKey, WalletTransactionPortError> {
+) -> Result<SignatureVerifyingKey, WalletTransactionPortError> {
     validate_account(account, account.network_id())?;
     VerifyingKey::deserialize(
         &mut Cursor::new(account.transaction_public_key().bytes()),
         0,
     )
+    .map(SignatureVerifyingKey::Schnorr)
     .map_err(|_| WalletTransactionPortError::InvalidData)
 }
 
@@ -2699,8 +2705,21 @@ pub(crate) fn decode_signature(
     if signature.bytes().len() != 64 {
         return Err(WalletTransactionPortError::InvalidData);
     }
-    Signature::deserialize(&mut Cursor::new(signature.bytes()), 0)
+    SchnorrSignature::deserialize(&mut Cursor::new(signature.bytes()), 0)
+        .map(Signature::Schnorr)
         .map_err(|_| WalletTransactionPortError::InvalidData)
+}
+
+pub(crate) fn verify_signature(
+    key: &SignatureVerifyingKey,
+    message: &[u8],
+    signature: &Signature,
+) -> bool {
+    matches!(
+        (key, signature),
+        (SignatureVerifyingKey::Schnorr(key), Signature::Schnorr(signature))
+            if key.verify(message, signature)
+    )
 }
 
 fn decode_recipient(

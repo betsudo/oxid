@@ -42,6 +42,7 @@ use sha2::{Digest, Sha256};
 pub struct StandaloneDidLifecycle {
     keys: Arc<dyn WalletKeyOperationPort>,
     jubjub_challenge_signing: Option<Arc<dyn WalletJubjubChallengeSigningPort>>,
+    ledger9_jubjub_jwk: bool,
     managed: Mutex<ManagedDids>,
     next_label: AtomicU64,
 }
@@ -65,6 +66,7 @@ impl StandaloneDidLifecycle {
         Self {
             keys,
             jubjub_challenge_signing: None,
+            ledger9_jubjub_jwk: false,
             managed: Mutex::new(BTreeMap::new()),
             next_label: AtomicU64::new(1),
         }
@@ -80,9 +82,17 @@ impl StandaloneDidLifecycle {
         Self {
             keys,
             jubjub_challenge_signing: Some(jubjub_challenge_signing),
+            ledger9_jubjub_jwk: false,
             managed: Mutex::new(BTreeMap::new()),
             next_label: AtomicU64::new(1),
         }
+    }
+
+    /// Use the canonical Jubjub wire format for the authenticated Ledger 9 profile.
+    #[must_use]
+    pub fn with_ledger9_jubjub_jwk(mut self) -> Self {
+        self.ledger9_jubjub_jwk = true;
+        self
     }
 
     fn managed(&self) -> Result<MutexGuard<'_, ManagedDids>, DidLifecyclePortError> {
@@ -148,7 +158,8 @@ impl StandaloneDidLifecycle {
             let matches = descriptors
                 .iter()
                 .filter(|descriptor| {
-                    public_jwk(descriptor).is_ok_and(|jwk| &jwk == method.public_key_jwk())
+                    public_jwk(descriptor, self.ledger9_jubjub_jwk)
+                        .is_ok_and(|jwk| &jwk == method.public_key_jwk())
                 })
                 .collect::<Vec<_>>();
             if matches.len() > 1 {
@@ -300,7 +311,7 @@ impl DidLifecyclePort for StandaloneDidLifecycle {
                 vec![
                     OffchainVerificationMethod::new(
                         "#auth-1",
-                        public_jwk(&authentication)?,
+                        public_jwk(&authentication, self.ledger9_jubjub_jwk)?,
                         [
                             VerificationRelationship::Authentication,
                             VerificationRelationship::CapabilityInvocation,
@@ -308,12 +319,12 @@ impl DidLifecyclePort for StandaloneDidLifecycle {
                     ),
                     OffchainVerificationMethod::new(
                         "#assertion-1",
-                        public_jwk(&assertion)?,
+                        public_jwk(&assertion, self.ledger9_jubjub_jwk)?,
                         [VerificationRelationship::AssertionMethod],
                     ),
                     OffchainVerificationMethod::new(
                         "#holder-jubjub-1",
-                        public_jwk(&presentation)?,
+                        public_jwk(&presentation, self.ledger9_jubjub_jwk)?,
                         [VerificationRelationship::AssertionMethod],
                     ),
                 ]
@@ -329,9 +340,11 @@ impl DidLifecyclePort for StandaloneDidLifecycle {
                 .map_err(|_| DidLifecyclePortError::InvalidOperation)?
         } else {
             let did = did_from_public_keys(profile_id, &authentication, &assertion)?;
-            let authentication_method = verification_method(&did, "auth-1", &authentication)?;
-            let assertion_method = verification_method(&did, "assertion-1", &assertion)?;
-            let presentation_method = verification_method(&did, "holder-jubjub-1", &presentation)?;
+            let authentication_method =
+                self.verification_method(&did, "auth-1", &authentication)?;
+            let assertion_method = self.verification_method(&did, "assertion-1", &assertion)?;
+            let presentation_method =
+                self.verification_method(&did, "holder-jubjub-1", &presentation)?;
             let document = DidDocument::new(DidDocumentParts {
                 contexts: vec![DID_CONTEXT.to_owned(), JWK_CONTEXT.to_owned()],
                 id: did.clone(),
@@ -464,7 +477,7 @@ impl DidLifecyclePort for StandaloneDidLifecycle {
                     "verification",
                     WalletKeyPurpose::Assertion,
                 )?;
-                let method = verification_method(did, &fragment, &descriptor)?;
+                let method = self.verification_method(did, &fragment, &descriptor)?;
                 if methods.iter().any(|existing| existing.id() == method.id()) {
                     let _ = self
                         .keys
@@ -497,7 +510,7 @@ impl DidLifecyclePort for StandaloneDidLifecycle {
                     "verification",
                     WalletKeyPurpose::Assertion,
                 )?;
-                let method = verification_method(did, &method_id, &descriptor)?;
+                let method = self.verification_method(did, &method_id, &descriptor)?;
                 methods[index] = method;
                 new_binding = Some((
                     method_id,
@@ -870,22 +883,28 @@ fn did_from_public_keys(
         .map_err(|_| DidLifecyclePortError::InvalidOperation)
 }
 
-fn verification_method(
-    did: &MidnightDid,
-    fragment: &str,
-    descriptor: &WalletKeyDescriptor,
-) -> Result<VerificationMethod, DidLifecyclePortError> {
-    let jwk = public_jwk(descriptor)?;
-    VerificationMethod::new(
-        did,
-        canonical_component_id(did, fragment)?,
-        did.clone(),
-        jwk,
-    )
-    .map_err(|_| DidLifecyclePortError::InvalidOperation)
+impl StandaloneDidLifecycle {
+    fn verification_method(
+        &self,
+        did: &MidnightDid,
+        fragment: &str,
+        descriptor: &WalletKeyDescriptor,
+    ) -> Result<VerificationMethod, DidLifecyclePortError> {
+        let jwk = public_jwk(descriptor, self.ledger9_jubjub_jwk)?;
+        VerificationMethod::new(
+            did,
+            canonical_component_id(did, fragment)?,
+            did.clone(),
+            jwk,
+        )
+        .map_err(|_| DidLifecyclePortError::InvalidOperation)
+    }
 }
 
-fn public_jwk(descriptor: &WalletKeyDescriptor) -> Result<PublicJwk, DidLifecyclePortError> {
+fn public_jwk(
+    descriptor: &WalletKeyDescriptor,
+    ledger9_jubjub_jwk: bool,
+) -> Result<PublicJwk, DidLifecyclePortError> {
     match (descriptor.algorithm(), descriptor.public_key().encoding()) {
         (WalletKeyAlgorithm::Ed25519, PublicKeyEncoding::Ed25519Compressed) => PublicJwk::new(
             JwkKeyType::Okp,
@@ -923,11 +942,21 @@ fn public_jwk(descriptor: &WalletKeyDescriptor) -> Result<PublicJwk, DidLifecycl
             }
             let x = point.x().ok_or(DidLifecyclePortError::InvalidOperation)?;
             let y = point.y().ok_or(DidLifecyclePortError::InvalidOperation)?;
+            let encode = |bytes: &[u8], label| {
+                if ledger9_jubjub_jwk {
+                    midnight_did_domain::encode_jubjub_jwk_coordinate_from_little_endian(
+                        bytes, label,
+                    )
+                    .map_err(|_| DidLifecyclePortError::InvalidOperation)
+                } else {
+                    Ok(base64url(bytes))
+                }
+            };
             PublicJwk::new(
                 JwkKeyType::Ec,
                 JwkCurve::Jubjub,
-                base64url(&x.as_le_bytes()),
-                Some(base64url(&y.as_le_bytes())),
+                encode(&x.as_le_bytes(), "x")?,
+                Some(encode(&y.as_le_bytes(), "y")?),
             )
             .map_err(|_| DidLifecyclePortError::InvalidOperation)
         }
@@ -1249,6 +1278,160 @@ mod tests {
         reopened
             .sign(&profile, &resolution, method_id, b"restored DID signing")
             .expect("restored key signs");
+    }
+
+    #[test]
+    fn ledger9_profile_rebinds_the_exact_canonical_jubjub_point_after_storage() {
+        use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
+        use midnight_did_domain::encode_jubjub_jwk_coordinate_from_little_endian;
+
+        let (security, lifecycle, profile) = setup();
+        let local = lifecycle
+            .create(&profile, MidnightNetwork::Undeployed)
+            .unwrap();
+        let did = local.document().id();
+        let assertion = format!("{}#key-assert", did.as_str());
+        let auth = format!("{}#key-auth", did.as_str());
+        let methods = local.document().verification_methods();
+        let auth_jwk = methods
+            .iter()
+            .find(|method| method.public_key_jwk().curve() == JwkCurve::Ed25519)
+            .unwrap()
+            .public_key_jwk()
+            .clone();
+        let legacy_jwk = methods
+            .iter()
+            .find(|method| method.public_key_jwk().curve() == JwkCurve::Jubjub)
+            .unwrap()
+            .public_key_jwk()
+            .clone();
+        let encode = |value: &str| {
+            encode_jubjub_jwk_coordinate_from_little_endian(
+                &URL_SAFE_NO_PAD.decode(value).unwrap(),
+                "test coordinate",
+            )
+            .unwrap()
+        };
+        let canonical_jwk = PublicJwk::new(
+            JwkKeyType::Ec,
+            JwkCurve::Jubjub,
+            encode(legacy_jwk.x()),
+            Some(encode(legacy_jwk.y().unwrap())),
+        )
+        .unwrap();
+        let alternative = EmbeddedGroupAffine::generator();
+        let wrong_point = PublicJwk::new(
+            JwkKeyType::Ec,
+            JwkCurve::Jubjub,
+            encode_jubjub_jwk_coordinate_from_little_endian(
+                &alternative.x().unwrap().as_le_bytes(),
+                "x",
+            )
+            .unwrap(),
+            Some(
+                encode_jubjub_jwk_coordinate_from_little_endian(
+                    &alternative.y().unwrap().as_le_bytes(),
+                    "y",
+                )
+                .unwrap(),
+            ),
+        )
+        .unwrap();
+        let resolve = |jubjub: PublicJwk, source| {
+            let doc = DidDocument::new(DidDocumentParts {
+                contexts: vec![DID_CONTEXT.to_owned(), JWK_CONTEXT.to_owned()],
+                id: did.clone(),
+                controllers: vec![did.clone()],
+                also_known_as: Vec::new(),
+                verification_methods: vec![
+                    VerificationMethod::new(did, &auth, did.clone(), auth_jwk.clone()).unwrap(),
+                    VerificationMethod::new(did, &assertion, did.clone(), jubjub).unwrap(),
+                ],
+                relationships: vec![
+                    VerificationRelationshipEntry::new(
+                        VerificationRelationship::Authentication,
+                        vec![auth.clone()],
+                    ),
+                    VerificationRelationshipEntry::new(
+                        VerificationRelationship::AssertionMethod,
+                        vec![assertion.clone()],
+                    ),
+                ],
+                services: Vec::new(),
+            })
+            .unwrap();
+            DidResolution::new(
+                doc,
+                DidDocumentMetadata::default(),
+                local.resolution_metadata().clone(),
+                source,
+            )
+        };
+        let expected = vec![assertion.clone(), auth.clone()];
+        for source in [DidResolutionSource::Live, DidResolutionSource::Stored] {
+            let canonical = resolve(canonical_jwk.clone(), source);
+            let reopened = StandaloneDidLifecycle::new(security.clone()).with_ledger9_jubjub_jwk();
+            assert_eq!(
+                reopened.managed_method_ids(&profile, &canonical).unwrap(),
+                expected
+            );
+        }
+        for unrecognized in [legacy_jwk, wrong_point] {
+            let reopened = StandaloneDidLifecycle::new(security.clone()).with_ledger9_jubjub_jwk();
+            let live = resolve(unrecognized, DidResolutionSource::Live);
+            assert_eq!(
+                reopened.managed_method_ids(&profile, &live).unwrap(),
+                [auth.clone()]
+            );
+        }
+        assert_eq!(
+            StandaloneDidLifecycle::new(security)
+                .managed_method_ids(&profile, &local.into_stored())
+                .unwrap()
+                .len(),
+            3
+        );
+    }
+
+    #[test]
+    fn ledger9_adapter_matches_the_typescript_jubjub_wire_vectors() {
+        use midnight_did_domain::encode_jubjub_jwk_coordinate_from_little_endian;
+        use midnight_did_jubjub_schnorr::{
+            decode_signature, derive_public_key_from_seed, encode_signature,
+            sign_payload_from_seed, verify_payload,
+        };
+
+        const SEED: [u8; 32] = [
+            0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e,
+            0x0f, 0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18, 0x19, 0x1a, 0x1b, 0x1c,
+            0x1d, 0x1e, 0x1f, 0x20,
+        ];
+        const PAYLOAD: &[u8] = b"midnight-identity jubjub-schnorr golden vector";
+        const X_JWK: &str = "EMyWcM8XCxkJTyn8MDXM4q6wVLMfqCxYCu0MwT0hHPQ";
+        const Y_JWK: &str = "H0wYFnDb0GGRQPznl3NU9G1sohdsMMrVdZpEQyiZrd0";
+        const SIGNATURE_HEX: &str = "02b4bfc039ddca33a2bc807a2df358682a81a6dd0db45eaf9567f00d000211460abff840b93c8fbc864111ba6009a31d227a9e04d44adcc6a44c0b103bb459da0603b2f0bc6eb850600cc297da66b157c88c53a731cfda0887153d531eabcd9c";
+
+        let public_key = derive_public_key_from_seed(&SEED);
+        let x = public_key.x().expect("non-identity x coordinate");
+        let y = public_key.y().expect("non-identity y coordinate");
+        assert_eq!(
+            encode_jubjub_jwk_coordinate_from_little_endian(&x.as_le_bytes(), "x")
+                .expect("canonical x"),
+            X_JWK
+        );
+        assert_eq!(
+            encode_jubjub_jwk_coordinate_from_little_endian(&y.as_le_bytes(), "y")
+                .expect("canonical y"),
+            Y_JWK
+        );
+
+        let signature = sign_payload_from_seed(&SEED, PAYLOAD).expect("deterministic signature");
+        let encoded = encode_signature(&signature).expect("canonical signature");
+        assert_eq!(hex::encode(&encoded), SIGNATURE_HEX);
+        let typescript_signature =
+            decode_signature(&hex::decode(SIGNATURE_HEX).expect("frozen signature hex"))
+                .expect("TypeScript signature decodes");
+        assert!(verify_payload(&public_key, PAYLOAD, &typescript_signature));
     }
 
     #[test]

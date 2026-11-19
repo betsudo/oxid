@@ -258,9 +258,9 @@ const fn map_replay_error(
 mod tests {
     use std::io::Cursor;
 
-    use midnight_base_crypto::{hash::HashOutput, schnorr::Signature, time::Timestamp};
+    use midnight_base_crypto::{hash::HashOutput, time::Timestamp};
     use midnight_ledger::structure::{
-        ContractDeploy, Intent, ProofPreimageMarker, StandardTransaction, Transaction,
+        ContractDeploy, Intent, ProofPreimageMarker, Signature, StandardTransaction, Transaction,
     };
     use midnight_onchain_runtime::state::ContractState;
     use midnight_serialize::{tagged_deserialize, tagged_serialize};

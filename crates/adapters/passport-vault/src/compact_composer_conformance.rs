@@ -2,8 +2,7 @@
 
 use std::{fs, io::Cursor, path::PathBuf, process::Command, sync::Arc};
 
-use midnight_base_crypto::schnorr::Signature;
-use midnight_ledger::structure::{INITIAL_PARAMETERS, ProofPreimageMarker, Transaction};
+use midnight_ledger::structure::{INITIAL_PARAMETERS, ProofPreimageMarker, Signature, Transaction};
 use midnight_serialize::{tagged_deserialize, tagged_serialize};
 use midnight_storage::DefaultDB;
 use midnight_transient_crypto::commitment::PedersenRandomness;

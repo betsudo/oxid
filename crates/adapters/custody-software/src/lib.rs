@@ -93,7 +93,7 @@ pub fn public_key_from_secret(
             ))
         }
         WalletKeyAlgorithm::Secp256k1Schnorr => {
-            let signing_key = Secp256k1SchnorrSigningKey::from_bytes(secret)
+            let signing_key = Secp256k1SchnorrSigningKey::from_bytes(secret.into())
                 .map_err(|_| WalletSecurityPortError::InvalidOperation)?;
             Ok(WalletPublicKey::new(
                 PublicKeyEncoding::Secp256k1XOnly,
@@ -135,7 +135,7 @@ pub fn sign_with_secret(
             ))
         }
         WalletKeyAlgorithm::Secp256k1Schnorr => {
-            let key = Secp256k1SchnorrSigningKey::from_bytes(secret)
+            let key = Secp256k1SchnorrSigningKey::from_bytes(secret.into())
                 .map_err(|_| WalletSecurityPortError::InvalidOperation)?;
             let signature: k256::schnorr::Signature = key.sign(payload);
             Ok(WalletSignature::new(

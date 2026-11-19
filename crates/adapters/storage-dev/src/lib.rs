@@ -437,7 +437,8 @@ impl<C, N> DevelopmentWalletSecurity<C, N> {
                     self.random
                         .fill_bytes(secret.as_mut())
                         .map_err(|_| WalletSecurityPortError::Unavailable)?;
-                    if let Ok(signing_key) = Secp256k1SchnorrSigningKey::from_bytes(secret.as_ref())
+                    if let Ok(signing_key) =
+                        Secp256k1SchnorrSigningKey::from_bytes((&*secret).into())
                     {
                         let public_key = WalletPublicKey::new(
                             PublicKeyEncoding::Secp256k1XOnly,
@@ -480,7 +481,7 @@ impl<C, N> DevelopmentWalletSecurity<C, N> {
         }
 
         let private_bytes = Self::derive_secret(root_seed, path)?;
-        let signing_key = Secp256k1SchnorrSigningKey::from_bytes(private_bytes.as_ref())
+        let signing_key = Secp256k1SchnorrSigningKey::from_bytes((&*private_bytes).into())
             .map_err(|_| WalletSecurityPortError::InvalidOperation)?;
         let public_key = WalletPublicKey::new(
             PublicKeyEncoding::Secp256k1XOnly,
@@ -536,7 +537,7 @@ impl<C, N> DevelopmentWalletSecurity<C, N> {
                 Ok((DevelopmentKeyMaterial::P256(signing_key), public_key))
             }
             WalletKeyAlgorithm::Secp256k1Schnorr => {
-                let signing_key = Secp256k1SchnorrSigningKey::from_bytes(secret.as_ref())
+                let signing_key = Secp256k1SchnorrSigningKey::from_bytes((&*secret).into())
                     .map_err(|_| WalletSecurityPortError::InvalidOperation)?;
                 let public_key = WalletPublicKey::new(
                     PublicKeyEncoding::Secp256k1XOnly,
@@ -1508,7 +1509,7 @@ mod tests {
         );
         assert_eq!(
             restored.list(&first_profile).expect("first keys"),
-            vec![first_descriptor]
+            vec![first_descriptor.clone()]
         );
         assert_eq!(
             restored.list(&second_profile).expect("second keys"),
@@ -1530,6 +1531,17 @@ mod tests {
             .expect("restore second bounded secret");
         assert_eq!(restored_first, Some(first_secret));
         assert_eq!(restored_second, Some(second_secret));
+        let intent = b"transaction intent after app replacement";
+        let signature = restored
+            .sign(&first_profile, first_descriptor.reference(), intent)
+            .expect("the reopened custody store can sign with the original key");
+        let public_bytes: &[u8; 32] = first_descriptor.public_key().bytes().try_into().unwrap();
+        let verifying_key =
+            SchnorrVerifyingKey::from_bytes(public_bytes.into()).expect("original public key");
+        let signature = SchnorrSignature::try_from(signature.bytes()).expect("signature format");
+        verifying_key
+            .verify(intent, &signature)
+            .expect("original key verifies");
 
         drop(restored);
         let persistence = DevelopmentCustodyPersistence {
@@ -1555,6 +1567,11 @@ mod tests {
                 .expect("second profile remains independently readable")
                 .state(),
             WalletProtectionState::Unlocked
+        );
+        assert_eq!(
+            isolated.sign(&first_profile, first_descriptor.reference(), intent),
+            Err(WalletSecurityPortError::InvalidOperation),
+            "an unreadable saved root must never sign using replacement custody"
         );
     }
 
@@ -1668,8 +1685,8 @@ mod tests {
             .bytes()
             .try_into()
             .expect("x-only public key is 32 bytes");
-        let verifying_key =
-            SchnorrVerifyingKey::from_bytes(&public_bytes).expect("x-only public key is valid");
+        let verifying_key = SchnorrVerifyingKey::from_bytes((&public_bytes).into())
+            .expect("x-only public key is valid");
         let signature =
             SchnorrSignature::try_from(signature.bytes()).expect("signature bytes are valid");
         verifying_key

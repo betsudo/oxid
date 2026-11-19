@@ -7,4 +7,6 @@ tagline = "Identity wallet"
 bundle_identifier = "io.medianox.oxid"
 publisher = "MediaNoxLabs"
 logo = "assets/logo.svg"
-show_vault_card = true
+# Passport Vault is temporarily absent while its Compact composer migrates to
+# the Ledger 9 cohort. Credential issuance remains an independent capability.
+show_vault_card = false

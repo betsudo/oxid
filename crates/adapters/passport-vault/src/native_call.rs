@@ -17,8 +17,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use midnight_base_crypto::schnorr::Signature;
-use midnight_ledger::structure::{ProofPreimageMarker, Transaction};
+use midnight_ledger::structure::{ProofPreimageMarker, Signature, Transaction};
 use midnight_serialize::tagged_deserialize;
 use midnight_storage::DefaultDB;
 use midnight_transient_crypto::commitment::PedersenRandomness;
@@ -1903,7 +1902,8 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     use futures::executor::block_on;
-    use midnight_base_crypto::{fab::AlignedValue, schnorr::Signature, time::Timestamp};
+    use midnight_base_crypto::{fab::AlignedValue, time::Timestamp};
+    use midnight_ledger::structure::Signature;
     use midnight_ledger::structure::{Intent, ProofPreimageMarker, StandardTransaction};
     use midnight_onchain_runtime::state::{ChargedState, ContractState, StateValue};
     use midnight_serialize::tagged_serialize;

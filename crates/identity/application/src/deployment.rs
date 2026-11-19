@@ -174,6 +174,10 @@ pub enum DidDeploymentFailure {
     ProtectionLocked,
     AccountUnavailable,
     FundingUnavailable,
+    InsufficientNight,
+    ChainStateUnavailable,
+    UnsupportedNetwork,
+    InvalidFundingPlan,
     InsufficientDust,
     ProvingUnavailable,
     SubmissionRejected,
@@ -190,6 +194,10 @@ impl DidDeploymentFailure {
             Self::ProtectionLocked => "protection_locked",
             Self::AccountUnavailable => "account_unavailable",
             Self::FundingUnavailable => "funding_unavailable",
+            Self::InsufficientNight => "insufficient_night",
+            Self::ChainStateUnavailable => "chain_state_unavailable",
+            Self::UnsupportedNetwork => "unsupported_network",
+            Self::InvalidFundingPlan => "invalid_funding_plan",
             Self::InsufficientDust => "insufficient_dust",
             Self::ProvingUnavailable => "proving_unavailable",
             Self::SubmissionRejected => "submission_rejected",
@@ -473,7 +481,16 @@ impl DidDeploymentOperation {
         {
             return Err(DidDeploymentOperationError::InvalidTransition);
         }
-        self.resume_from = Some(self.state);
+        // Funded/proved transaction bytes are deliberately not durable. A
+        // known pre-broadcast failure while submitting must therefore rebuild
+        // from the funding boundary; resuming directly at `Submitting` would
+        // attempt to reuse material that no longer exists after a restart.
+        self.resume_from = Some(match self.state {
+            DidDeploymentState::Submitting | DidDeploymentState::Confirming => {
+                DidDeploymentState::Funding
+            }
+            state => state,
+        });
         self.failure = Some(failure);
         self.state = DidDeploymentState::RetryableFailure;
         self.updated_at = now;
@@ -925,6 +942,35 @@ mod tests {
             operation
                 .transition(DidDeploymentState::Funding, UnixTimestampMillis::new(4_000))
                 .expect("resume")
+                .state(),
+            DidDeploymentState::Funding
+        );
+    }
+
+    #[test]
+    fn submission_failure_resumes_at_the_last_durable_transaction_boundary() {
+        let operation = operation()
+            .composed(did(), "draft-1".to_owned(), UnixTimestampMillis::new(2_000))
+            .expect("composed")
+            .transition(DidDeploymentState::Proving, UnixTimestampMillis::new(3_000))
+            .expect("proving")
+            .transition(
+                DidDeploymentState::Submitting,
+                UnixTimestampMillis::new(4_000),
+            )
+            .expect("submitting")
+            .retryable_failure(
+                DidDeploymentFailure::FundingUnavailable,
+                UnixTimestampMillis::new(5_000),
+            )
+            .expect("durable failure");
+
+        assert_eq!(operation.state(), DidDeploymentState::RetryableFailure);
+        assert_eq!(operation.resume_from(), Some(DidDeploymentState::Funding));
+        assert_eq!(
+            operation
+                .transition(DidDeploymentState::Funding, UnixTimestampMillis::new(6_000))
+                .expect("resume from durable boundary")
                 .state(),
             DidDeploymentState::Funding
         );

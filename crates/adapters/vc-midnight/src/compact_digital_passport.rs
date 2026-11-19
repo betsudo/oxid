@@ -25,7 +25,9 @@ use oxid_credential_domain::{
 };
 use oxid_foundation::UnixTimestampMillis;
 use oxid_identity_application::{DidResolutionPort, DidResolutionPortError};
-use oxid_identity_domain::{JwkCurve, JwkKeyType, MidnightDid, VerificationRelationship};
+use oxid_identity_domain::{
+    JwkCurve, JwkKeyType, MidnightDid, MidnightNetwork, VerificationRelationship,
+};
 use oxid_platform_ports::{ClockPort, PlatformError};
 use std::sync::Arc;
 
@@ -103,10 +105,11 @@ impl CredentialVerificationPort for MidnightCompactCredentialVerifier {
         detached_proof: Option<&'a [u8]>,
     ) -> CredentialInspectionFuture<'a> {
         Box::pin(async move {
-            let inspection = inspect(signed_bytes, detached_proof)?;
             let Some(policy) = self.policy.as_deref() else {
-                return Ok(inspection);
+                return inspect(signed_bytes, detached_proof);
             };
+            let inspection =
+                inspect_in_network(signed_bytes, detached_proof, policy.trust_anchor.network())?;
             if inspection.verification.outcome() != VerificationOutcome::Valid {
                 return Ok(inspection);
             }
@@ -150,10 +153,24 @@ pub(crate) fn inspect(
     credential_bytes: &[u8],
     detached_proof: Option<&[u8]>,
 ) -> Result<CredentialInspection, CredentialVerificationError> {
+    inspect_in_network(
+        credential_bytes,
+        detached_proof,
+        MidnightNetwork::Undeployed,
+    )
+}
+
+// Compact v1 signs contract addresses. The exact issuer policy supplies the
+// DID namespace for both references. No credential or resolver text selects it.
+fn inspect_in_network(
+    credential_bytes: &[u8],
+    detached_proof: Option<&[u8]>,
+    network: MidnightNetwork,
+) -> Result<CredentialInspection, CredentialVerificationError> {
     let credential = parse_credential(credential_bytes)?;
     let id = credential_id(credential_bytes)?;
-    let issuer_did = did_from_contract_address(credential.issuer.did_contract_address);
-    let holder_did = did_from_contract_address(credential.holder.did_contract_address);
+    let issuer_did = did_from_contract_address(network, credential.issuer.did_contract_address);
+    let holder_did = did_from_contract_address(network, credential.holder.did_contract_address);
     let issued_at_ms = credential
         .issued_at
         .checked_mul(1_000)
@@ -306,7 +323,10 @@ async fn inspect_policy(
 ) -> Result<CredentialInspection, CredentialVerificationError> {
     let credential = parse_credential(credential_bytes)?;
     let proof = parse_proof(detached_proof.ok_or(CredentialVerificationError::InvalidCredential)?)?;
-    let issuer_did_value = did_from_contract_address(credential.issuer.did_contract_address);
+    let issuer_did_value = did_from_contract_address(
+        policy.trust_anchor.network(),
+        credential.issuer.did_contract_address,
+    );
     let issuer_did = MidnightDid::parse(issuer_did_value.clone())
         .map_err(|_| CredentialVerificationError::InvalidCredential)?;
     let method_fragment = method_fragment(&credential.issuer.method_id)
@@ -381,7 +401,7 @@ async fn inspect_policy(
     }
     let proof_key =
         point_bytes(proof.public_key).ok_or(CredentialVerificationError::InvalidCredential)?;
-    if !jwk_matches_proof(method.public_key_jwk(), &proof_key) {
+    if !jwk_matches_proof(method.public_key_jwk(), &proof_key, &policy.trust_anchor) {
         return policy_failure(
             inspection,
             VerificationOutcome::Invalid,
@@ -524,6 +544,26 @@ fn method_fragment(method_id: &[u8; 32]) -> Option<&str> {
     Some(value)
 }
 
+/// Checks the holder address and method encoded in the signed Compact body
+/// against the holder binding selected for this issuance request.
+pub fn validate_compact_holder_binding(
+    signed_credential: &[u8],
+    expected_binding_method: &str,
+) -> Result<(), CredentialVerificationError> {
+    let invalid = CredentialVerificationError::InvalidCredential;
+    let (expected_did, _) = expected_binding_method.split_once('#').ok_or(invalid)?;
+    let did = MidnightDid::parse(expected_did).map_err(|_| invalid)?;
+    if did.network() == MidnightNetwork::Offchain {
+        return Err(invalid);
+    }
+    let holder = parse_credential(signed_credential)?.holder;
+    let fragment = method_fragment(&holder.method_id).ok_or(invalid)?;
+    let actual_did = did_from_contract_address(did.network(), holder.did_contract_address);
+    (format!("{actual_did}{fragment}") == expected_binding_method)
+        .then_some(())
+        .ok_or(invalid)
+}
+
 fn point_bytes(point: EmbeddedGroupAffine) -> Option<[u8; 64]> {
     let mut bytes = [0_u8; 64];
     bytes[..32].copy_from_slice(&point.x()?.as_le_bytes());
@@ -531,20 +571,18 @@ fn point_bytes(point: EmbeddedGroupAffine) -> Option<[u8; 64]> {
     Some(bytes)
 }
 
-fn jwk_matches_proof(jwk: &oxid_identity_domain::PublicJwk, proof_key: &[u8; 64]) -> bool {
+fn jwk_matches_proof(
+    jwk: &oxid_identity_domain::PublicJwk,
+    proof_key: &[u8; 64],
+    trust_anchor: &DigitalPassportIssuerTrustAnchor,
+) -> bool {
     if jwk.key_type() != JwkKeyType::Ec || jwk.curve() != JwkCurve::Jubjub {
         return false;
     }
     let Some(y) = jwk.y() else {
         return false;
     };
-    let decode = |value: &str| {
-        general_purpose::URL_SAFE_NO_PAD
-            .decode(value)
-            .ok()
-            .filter(|bytes| bytes.len() == 32)
-            .filter(|bytes| general_purpose::URL_SAFE_NO_PAD.encode(bytes) == value)
-    };
+    let decode = |value| trust_anchor.decode_jwk_coordinate(value);
     matches!((decode(jwk.x()), decode(y)), (Some(x), Some(y)) if x == proof_key[..32] && y == proof_key[32..])
 }
 
@@ -961,8 +999,8 @@ pub(crate) fn persistent_hash<T: BinaryHashRepr + ?Sized>(value: &T) -> [u8; 32]
     writer.finalize().0
 }
 
-fn did_from_contract_address(address: [u8; 32]) -> String {
-    format!("did:midnight:undeployed:{}", hex::encode(address))
+fn did_from_contract_address(network: MidnightNetwork, address: [u8; 32]) -> String {
+    format!("did:midnight:{}:{}", network.as_str(), hex::encode(address))
 }
 
 const fn padded<const N: usize>(value: &[u8]) -> [u8; N] {
@@ -977,7 +1015,6 @@ const fn padded<const N: usize>(value: &[u8]) -> [u8; N] {
 
 #[cfg(test)]
 mod tests {
-    use base64::{Engine as _, engine::general_purpose};
     use oxid_identity_application::{DidResolutionPort, DidResolutionPortFuture};
     use oxid_identity_domain::{
         DID_CONTEXT, DidDocument, DidDocumentMetadata, DidDocumentParts, DidResolution,
@@ -1004,6 +1041,44 @@ mod tests {
         general_purpose::STANDARD
             .decode(value.trim())
             .expect("fixture base64")
+    }
+
+    #[test]
+    fn ledger9_portal_anchor_and_resolved_jwk_use_canonical_big_endian_coordinates() {
+        use midnight_did_domain::encode_jubjub_jwk_coordinate_from_little_endian;
+        use sha2::{Digest as _, Sha256};
+
+        let proof = parse_proof(&crate::standalone_compact_proof()).expect("proof");
+        let proof_key = point_bytes(proof.public_key).expect("public coordinates");
+        let x = encode_jubjub_jwk_coordinate_from_little_endian(&proof_key[..32], "x").unwrap();
+        let y = encode_jubjub_jwk_coordinate_from_little_endian(&proof_key[32..], "y").unwrap();
+        let wire = serde_json::json!({"crv":"Jubjub","kty":"EC","x":x,"y":y});
+        let digest = hex::encode(Sha256::digest(serde_json::to_vec(&wire).unwrap()));
+        let did = did_from_contract_address(
+            MidnightNetwork::Undeployed,
+            proof.signer.did_contract_address,
+        );
+        let method = format!("{did}{}", method_fragment(&proof.signer.method_id).unwrap());
+        let anchor = DigitalPassportIssuerTrustAnchor::from_ledger9_portal_jubjub(
+            &did, &method, &x, &y, &digest,
+        )
+        .unwrap();
+        assert!(anchor.matches(&did, &proof.signer.method_id, &proof_key));
+        let resolved = PublicJwk::new(JwkKeyType::Ec, JwkCurve::Jubjub, x, Some(y)).unwrap();
+        assert!(jwk_matches_proof(&resolved, &proof_key, &anchor));
+        assert!(!jwk_matches_proof(
+            &resolved,
+            &proof_key,
+            &crate::standalone_digital_passport_issuer_trust_anchor()
+        ));
+        let legacy = PublicJwk::new(
+            JwkKeyType::Ec,
+            JwkCurve::Jubjub,
+            general_purpose::URL_SAFE_NO_PAD.encode(&proof_key[..32]),
+            Some(general_purpose::URL_SAFE_NO_PAD.encode(&proof_key[32..])),
+        )
+        .unwrap();
+        assert!(!jwk_matches_proof(&legacy, &proof_key, &anchor));
     }
 
     fn bound_request() -> BoundCredentialRequest {
@@ -1036,6 +1111,7 @@ mod tests {
         MissingMethod,
         NotAssertionAuthorized,
         WrongKey,
+        WrongNetworkDocument,
         Unavailable,
     }
 
@@ -1043,7 +1119,12 @@ mod tests {
 
     impl DidResolutionPort for PolicyResolver {
         fn resolve<'a>(&'a self, did: &'a MidnightDid) -> DidResolutionPortFuture<'a> {
-            let did = did.clone();
+            let did = if matches!(self.0, ResolverMode::WrongNetworkDocument) {
+                MidnightDid::parse(did.as_str().replacen(":preview:", ":undeployed:", 1))
+                    .expect("fixture DID")
+            } else {
+                did.clone()
+            };
             let mode = self.0;
             Box::pin(async move {
                 if matches!(mode, ResolverMode::Unavailable) {
@@ -1215,6 +1296,85 @@ mod tests {
             stage(&inspection, VerificationStageName::Status).status(),
             VerificationStageStatus::NotChecked
         );
+    }
+
+    #[test]
+    fn compact_addresses_use_the_configured_issuer_network() {
+        use sha2::{Digest as _, Sha256};
+
+        let issued_at = 1_700_000_000;
+        let issued = issue_bound_standalone_credential(&bound_request(), issued_at).expect("issue");
+        let proof_bytes = issued.detached_proof.as_deref().expect("proof bytes");
+        let proof = parse_proof(proof_bytes).expect("proof");
+        let key = point_bytes(proof.public_key).expect("public coordinates");
+        let x = general_purpose::URL_SAFE_NO_PAD.encode(&key[..32]);
+        let y = general_purpose::URL_SAFE_NO_PAD.encode(&key[32..]);
+        let wire = serde_json::json!({"crv":"Jubjub","kty":"EC","x":x,"y":y});
+        let digest = hex::encode(Sha256::digest(serde_json::to_vec(&wire).unwrap()));
+        let issuer_did =
+            did_from_contract_address(MidnightNetwork::Preview, proof.signer.did_contract_address);
+        let method = format!(
+            "{issuer_did}{}",
+            method_fragment(&proof.signer.method_id).unwrap()
+        );
+        let anchor = DigitalPassportIssuerTrustAnchor::from_portal_jubjub(
+            &issuer_did,
+            &method,
+            &x,
+            &y,
+            &digest,
+        )
+        .expect("Preview trust anchor");
+
+        for (mode, expected_outcome) in [
+            (ResolverMode::Valid, VerificationOutcome::Valid),
+            (
+                ResolverMode::WrongNetworkDocument,
+                VerificationOutcome::Invalid,
+            ),
+        ] {
+            let verifier = MidnightCompactCredentialVerifier::with_policy(
+                Arc::new(PolicyResolver(mode)),
+                Arc::new(FixedClock(issued_at + 1)),
+                anchor.clone(),
+            );
+            let inspection =
+                poll(verifier.inspect(&issued.signed_bytes, Some(proof_bytes))).expect("inspect");
+            assert_eq!(inspection.verification.outcome(), expected_outcome);
+            assert_eq!(inspection.metadata.issuer_did(), issuer_did);
+            assert!(
+                inspection
+                    .metadata
+                    .subject_did()
+                    .unwrap()
+                    .starts_with("did:midnight:preview:")
+            );
+        }
+    }
+
+    #[test]
+    fn compact_signed_body_must_match_the_selected_holder_address_and_method() {
+        let request = bound_request();
+        let issued = issue_bound_standalone_credential(&request, 1_700_000_000).expect("issue");
+        assert_eq!(
+            validate_compact_holder_binding(
+                &issued.signed_bytes,
+                &request.holder_binding_method_id
+            ),
+            Ok(())
+        );
+        for unexpected_method in [
+            format!("{}#another-method", request.holder_did),
+            format!(
+                "did:midnight:undeployed:{}#holder-jubjub-1",
+                "ff".repeat(32)
+            ),
+        ] {
+            assert_eq!(
+                validate_compact_holder_binding(&issued.signed_bytes, &unexpected_method),
+                Err(CredentialVerificationError::InvalidCredential)
+            );
+        }
     }
 
     #[test]

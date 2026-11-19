@@ -363,6 +363,10 @@ fn parse_failure(value: &str) -> Result<DidDeploymentFailure, DidDeploymentOpera
         "protection_locked" => Ok(DidDeploymentFailure::ProtectionLocked),
         "account_unavailable" => Ok(DidDeploymentFailure::AccountUnavailable),
         "funding_unavailable" => Ok(DidDeploymentFailure::FundingUnavailable),
+        "insufficient_night" => Ok(DidDeploymentFailure::InsufficientNight),
+        "chain_state_unavailable" => Ok(DidDeploymentFailure::ChainStateUnavailable),
+        "unsupported_network" => Ok(DidDeploymentFailure::UnsupportedNetwork),
+        "invalid_funding_plan" => Ok(DidDeploymentFailure::InvalidFundingPlan),
         "insufficient_dust" => Ok(DidDeploymentFailure::InsufficientDust),
         "proving_unavailable" => Ok(DidDeploymentFailure::ProvingUnavailable),
         "submission_rejected" => Ok(DidDeploymentFailure::SubmissionRejected),
@@ -388,6 +392,26 @@ mod tests {
     };
 
     use super::*;
+
+    #[test]
+    fn parses_actionable_funding_failure_categories() {
+        assert_eq!(
+            parse_failure("insufficient_night"),
+            Ok(DidDeploymentFailure::InsufficientNight)
+        );
+        assert_eq!(
+            parse_failure("chain_state_unavailable"),
+            Ok(DidDeploymentFailure::ChainStateUnavailable)
+        );
+        assert_eq!(
+            parse_failure("unsupported_network"),
+            Ok(DidDeploymentFailure::UnsupportedNetwork)
+        );
+        assert_eq!(
+            parse_failure("invalid_funding_plan"),
+            Ok(DidDeploymentFailure::InvalidFundingPlan)
+        );
+    }
     use oxid_foundation::UnixTimestampMillis;
 
     static SEQUENCE: AtomicU64 = AtomicU64::new(0);

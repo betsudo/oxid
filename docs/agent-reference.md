@@ -596,6 +596,13 @@ as source-derived negative contract evidence only. ADR-0102 pins merged Portal
 `integration` commit `25499870f84d77173c46e4af3021311decfb840b`, tree
 `2d845d2293603dfd8adce5362c8a9941e6ba78a9`, and refreshed Final-profile
 provenance digest `63d2dd182f1a315d8fe7677ae6481aecebd2fd9cff709cc438b6c0261a3cf4c7`.
+The shared Ledger 9 lane admits merged Portal commit
+`154ad777456ab40ab2f46a8b94959ae63b14a459`, tree
+`4f9952cebd0e9cc8a82ec9d459d2eadc9cce8adb` and Final-profile provenance digest
+`70f67a9f339ca0756ca4d10f5bef9dea769746094076288b8f571d93cb9c51fc`.
+This source lock requires the issuer at `http://127.0.0.1:8090` and the pinned
+resolver at `http://127.0.0.1:9092`.
+
 Native desktop/headless development selects the strict HTTP
 adapter through an absolute manifest path plus exact digest. The
 `portal-headless-e2e` target fetches that exact Lace integration tree and runs
@@ -1385,9 +1392,12 @@ only that the schema is authenticated and does not imply where the bytes came
 from. The exact ledger has 15 fields and
 contract version 1. Cap decoding at 16 MiB and 4,096 contiguous locks, require
 per-lock/global accounting agreement and `claimCount == consumedClaims.size`,
-and reject trailing bytes or unknown decisions. The deterministic fixture at
-`fixtures/passport-vault/contract-state-v1.hex` is 2,013 bytes with SHA-256
-`dc4a2f242b8a0a525310b1090ca1ad117cc0d7b019e16d8738f3c9505760a8c0`.
+and reject trailing bytes or unknown decisions. The deterministic Ledger9
+layout fixture at `fixtures/passport-vault/contract-state-v1.hex` is 1,654 bytes
+with SHA-256
+`29309501c082ee55bffb9211a5ab96b36b8dd0e658788f0789641dfab0aa98bc`.
+It uses `contract-state[v8]`, preserves the exact public state shape, and has no
+deployable operations; issue #1194 owns the Ledger9 Compact operation closure.
 Do not relabel it live/cached without an authenticated acquisition/freshness
 adapter.
 
