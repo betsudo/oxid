@@ -1833,6 +1833,17 @@ mod tests {
         events::{EventDetails, EventSource},
         structure::{INITIAL_PARAMETERS, TransactionHash},
     };
+    use oxid_foundation::UnixTimestampMillis;
+    use oxid_wallet_domain::{
+        WalletProfileId, WalletTransactionDraftId, WalletTransactionSubmissionState,
+    };
+
+    use crate::{
+        submission_journal::{
+            MemoryMidnightSubmissionJournalStore, MidnightSubmissionJournalStore,
+        },
+        transaction::{MidnightSubmissionAttempt, MidnightSubmissionControl},
+    };
     use tokio_tungstenite::{
         accept_hdr_async,
         tungstenite::handshake::server::{Request, Response},
@@ -1860,6 +1871,108 @@ mod tests {
             .enable_all()
             .build()
             .expect("test runtime builds")
+    }
+
+    fn submission_entry(state: StoredSubmissionState) -> StoredSubmissionJournalEntry {
+        StoredSubmissionJournalEntry {
+            profile_id: WalletProfileId::parse("profile-submission").expect("profile"),
+            network_id: config("http://127.0.0.1:6300")
+                .expect("config")
+                .indexer()
+                .network_id()
+                .clone(),
+            draft_id: WalletTransactionDraftId::parse("txdraft-submission").expect("draft"),
+            planning_fingerprint: [1; 32],
+            expires_at: UnixTimestampMillis::new(2_000),
+            updated_at: UnixTimestampMillis::new(1_000),
+            fee_specks: 42,
+            transaction_hash: [7; 32],
+            anchor_block_hash: [8; 32],
+            block_hash: None,
+            block_height: None,
+            state,
+            mode: WalletTransferSubmissionMode::Live,
+        }
+    }
+
+    #[test]
+    fn transaction_submission_connection_failure_does_not_create_a_broadcast_record() {
+        let entry = submission_entry(StoredSubmissionState::Broadcasting);
+        let journal: Arc<dyn MidnightSubmissionJournalStore> =
+            Arc::new(MemoryMidnightSubmissionJournalStore::default());
+        let control = Arc::new(MidnightSubmissionControl::new(
+            MidnightSubmissionAttempt {
+                profile_id: entry.profile_id.clone(),
+                network_id: entry.network_id.clone(),
+                draft_id: entry.draft_id.clone(),
+                planning_fingerprint: entry.planning_fingerprint,
+                expires_at: entry.expires_at,
+                updated_at: entry.updated_at,
+            },
+            Arc::clone(&journal),
+        ));
+        let request = MidnightCompletionRequest::new(
+            Transaction::Standard(StandardTransaction::new(
+                "undeployed",
+                LedgerHashMap::new(),
+                None,
+                LedgerHashMap::new(),
+            )),
+            2,
+            Arc::clone(&control),
+        );
+
+        let result = runtime().block_on(async {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+                .await
+                .expect("test node binds");
+            let address = listener.local_addr().expect("test node address");
+            let endpoint = format!("wss://{address}");
+            let disconnect = async {
+                let (connection, _) = timeout(CONNECT_TIMEOUT, listener.accept())
+                    .await
+                    .expect("client connects")
+                    .expect("node accepts connection");
+                drop(connection);
+            };
+            let (result, ()) = tokio::join!(
+                submit_unsigned(&endpoint, vec![0], &request, entry.fee_specks),
+                disconnect,
+            );
+            result
+        });
+
+        assert_eq!(result, Err(WalletTransactionPortError::Unavailable));
+        assert!(
+            journal
+                .load(&entry.profile_id, &entry.draft_id)
+                .expect("journal reads")
+                .is_none(),
+            "the durable broadcast barrier starts only after the node connection and anchor resolve"
+        );
+        assert_eq!(
+            control.public_state().expect("control state reads"),
+            WalletTransactionSubmissionState::Running
+        );
+    }
+
+    #[test]
+    fn live_reconciliation_rejects_terminal_records_but_keeps_unknowns_reconcilable() {
+        let reconciler =
+            LiveMidnightSubmissionReconciler::new(config("http://127.0.0.1:6300").expect("config"));
+        let rejected = submission_entry(StoredSubmissionState::Rejected);
+        let unknown = submission_entry(StoredSubmissionState::OutcomeUnknown);
+
+        assert_eq!(
+            reconciler.validate_entry(&rejected),
+            Err(WalletTransactionPortError::InvalidData),
+            "a terminal rejection must never be probed or changed into an ambiguous outcome"
+        );
+        assert_eq!(
+            reconciler.validate_entry(&unknown),
+            Ok(()),
+            "an outcome-unknown record remains eligible for a fresh durable observation"
+        );
     }
 
     #[test]

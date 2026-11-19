@@ -425,6 +425,14 @@ impl DidResolutionPort for LiveResolver {
 
 struct MismatchedSubjectResolver;
 
+struct UnavailableResolver;
+
+impl DidResolutionPort for UnavailableResolver {
+    fn resolve<'a>(&'a self, _: &'a MidnightDid) -> DidResolutionPortFuture<'a> {
+        Box::pin(async { Err(DidResolutionPortError::Unavailable) })
+    }
+}
+
 impl DidResolutionPort for MismatchedSubjectResolver {
     fn resolve<'a>(&'a self, _: &'a MidnightDid) -> DidResolutionPortFuture<'a> {
         let other = MidnightDid::parse(format!("did:midnight:undeployed:{}", "f".repeat(64)))
@@ -662,6 +670,30 @@ fn incomplete_live_resolution_waits_without_resubmitting_or_exposing_ready() {
     assert_eq!(operation.failure(), None);
     assert_eq!(operation.resume_from(), None);
     assert_eq!(operation.receipts().len(), 8);
+    assert_eq!(submissions.submissions.load(Ordering::SeqCst), 8);
+}
+
+#[test]
+fn unavailable_resolution_keeps_recovered_deployment_resolving_without_resubmission() {
+    let submissions = Arc::new(IncludedSubmission {
+        submissions: AtomicUsize::new(0),
+    });
+    let operations = Arc::new(MemoryOperations::default());
+    let service = service(
+        Arc::new(UnavailableResolver),
+        Arc::clone(&submissions),
+        operations,
+    );
+
+    let first = futures::executor::block_on(service.execute(command()))
+        .expect("unavailable resolver leaves a durable recovery snapshot");
+    let second = futures::executor::block_on(service.execute(command()))
+        .expect("retry keeps the same unresolved deployment");
+
+    assert_eq!(first.state(), DidDeploymentState::Resolving);
+    assert_eq!(second.state(), DidDeploymentState::Resolving);
+    assert_eq!(second.operation_id(), first.operation_id());
+    assert_eq!(second.receipts().len(), 8);
     assert_eq!(submissions.submissions.load(Ordering::SeqCst), 8);
 }
 

@@ -843,15 +843,114 @@ mod tests {
         );
     }
     #[test]
-    fn maps_bootstrap_operations_to_generated_runtime_calls() {
-        let operation = MidnightDidCallOperation::AddAuthenticationMethod {
-            method_id: "#key-auth".to_owned(),
-            x: [7; 32],
+    fn rejects_wrong_network_and_key_contexts() {
+        let valid = MidnightDidCallContext {
+            contract_state: vec![1],
+            contract_address: [2; 32],
+            observation_transaction_hash: [7; 32],
+            observation_block_hash: [8; 32],
+            observation_block_height: 1,
+            zswap_chain_state: None,
+            ledger_parameters: Some(vec![1]),
+            network_id: "undeployed".to_owned(),
+            timestamp_millis: 1_000,
+            expires_at_millis: 2_000,
+            coin_public_key: [3; 32],
+            encryption_public_key: [4; 32],
         };
+        assert_eq!(valid.validate(), Ok(()));
+
+        for context in [
+            MidnightDidCallContext {
+                network_id: "Undeployed".to_owned(),
+                ..valid.clone()
+            },
+            MidnightDidCallContext {
+                coin_public_key: [0; 32],
+                ..valid.clone()
+            },
+            MidnightDidCallContext {
+                expires_at_millis: 1_999,
+                ..valid
+            },
+        ] {
+            assert_eq!(
+                context.validate(),
+                Err(DidLifecyclePortError::InvalidOperation)
+            );
+        }
+    }
+
+    #[test]
+    fn validates_bootstrap_operations_and_rejects_invalid_curve_points() {
+        let operations = [
+            MidnightDidCallOperation::AddAuthenticationMethod {
+                method_id: "#key-auth".to_owned(),
+                x: [7; 32],
+            },
+            MidnightDidCallOperation::AddAuthenticationRelationship {
+                method_id: "#key-auth".to_owned(),
+            },
+            MidnightDidCallOperation::AddAssertionMethod {
+                method_id: "#key-assertion".to_owned(),
+                x: [8; 32],
+                y: [9; 32],
+            },
+            MidnightDidCallOperation::AddAssertionRelationship {
+                method_id: "#key-assertion".to_owned(),
+            },
+        ];
+
+        for operation in &operations {
+            operation.validate().expect("valid operation");
+        }
+        assert!(operations[0].clone().into_runtime().is_ok());
+        assert!(operations[1].clone().into_runtime().is_ok());
         assert!(matches!(
-            operation.into_runtime().expect("runtime call"),
-            RuntimeDidOperation::SetVerificationMethod { .. }
+            operations[2].clone().into_runtime(),
+            Err(DidLifecyclePortError::InvalidOperation)
         ));
+        assert!(operations[3].clone().into_runtime().is_ok());
+
+        let point = derive_public_key_from_seed(&[11; 32]);
+        let coordinate = |value: Option<runtime::Field>| {
+            value
+                .expect("fixture is not the identity")
+                .as_le_bytes()
+                .try_into()
+                .expect("canonical coordinate")
+        };
+        let valid_assertion = MidnightDidCallOperation::AddAssertionMethod {
+            method_id: "#key-assertion".to_owned(),
+            x: coordinate(point.x()),
+            y: coordinate(point.y()),
+        };
+        assert_eq!(valid_assertion.validate(), Ok(()));
+        assert!(matches!(
+            valid_assertion.into_runtime().expect("valid Jubjub key"),
+            RuntimeDidOperation::SetSchnorrJubjubVerificationMethod {
+                mutation: types::MapMutation::Insert,
+                ..
+            }
+        ));
+
+        assert_eq!(
+            MidnightDidCallOperation::AddAuthenticationMethod {
+                method_id: "not-a-fragment".to_owned(),
+                x: [7; 32],
+            }
+            .validate(),
+            Err(DidLifecyclePortError::InvalidOperation)
+        );
+        assert_eq!(
+            MidnightDidCallOperation::AddAssertionMethod {
+                method_id: "#key-assertion".to_owned(),
+                x: [0; 32],
+                y: [9; 32],
+            }
+            .validate(),
+            Err(DidLifecyclePortError::InvalidOperation)
+        );
     }
 
     #[test]
