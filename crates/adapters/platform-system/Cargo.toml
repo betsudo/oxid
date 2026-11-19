@@ -15,11 +15,13 @@ oxid-foundation.workspace = true
 oxid-platform-ports.workspace = true
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+jsonrpsee = { version = "=0.24.11", default-features = false, features = ["ws-client"] }
 reqwest.workspace = true
 rustls.workspace = true
 rustls-platform-verifier-07.workspace = true
 sysinfo.workspace = true
 tokio-tungstenite.workspace = true
+tracing = { version = "=0.1.44", default-features = false, features = ["std"] }
 url.workspace = true
 webpki-root-certs.workspace = true
 

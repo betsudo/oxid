@@ -290,12 +290,12 @@ async fn read_on_runtime(
 ) -> Result<PassportVaultContractStateSnapshot, PassportVaultContractStateSourceError> {
     let rpc_client = timeout(
         CONNECT_TIMEOUT,
-        RpcClient::from_insecure_url(&config.node_endpoint),
+        oxid_adapter_platform_system::connect_json_rpc_websocket(&config.node_endpoint),
     )
     .await
     .map_err(|_| PassportVaultContractStateSourceError::Unavailable)?
     .map_err(|_| PassportVaultContractStateSourceError::Unavailable)?;
-    let rpc = LegacyRpcMethods::<SubstrateConfig>::new(rpc_client);
+    let rpc = LegacyRpcMethods::<SubstrateConfig>::new(RpcClient::new(rpc_client));
     let finalized_head = timeout(CONNECT_TIMEOUT, rpc.chain_get_finalized_head())
         .await
         .map_err(|_| PassportVaultContractStateSourceError::Unavailable)?

@@ -39,14 +39,16 @@ use midnight_transient_crypto::{
         KeyLocation, Proof, ProofPreimage, ProvingKeyMaterial, ProvingProvider, Resolver, WrappedIr,
     },
 };
-use oxid_adapter_platform_system::{http_client_builder_for, websocket_connector_for};
+use oxid_adapter_platform_system::{
+    connect_json_rpc_websocket, http_client_builder_for, websocket_connector_for,
+};
 use oxid_platform_ports::ClockPort;
 use oxid_wallet_application::WalletTransactionPortError;
 use oxid_wallet_domain::WalletTransferSubmissionMode;
 use rand::rngs::OsRng;
 use reqwest::{Method, StatusCode, Url, header::CONTENT_TYPE};
 use serde_json::{Value, json};
-use subxt::{OnlineClient, SubstrateConfig, dynamic};
+use subxt::{OnlineClient, SubstrateConfig, backend::rpc::RpcClient, dynamic};
 use tokio::time::timeout;
 use tokio_tungstenite::tungstenite::{
     Message, client::IntoClientRequest, protocol::WebSocketConfig,
@@ -315,13 +317,10 @@ pub async fn authenticate_midnight_chain_identity(
 ) -> Result<(), MidnightChainIdentityError> {
     super::indexer::validate_websocket_url(node_websocket_url)
         .map_err(|_| MidnightChainIdentityError::InvalidNodeEndpoint)?;
-    let client = timeout(
-        CONNECT_TIMEOUT,
-        OnlineClient::<SubstrateConfig>::from_insecure_url(node_websocket_url),
-    )
-    .await
-    .map_err(|_| MidnightChainIdentityError::NodeUnavailable)?
-    .map_err(|_| MidnightChainIdentityError::NodeUnavailable)?;
+    let client = timeout(CONNECT_TIMEOUT, connect_midnight_node(node_websocket_url))
+        .await
+        .map_err(|_| MidnightChainIdentityError::NodeUnavailable)?
+        .map_err(|_| MidnightChainIdentityError::NodeUnavailable)?;
     let genesis_hash = client.genesis_hash();
     let observed: &[u8] = genesis_hash.as_ref();
     if observed == expected_genesis_hash {
@@ -329,6 +328,19 @@ pub async fn authenticate_midnight_chain_identity(
     } else {
         Err(MidnightChainIdentityError::GenesisMismatch)
     }
+}
+
+async fn connect_midnight_node(endpoint: &str) -> Result<OnlineClient<SubstrateConfig>, ()> {
+    let url = Url::parse(endpoint).map_err(|_| ())?;
+    if url.scheme() == "ws" && url.query().is_none() {
+        return OnlineClient::from_insecure_url(endpoint)
+            .await
+            .map_err(|_| ());
+    }
+    let client = connect_json_rpc_websocket(endpoint).await.map_err(|_| ())?;
+    OnlineClient::from_rpc_client(RpcClient::new(client))
+        .await
+        .map_err(|_| ())
 }
 
 #[derive(Clone)]
@@ -429,7 +441,7 @@ async fn reconcile_live_submission(
 ) -> Result<MidnightSubmissionReconciliation, WalletTransactionPortError> {
     let client = timeout(
         CONNECT_TIMEOUT,
-        OnlineClient::<SubstrateConfig>::from_insecure_url(config.node_websocket_url()),
+        connect_midnight_node(config.node_websocket_url()),
     )
     .await
     .map_err(|_| WalletTransactionPortError::Timeout)?
@@ -1566,13 +1578,10 @@ async fn submit_unsigned(
     request: &MidnightCompletionRequest,
     fee_specks: u128,
 ) -> Result<([u8; 32], [u8; 32], u64), WalletTransactionPortError> {
-    let client = timeout(
-        CONNECT_TIMEOUT,
-        OnlineClient::<SubstrateConfig>::from_insecure_url(endpoint),
-    )
-    .await
-    .map_err(|_| WalletTransactionPortError::Timeout)?
-    .map_err(|_| WalletTransactionPortError::Unavailable)?;
+    let client = timeout(CONNECT_TIMEOUT, connect_midnight_node(endpoint))
+        .await
+        .map_err(|_| WalletTransactionPortError::Timeout)?
+        .map_err(|_| WalletTransactionPortError::Unavailable)?;
     let call = dynamic::tx(
         "Midnight",
         "send_mn_transaction",
