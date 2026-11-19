@@ -16,7 +16,7 @@ const bigint = {
   advisory: { id: "RUSTSEC-2026-0387" }, package: { name: "crypto-bigint", version: "0.5.5" },
 };
 
-function audit(t, entries, graph = "", graphExit = 0) {
+function audit(t, entries, graph = "", graphExit = 0, day = "2026-11-19") {
   const directory = mkdtempSync(path.join(tmpdir(), "oxid-advisory-fixture-"));
   t.after(() => rmSync(directory, { recursive: true, force: true }));
   writeFileSync(path.join(directory, "cargo"), `#!/usr/bin/env bash
@@ -29,6 +29,7 @@ case "$1" in
   *) exit 2 ;;
 esac
 `, { mode: 0o700 });
+  writeFileSync(path.join(directory, "date"), '#!/usr/bin/env bash\nprintf "%s\\n" "$OXID_TEST_DAY"\n', { mode: 0o700 });
   return spawnSync("bash", [gate], {
     encoding: "utf8",
     env: {
@@ -37,6 +38,7 @@ esac
       OXID_TEST_AUDIT: JSON.stringify({ vulnerabilities: { found: true, list: entries } }),
       OXID_TEST_GRAPH: graph,
       OXID_TEST_GRAPH_EXIT: String(graphExit),
+      OXID_TEST_DAY: day,
     },
   });
 }
@@ -49,8 +51,15 @@ test("only the exact inactive ruzstd finding can pass", (t) => {
   assert.notEqual(audit(t, [{ ...ruzstd, package: { name: "ruzstd", version: "0.8.2" } }]).status, 0);
 });
 
-test("the inactive ruzstd exception leaves the active cryptography finding denied", (t) => {
-  const result = audit(t, [ruzstd, bigint]);
-  assert.notEqual(result.status, 0);
-  assert.match(result.stderr, /Denied: RUSTSEC-2026-0387 crypto-bigint 0.5.5/u);
+test("the active Ledger 9 exception reports residual risk and expires fail closed", (t) => {
+  const accepted = audit(t, [ruzstd, bigint], "", 0, "2026-12-02");
+  assert.equal(accepted.status, 0);
+  assert.match(accepted.stderr, /Warning: active finding RUSTSEC-2026-0387 crypto-bigint 0.5.5/u);
+  for (const day of ["2026-12-03", ""]) {
+    const denied = audit(t, [ruzstd, bigint], "", 0, day);
+    assert.notEqual(denied.status, 0);
+    assert.match(denied.stderr, /Denied: RUSTSEC-2026-0387 crypto-bigint 0.5.5/u);
+  }
+  const otherVersion = { ...bigint, package: { ...bigint.package, version: "0.6.1" } };
+  assert.notEqual(audit(t, [otherVersion]).status, 0);
 });

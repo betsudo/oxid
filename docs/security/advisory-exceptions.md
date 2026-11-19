@@ -99,6 +99,20 @@ its owning upstream graph drops the crate.
   graph query or any reachable path fails the gate. Remove this check when
   Subxt stops resolving the affected decompressor. See #1197.
 
+## Temporary Ledger 9 proving dependency exception
+
+- [RUSTSEC-2026-0387](https://rustsec.org/advisories/RUSTSEC-2026-0387.html)
+  applies to the active `crypto-bigint 0.5.5` dependency reached through the
+  pinned Midnight ZK and Compact curve dependencies. It can expose
+  secret-dependent timing. Oxid's direct custody dependencies resolve to the
+  fixed version, and the upstream selected graph still includes `0.5.5`.
+- The gate reports and accepts only that advisory and package version through
+  December 2, 2026 UTC. It denies the finding again on December 3. The
+  exception accepts residual risk while the shared Ledger 9 dependency cohort
+  is repaired. [Oxid #1197](https://github.com/betsudo/oxid/issues/1197) tracks
+  compatible upstream pins, focused cryptographic regression tests, and
+  removal of the exception.
+
 ## Yanked crate versions
 
 A yank is a **withdrawal** notice, not a vulnerability. `Cargo.lock` pins the

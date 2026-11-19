@@ -93,6 +93,14 @@ if [ "$(jq -r '.vulnerabilities.found' "$report")" != "false" ]; then
       echo "Note: $finding is present only in the inactive Subxt light-client lockfile graph (#1197)."
       continue
     fi
+    # #1197: time-limited acceptance of the active finding in the pinned
+    # Ledger 9 proving graph while the upstream curve migration is pending.
+    if [ "$finding" = "RUSTSEC-2026-0387 crypto-bigint 0.5.5" ] && \
+      audit_date="$(date -u +%F)" && \
+      [[ "$audit_date" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}$ && "$audit_date" < 2026-12-03 ]]; then
+      echo "Warning: active finding $finding accepted temporarily by #1197 through 2026-12-02 UTC." >&2
+      continue
+    fi
     echo "Denied: $finding" >&2
     failures=$((failures + 1))
   done <<< "$findings"
@@ -142,4 +150,4 @@ if [ "$failures" -ne 0 ]; then
   exit 1
 fi
 
-echo "Advisory gate passed: no vulnerabilities, no unmaintained or unsound findings, every yanked crate permitted."
+echo "Advisory gate passed under the documented policy."
