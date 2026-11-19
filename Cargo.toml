@@ -114,7 +114,7 @@ blake2 = { version = "=0.10.6" }
 bytes = { version = "=1.12.1" }
 chacha20poly1305 = { version = "=0.11.0", features = ["zeroize"] }
 ciborium = { version = "=0.2.2" }
-bip32 = { version = "=0.5.3", default-features = false, features = ["secp256k1", "std"] }
+bip32 = { version = "=0.6.0", default-features = false, features = ["secp256k1"] }
 bip39 = { version = "=2.2.2", default-features = false, features = ["std", "zeroize"] }
 dioxus = { version = "=0.7.10", default-features = false }
 dioxus-document = { version = "=0.7.10" }
@@ -129,7 +129,7 @@ hmac = { version = "=0.12.1" }
 jni = { version = "=0.21.1" }
 jni-022 = { package = "jni", version = "=0.22.4" }
 manganis = { version = "=0.7.10" }
-k256 = { version = "=0.13.4", default-features = false, features = ["schnorr", "std"] }
+k256 = { version = "=0.14.0", default-features = false, features = ["schnorr", "std"] }
 midnight-base-crypto = { version = "=1.1.1", git = "https://github.com/betsudo/midnight-ledger", rev = "6fbc2e3900845a858f70eebf8a0deab1d4d3c0d6", package = "midnight-base-crypto" }
 midnight-coin-structure = { version = "=3.0.1", git = "https://github.com/betsudo/midnight-ledger", rev = "6fbc2e3900845a858f70eebf8a0deab1d4d3c0d6", package = "midnight-coin-structure" }
 midnight-compact-runtime = { version = "=0.2.0", git = "https://github.com/betsudo/compact", rev = "d6513a24debac14d43a8199460d9dc2c6d9af2b1", package = "midnight-compact-runtime", features = ["experimental-functional"] }
