@@ -1,5 +1,8 @@
 # Ledger 9 local credential issuance
 
+For the physical standalone demo, use the
+[Android Tailnet scenario contract](ledger9-tailnet-issuance.md).
+
 ## Purpose
 
 This is the fast, local qualification lane for a native Ledger 9 holder DID and
@@ -113,9 +116,12 @@ The rendered handoff is:
 
 The repository-owned XCTest selector is
 `OxidUITests/PortalFlowTests/testPasteAndIssue`. The holder bootstrap selector
-is `testPrepareHolder`; the post-restart selector is `testRestored`. Build the
-XCTest bundle once, then use `test-without-building` for these selectors. Do
-not reinstall or reset app data between issuance and `testRestored`.
+is `testPrepareHolder`. Run `testFundedWalletRecoversAcrossRestart` next, on the
+same simulator and profile, to observe DUST readiness and the unchanged public
+NIGHT address after a process restart. Create the offer after that check to
+preserve its lifetime for issuance. The post-issuance restart selector is
+`testRestored`. Build the XCTest bundle once and reuse it with
+`test-without-building`. Preserve app data throughout the sequence.
 
 ### Restart and protected-store checks
 

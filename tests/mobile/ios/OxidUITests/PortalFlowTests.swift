@@ -341,6 +341,39 @@ final class PortalFlowTests: XCTestCase {
     }
 
     @MainActor
+    func testFundedWalletRecoversAcrossRestart() {
+        let application = application()
+        let receive = application.buttons["Receive"]
+        let addressElement = application.descendants(matching: .any)
+            .matching(NSPredicate(format: "label BEGINSWITH %@", "Full validated raw Unshielded receive address "))
+            .firstMatch
+        let dustReady = application.descendants(matching: .any)["DUST Ready"].firstMatch
+
+        func readReceiveLabel() -> String {
+            application.buttons["Home"].tap()
+            XCTAssertTrue(receive.waitForExistence(timeout: 10))
+            receive.tap()
+            XCTAssertTrue(addressElement.waitForExistence(timeout: 15))
+            let label = addressElement.label
+            application.buttons["Close Receive"].firstMatch.tap()
+            return label
+        }
+
+        let before = readReceiveLabel()
+        application.buttons["Wallet"].tap()
+        XCTAssertTrue(dustReady.waitForExistence(timeout: 120), "Funded wallet did not reach DUST Ready.")
+        application.terminate()
+        XCTAssertTrue(application.wait(for: .notRunning, timeout: 15))
+        application.launch()
+        XCTAssertTrue(application.buttons["Wallet"].waitForExistence(timeout: 20))
+        application.buttons["Wallet"].tap()
+        XCTAssertTrue(application.buttons["Use my receive address"].waitForExistence(timeout: 45))
+        XCTAssertFalse(application.staticTexts["Restore this wallet to continue"].exists)
+        XCTAssertTrue(dustReady.waitForExistence(timeout: 180), "Funded wallet did not recover DUST after restart.")
+        XCTAssertTrue(readReceiveLabel() == before, "Public NIGHT receive address changed after restart.")
+    }
+
+    @MainActor
     func testRouteRefuse() {
         let application = application()
         _ = preparePreview(in: application)

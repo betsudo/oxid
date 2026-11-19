@@ -445,7 +445,7 @@ pub(super) fn parse_portal_credential_response(
     }
     let private_json = compact_private_json(midnight.credential_private_parts)?;
     let private_material = decoder
-        .decode(&signed, private_json.as_slice())
+        .decode(&signed, private_json.as_slice(), expected_binding_method)
         .map_err(|error| match error {
             PortalCredentialMaterialError::Invalid => {
                 IssuanceProtocolError::InvalidCredentialResponse

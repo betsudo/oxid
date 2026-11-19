@@ -35,15 +35,17 @@ fn deployment_resolver_base_accepts_the_exact_tailnet_prefix() {
     );
 }
 
-const HOLDER_DID: &str = "did:example:synthetic-holder";
-const AUTH_METHOD: &str = "did:example:synthetic-holder#auth";
-const BINDING_METHOD: &str = "did:example:synthetic-holder#assert";
-const AUTHORITY_DID: &str =
-    "did:midnight:undeployed:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+const HOLDER_DID: &str =
+    "did:midnight:undeployed:1111111111111111111111111111111111111111111111111111111111111111";
+const AUTH_METHOD: &str =
+    "did:midnight:undeployed:1111111111111111111111111111111111111111111111111111111111111111#auth";
+const BINDING_METHOD: &str = "did:midnight:undeployed:1111111111111111111111111111111111111111111111111111111111111111#assert";
 const POSITIVE_ROOT: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/../../../fixtures/laceid-portal/76e8edf394a4cb37ca822037272d543c68f25f71/openid4vci-final"
 );
+const FIXTURE_HOLDER_DID: &str = "did:example:synthetic-holder";
+const FIXTURE_BINDING_METHOD: &str = "did:example:synthetic-holder#assert";
 
 struct Proof;
 
@@ -58,8 +60,8 @@ fn authority(profile: &ProtocolProfileId, session_id: &str) -> AcceptedCredentia
     CredentialIssuanceFlowService::new(Arc::new(IssuanceClock))
         .mint(AcceptedCredentialIssuanceContext::new(
             IdentityProfileId::parse(profile.as_str().to_owned()).expect("identity profile"),
-            MidnightDid::parse(AUTHORITY_DID).expect("authority DID"),
-            format!("{AUTHORITY_DID}#auth"),
+            MidnightDid::parse(HOLDER_DID).expect("authority DID"),
+            AUTH_METHOD.to_owned(),
             OID4VCI_CREDENTIAL_ISSUANCE_FLOW_ID,
             session_id,
         ))
@@ -87,17 +89,23 @@ struct Did;
 
 impl GetDidRecordUseCase for Did {
     fn execute(&self, query: DidRecordQuery) -> Result<DidRecordView, DidOperationError> {
+        let did = query.did;
+        let network = MidnightDid::parse(did.as_str())
+            .expect("fixture DID")
+            .network();
+        let auth_method = format!("{did}#auth");
+        let binding_method = format!("{did}#assert");
         Ok(DidRecordView {
             refresh_availability: DidRefreshAvailability::Unavailable,
             document: DidDocumentView {
                 contexts: vec![],
-                id: query.did,
-                network: "undeployed".to_owned(),
+                id: did.clone(),
+                network: network.as_str().to_owned(),
                 also_known_as: vec![],
                 verification_methods: vec![
                     VerificationMethodView {
-                        id: AUTH_METHOD.to_owned(),
-                        controller: HOLDER_DID.to_owned(),
+                        id: auth_method.clone(),
+                        controller: did.clone(),
                         public_key_jwk: PublicJwkView {
                             key_type: "OKP".to_owned(),
                             curve: "Ed25519".to_owned(),
@@ -106,8 +114,8 @@ impl GetDidRecordUseCase for Did {
                         },
                     },
                     VerificationMethodView {
-                        id: BINDING_METHOD.to_owned(),
-                        controller: HOLDER_DID.to_owned(),
+                        id: binding_method.clone(),
+                        controller: did,
                         public_key_jwk: PublicJwkView {
                             key_type: "EC".to_owned(),
                             curve: "Jubjub".to_owned(),
@@ -119,11 +127,11 @@ impl GetDidRecordUseCase for Did {
                 relationships: vec![
                     VerificationRelationshipView {
                         relationship: "authentication".to_owned(),
-                        method_ids: vec![AUTH_METHOD.to_owned()],
+                        method_ids: vec![auth_method.clone()],
                     },
                     VerificationRelationshipView {
                         relationship: "assertionMethod".to_owned(),
-                        method_ids: vec![BINDING_METHOD.to_owned()],
+                        method_ids: vec![binding_method.clone()],
                     },
                 ],
                 services: vec![],
@@ -140,7 +148,7 @@ impl GetDidRecordUseCase for Did {
             },
             content_type: None,
             source: "managed".to_owned(),
-            managed_method_ids: vec![AUTH_METHOD.to_owned(), BINDING_METHOD.to_owned()],
+            managed_method_ids: vec![auth_method, binding_method],
         })
     }
 }
@@ -152,9 +160,14 @@ impl PortalCredentialMaterialDecoder for Decoder {
         &self,
         signed_credential: &[u8],
         private_json: &[u8],
+        expected_binding_method: &str,
     ) -> Result<Vec<u8>, PortalCredentialMaterialError> {
         if signed_credential == b"synthetic-signed-bytes"
             && private_json == br#"{"synthetic":"private-parts-contract-value"}"#
+            && matches!(
+                expected_binding_method,
+                BINDING_METHOD | FIXTURE_BINDING_METHOD
+            )
         {
             Ok(b"decoded-private".to_vec())
         } else {
@@ -166,7 +179,12 @@ impl PortalCredentialMaterialDecoder for Decoder {
 struct UnavailableDecoder;
 
 impl PortalCredentialMaterialDecoder for UnavailableDecoder {
-    fn decode(&self, _: &[u8], _: &[u8]) -> Result<Vec<u8>, PortalCredentialMaterialError> {
+    fn decode(
+        &self,
+        _: &[u8],
+        _: &[u8],
+        _: &str,
+    ) -> Result<Vec<u8>, PortalCredentialMaterialError> {
         Err(PortalCredentialMaterialError::Unavailable)
     }
 }
@@ -190,6 +208,7 @@ fn deployment(origin: &str) -> PortalDeploymentManifest {
             issuer_resolver_origin: origin.to_owned(),
             provenance_sha256: PORTAL_PROVENANCE_SHA256.to_owned(),
             schema: "oxid-portal-deployment-v3".to_owned(),
+            tailnet_origin: None,
         };
     let bytes = serde_json::to_vec(&manifest).expect("manifest");
     PortalDeploymentManifest::from_bytes(&bytes, &sha256_hex(&bytes)).expect("deployment")
@@ -357,8 +376,8 @@ fn exact_public_positive_and_negative_profile_fixtures_are_final_only() {
         .expect("credential response");
     let issued = parse_portal_credential_response(
         &response,
-        HOLDER_DID,
-        BINDING_METHOD,
+        FIXTURE_HOLDER_DID,
+        FIXTURE_BINDING_METHOD,
         "SYNTHETIC_NONCE",
         &Decoder,
     )
@@ -373,8 +392,8 @@ fn exact_public_positive_and_negative_profile_fixtures_are_final_only() {
         assert!(
             parse_portal_credential_response(
                 &bytes,
-                HOLDER_DID,
-                BINDING_METHOD,
+                FIXTURE_HOLDER_DID,
+                FIXTURE_BINDING_METHOD,
                 "SYNTHETIC_NONCE",
                 &Decoder
             )
@@ -397,8 +416,8 @@ fn credential_response_rejects_duplicate_fields_and_preserves_decoder_errors() {
     assert!(
         parse_portal_credential_response(
             duplicate.as_bytes(),
-            HOLDER_DID,
-            BINDING_METHOD,
+            FIXTURE_HOLDER_DID,
+            FIXTURE_BINDING_METHOD,
             "SYNTHETIC_NONCE",
             &Decoder,
         )
@@ -407,8 +426,8 @@ fn credential_response_rejects_duplicate_fields_and_preserves_decoder_errors() {
     assert_eq!(
         parse_portal_credential_response(
             &vec![b' '; MAX_CREDENTIAL_BYTES + 1],
-            HOLDER_DID,
-            BINDING_METHOD,
+            FIXTURE_HOLDER_DID,
+            FIXTURE_BINDING_METHOD,
             "SYNTHETIC_NONCE",
             &Decoder,
         ),
@@ -429,8 +448,8 @@ fn credential_response_rejects_duplicate_fields_and_preserves_decoder_errors() {
     assert_eq!(
         parse_portal_credential_response(
             too_deep.as_bytes(),
-            HOLDER_DID,
-            BINDING_METHOD,
+            FIXTURE_HOLDER_DID,
+            FIXTURE_BINDING_METHOD,
             "SYNTHETIC_NONCE",
             &Decoder,
         ),
@@ -439,8 +458,8 @@ fn credential_response_rejects_duplicate_fields_and_preserves_decoder_errors() {
     assert_eq!(
         parse_portal_credential_response(
             &response,
-            HOLDER_DID,
-            BINDING_METHOD,
+            FIXTURE_HOLDER_DID,
+            FIXTURE_BINDING_METHOD,
             "SYNTHETIC_NONCE",
             &UnavailableDecoder,
         ),
@@ -496,6 +515,34 @@ async fn unmanaged_authentication_is_rejected_before_token_nonce_or_credential_c
         })
         .await
         .expect_err("unmanaged authentication method must fail");
+    assert_eq!(error, IssuanceProtocolError::InvalidProof);
+    server.await.expect("server");
+    assert_eq!(journal.lock().expect("journal").len(), 2);
+}
+
+#[tokio::test]
+async fn wrong_network_holder_is_rejected_before_secret_posts() {
+    let (origin, journal, server) = spawn_server(2, StatusCode::OK).await;
+    let client = protocol(&origin);
+    let profile = ProtocolProfileId::parse("profile_1").expect("profile");
+    let prepared = client
+        .prepare(PrepareIssuanceRequest {
+            profile_id: profile.clone(),
+            offer: offer(&origin),
+        })
+        .await
+        .expect("prepare");
+    let error = client
+        .issue(ProtocolIssueRequest {
+            authority: authority(&profile, prepared.id.as_str()),
+            profile_id: profile,
+            issuance_id: prepared.id,
+            holder_did: HOLDER_DID.replacen(":undeployed:", ":preview:", 1),
+            method_id: AUTH_METHOD.replacen(":undeployed:", ":preview:", 1),
+            holder_binding_method_id: BINDING_METHOD.replacen(":undeployed:", ":preview:", 1),
+        })
+        .await
+        .expect_err("holder DID from another network must fail");
     assert_eq!(error, IssuanceProtocolError::InvalidProof);
     server.await.expect("server");
     assert_eq!(journal.lock().expect("journal").len(), 2);

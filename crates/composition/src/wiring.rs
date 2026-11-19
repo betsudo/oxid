@@ -908,10 +908,18 @@ where
         Arc::new(UnavailablePortableWalletBackupDocuments);
     let presentation_credential_repository = Arc::clone(&credential_repository);
     let vault_credential_repository = Arc::clone(&credential_repository);
-    let standalone_passport_vault = !matches!(
-        &credential_issuance,
-        CredentialIssuanceComposition::Unavailable
-    );
+    #[cfg(all(feature = "mobile-portal-tailnet", target_os = "android"))]
+    let ledger9_tailnet_issuance = match &credential_issuance {
+        CredentialIssuanceComposition::Portal(factory) => factory.deployment().is_ledger9_tailnet(),
+        _ => false,
+    };
+    #[cfg(not(all(feature = "mobile-portal-tailnet", target_os = "android")))]
+    let ledger9_tailnet_issuance = false;
+    let standalone_passport_vault = !ledger9_tailnet_issuance
+        && !matches!(
+            &credential_issuance,
+            CredentialIssuanceComposition::Unavailable
+        );
     #[cfg(not(target_arch = "wasm32"))]
     let compact_presentation_proof_available = match &credential_presentation {
         CredentialPresentationComposition::StandaloneZk(_) => true,
@@ -1022,9 +1030,10 @@ where
             publisher,
         )) as Arc<dyn PublishDidUseCase>
     });
-    let credential_issuance_authority = did_approvals
-        .as_ref()
-        .map(|_| Arc::new(CredentialIssuanceFlowService::new(clock.clone())));
+    // The protocol mints this single-use authority only after accepting the
+    // exact prepared offer. Generic DID approvals remain unavailable on Tailnet.
+    let credential_issuance_authority = (did_approvals.is_some() || ledger9_tailnet_issuance)
+        .then(|| Arc::new(CredentialIssuanceFlowService::new(clock.clone())));
     let self_issued_authentication_authority = did_approvals
         .as_ref()
         .map(|_| Arc::new(SelfIssuedAuthenticationFlowService::new(clock.clone())));

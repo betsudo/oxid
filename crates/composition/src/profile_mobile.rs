@@ -753,7 +753,11 @@ where
         profiles,
     } = storage;
     let network_id = config.indexer().network_id().as_str().to_owned();
-    let passport_vault_state_source = node_anchored_passport_vault_state_source(&config);
+    let passport_vault_state_source = if portal.client_factory.deployment().is_ledger9_tailnet() {
+        None
+    } else {
+        node_anchored_passport_vault_state_source(&config)
+    };
     let did_config = config.clone();
     let private_store = profiles
         .configured_path()

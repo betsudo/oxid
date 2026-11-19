@@ -1,5 +1,9 @@
 # Portal physical Android Tailnet lane
 
+The [native Ledger 9 scenario contract](ledger9-tailnet-issuance.md) governs
+the current Android Tailnet issuance demo. The conformance lane below covers
+the earlier Portal harness.
+
 ## Purpose and boundary
 
 This owner-invoked L4 lane runs the Lace ID Portal conformance journey on one

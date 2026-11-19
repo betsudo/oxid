@@ -5,7 +5,6 @@ use std::{
     sync::atomic::{AtomicU64, Ordering},
 };
 
-use base64::{Engine as _, engine::general_purpose};
 use sha2::{Digest as _, Sha256};
 
 use super::*;
@@ -127,7 +126,7 @@ fn deployment_manifest_requires_exact_digest_source_profile_and_canonical_public
 }
 
 #[test]
-fn ledger9_source_is_authenticated_only_for_the_pinned_local_routes() {
+fn ledger9_source_requires_pinned_local_or_authenticated_tailnet_routes() {
     let tree = "4f9952cebd0e9cc8a82ec9d459d2eadc9cce8adb";
     let provenance = "70f67a9f339ca0756ca4d10f5bef9dea769746094076288b8f571d93cb9c51fc";
     let manifest = String::from_utf8(manifest_bytes("http://127.0.0.1:8090"))
@@ -179,6 +178,38 @@ fn ledger9_source_is_authenticated_only_for_the_pinned_local_routes() {
             Some(error)
         );
     }
+
+    let tailnet_origin = "https://wallet-demo.example.ts.net:11003";
+    let tailnet_manifest = manifest
+        .replace("http://127.0.0.1:8090", tailnet_origin)
+        .replace(
+            "http://127.0.0.1:9092",
+            &format!("{tailnet_origin}/issuer-resolver"),
+        );
+    let authenticate_tailnet = |manifest: &str, origin: &str| {
+        let bytes = manifest.as_bytes();
+        PortalDeploymentManifest::from_tailnet_bytes(bytes, &sha256(bytes), origin)
+    };
+    let authenticated = authenticate_tailnet(&tailnet_manifest, tailnet_origin)
+        .expect("exact Ledger 9 Tailnet routes authenticate");
+    assert!(authenticated.is_ledger9_tailnet());
+    assert!(PortalOid4vciClientFactory::new(authenticated).is_ok());
+    assert_eq!(
+        authenticate(&tailnet_manifest).err(),
+        Some(PortalDeploymentManifestError::InvalidOrigin)
+    );
+    assert_eq!(
+        authenticate_tailnet(&tailnet_manifest, "https://other.example.ts.net:11003").err(),
+        Some(PortalDeploymentManifestError::InvalidOrigin)
+    );
+    assert_eq!(
+        authenticate_tailnet(
+            &tailnet_manifest.replace("/issuer-resolver", "/other"),
+            tailnet_origin
+        )
+        .err(),
+        Some(PortalDeploymentManifestError::InvalidOrigin)
+    );
 }
 
 #[test]

@@ -126,11 +126,15 @@ impl PortalIdentityConfiguration {
         expected_sha256: &str,
         public_origin: &str,
     ) -> Result<Self, PortalIdentityConfigurationError> {
-        let deployment = PortalDeploymentManifest::from_bytes(bytes, expected_sha256)
-            .map_err(PortalIdentityConfigurationError::Manifest)?;
-        validate_tailnet_harness_origins(&deployment, public_origin)?;
         let ingress = NativeIdentityLinkIngress::standalone_portal_tailnet(public_origin)
             .map_err(|_| PortalIdentityConfigurationError::InvalidOfferIngress)?;
+        let deployment =
+            PortalDeploymentManifest::from_tailnet_bytes(bytes, expected_sha256, public_origin)
+                .map_err(PortalIdentityConfigurationError::Manifest)?;
+        validate_tailnet_harness_origins(&deployment, public_origin)?;
+        if deployment.is_ledger9_tailnet() {
+            return Self::new(deployment, Some(Arc::new(ingress)), None);
+        }
         let publisher = PortalTailnetDidPublisher::new(public_origin)
             .map_err(|_| PortalIdentityConfigurationError::InvalidDidPublisher)?;
         Self::new(
@@ -219,7 +223,13 @@ impl PortalCredentialMaterialDecoder for PortalPrivateMaterialDecoder {
         &self,
         signed_credential: &[u8],
         portal_private_json: &[u8],
+        expected_binding_method: &str,
     ) -> Result<Vec<u8>, PortalCredentialMaterialError> {
+        oxid_adapter_vc_midnight::validate_compact_holder_binding(
+            signed_credential,
+            expected_binding_method,
+        )
+        .map_err(|_| PortalCredentialMaterialError::Invalid)?;
         convert_portal_private_parts(signed_credential, portal_private_json)
             .map_err(|_| PortalCredentialMaterialError::Invalid)
     }

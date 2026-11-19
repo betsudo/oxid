@@ -14,7 +14,7 @@ use std::{
 use base64::{Engine as _, engine::general_purpose};
 use futures::StreamExt as _;
 use oxid_adapter_platform_system::http_client_builder_for;
-use oxid_identity_application::GetDidRecordUseCase;
+use oxid_identity_application::{GetDidRecordUseCase, MidnightDid, MidnightNetwork};
 use oxid_protocol_application::{
     CredentialHolderProofPort, CredentialIssuanceProtocolPort, HolderProofRequest,
     IssuanceProtocolError, IssueCredentialPortFuture, IssuedCredentialBytes,
@@ -170,6 +170,8 @@ pub struct PortalDeploymentManifest {
     issuer_resolver_origin: String,
     provenance_sha256: String,
     schema: String,
+    #[serde(skip)]
+    tailnet_origin: Option<String>,
 }
 
 impl PortalDeploymentManifest {
@@ -216,6 +218,23 @@ impl PortalDeploymentManifest {
         bytes: &[u8],
         expected_sha256: &str,
     ) -> Result<Self, PortalDeploymentManifestError> {
+        Self::parse(bytes, expected_sha256, None)
+    }
+
+    /// The caller supplies the origin bound to the authenticated app build.
+    pub fn from_tailnet_bytes(
+        bytes: &[u8],
+        expected_sha256: &str,
+        public_origin: &str,
+    ) -> Result<Self, PortalDeploymentManifestError> {
+        Self::parse(bytes, expected_sha256, Some(public_origin))
+    }
+
+    fn parse(
+        bytes: &[u8],
+        expected_sha256: &str,
+        tailnet_origin: Option<&str>,
+    ) -> Result<Self, PortalDeploymentManifestError> {
         validate_sha256(expected_sha256)?;
         if bytes.is_empty() || bytes.len() > MAX_DEPLOYMENT_MANIFEST_BYTES {
             return Err(PortalDeploymentManifestError::InvalidManifest);
@@ -224,7 +243,7 @@ impl PortalDeploymentManifest {
             return Err(PortalDeploymentManifestError::DigestMismatch);
         }
         let mut deserializer = serde_json::Deserializer::from_slice(bytes);
-        let manifest = Self::deserialize(&mut deserializer)
+        let mut manifest = Self::deserialize(&mut deserializer)
             .map_err(|_| PortalDeploymentManifestError::InvalidManifest)?;
         deserializer
             .end()
@@ -234,6 +253,7 @@ impl PortalDeploymentManifest {
         if canonical != bytes {
             return Err(PortalDeploymentManifestError::InvalidManifest);
         }
+        manifest.tailnet_origin = tailnet_origin.map(str::to_owned);
         manifest.validate()?;
         Ok(manifest)
     }
@@ -245,9 +265,23 @@ impl PortalDeploymentManifest {
         let source = if BUNDLED_SOURCE.matches(self) {
             &BUNDLED_SOURCE
         } else if LEDGER9_SOURCE.matches(self) {
-            if self.issuer_origin != "http://127.0.0.1:8090"
-                || self.issuer_resolver_origin != "http://127.0.0.1:9092"
-            {
+            let routes_match = match self.tailnet_origin.as_deref() {
+                None => {
+                    self.issuer_origin == "http://127.0.0.1:8090"
+                        && self.issuer_resolver_origin == "http://127.0.0.1:9092"
+                }
+                Some(origin) => {
+                    let url = validate_transport_base(origin)?;
+                    url.scheme() == "https"
+                        && url.host_str().is_some_and(|host| host.ends_with(".ts.net"))
+                        && url
+                            .port()
+                            .is_some_and(|port| port >= 1024 && !matches!(port, 8443 | 10_000))
+                        && self.issuer_origin == origin
+                        && self.issuer_resolver_origin == format!("{origin}/issuer-resolver")
+                }
+            };
+            if !routes_match {
                 return Err(PortalDeploymentManifestError::InvalidOrigin);
             }
             &LEDGER9_SOURCE
@@ -294,6 +328,11 @@ impl PortalDeploymentManifest {
     #[must_use]
     pub fn uses_ledger9_jubjub_jwk(&self) -> bool {
         LEDGER9_SOURCE.matches(self)
+    }
+
+    #[must_use]
+    pub fn is_ledger9_tailnet(&self) -> bool {
+        self.tailnet_origin.is_some() && self.uses_ledger9_jubjub_jwk()
     }
 
     #[must_use]
@@ -465,6 +504,7 @@ pub trait PortalCredentialMaterialDecoder: Send + Sync {
         &self,
         signed_credential: &[u8],
         portal_private_json: &[u8],
+        expected_binding_method: &str,
     ) -> Result<Vec<u8>, PortalCredentialMaterialError>;
 }
 
@@ -744,6 +784,13 @@ impl PortalOid4vciClient {
         if secret.profile_id != request.profile_id.as_str()
             || request.method_id == request.holder_binding_method_id
         {
+            return Err(IssuanceProtocolError::InvalidProof);
+        }
+        let holder = MidnightDid::parse(request.holder_did.as_str())
+            .map_err(|_| IssuanceProtocolError::InvalidProof)?;
+        let issuer = MidnightDid::parse(self.deployment.issuer_did())
+            .map_err(|_| IssuanceProtocolError::InvalidMetadata)?;
+        if holder.network() == MidnightNetwork::Offchain || holder.network() != issuer.network() {
             return Err(IssuanceProtocolError::InvalidProof);
         }
         validate_managed_authentication_method(

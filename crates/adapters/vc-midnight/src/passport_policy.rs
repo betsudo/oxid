@@ -11,7 +11,7 @@ use midnight_transient_crypto::{
     fab::ValueReprAlignedValue,
 };
 use oxid_credential_domain::VerificationOutcome;
-use oxid_identity_domain::MidnightDid;
+use oxid_identity_domain::{MidnightDid, MidnightNetwork};
 use sha2::{Digest as _, Sha256};
 
 use crate::{
@@ -24,7 +24,7 @@ use crate::{
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DigitalPassportIssuerTrustAnchor {
-    issuer_did: String,
+    issuer_did: MidnightDid,
     method_id: [u8; 32],
     public_key: [u8; 64],
     public_key_hash: [u8; 32],
@@ -123,8 +123,11 @@ impl DigitalPassportIssuerTrustAnchor {
         expected_jwk_sha256: &str,
         jwk_coordinates: JubjubJwkCoordinates,
     ) -> Result<Self, DigitalPassportIssuerTrustAnchorError> {
-        MidnightDid::parse(issuer_did.to_owned())
+        let parsed_issuer = MidnightDid::parse(issuer_did.to_owned())
             .map_err(|_| DigitalPassportIssuerTrustAnchorError::InvalidIssuer)?;
+        if parsed_issuer.network() == MidnightNetwork::Offchain {
+            return Err(DigitalPassportIssuerTrustAnchorError::InvalidIssuer);
+        }
         let fragment = issuer_method
             .strip_prefix(issuer_did)
             .filter(|value| value.starts_with('#'))
@@ -167,7 +170,7 @@ impl DigitalPassportIssuerTrustAnchor {
             return Err(DigitalPassportIssuerTrustAnchorError::PublicKeyDigestMismatch);
         }
         Ok(Self {
-            issuer_did: issuer_did.to_owned(),
+            issuer_did: parsed_issuer,
             method_id,
             public_key: point_bytes(point)
                 .ok_or(DigitalPassportIssuerTrustAnchorError::InvalidPublicKey)?,
@@ -178,7 +181,11 @@ impl DigitalPassportIssuerTrustAnchor {
 
     #[must_use]
     pub fn issuer_did(&self) -> &str {
-        &self.issuer_did
+        self.issuer_did.as_str()
+    }
+
+    pub(crate) const fn network(&self) -> MidnightNetwork {
+        self.issuer_did.network()
     }
 
     #[must_use]
@@ -197,7 +204,7 @@ impl DigitalPassportIssuerTrustAnchor {
         method_id: &[u8; 32],
         public_key: &[u8; 64],
     ) -> bool {
-        self.issuer_did == issuer_did
+        self.issuer_did.as_str() == issuer_did
             && &self.method_id == method_id
             && &self.public_key == public_key
     }
@@ -240,10 +247,11 @@ pub fn standalone_digital_passport_issuer_trust_anchor() -> DigitalPassportIssue
     let proof = parse_proof(&standalone_compact_proof())
         .expect("checked-in standalone proof must remain valid");
     DigitalPassportIssuerTrustAnchor {
-        issuer_did: format!(
+        issuer_did: MidnightDid::parse(format!(
             "did:midnight:undeployed:{}",
             hex::encode(credential.issuer.did_contract_address)
-        ),
+        ))
+        .expect("standalone issuer DID"),
         method_id: credential.issuer.method_id,
         public_key: point_bytes(proof.public_key)
             .expect("checked-in standalone issuer key must be affine"),
@@ -277,7 +285,7 @@ pub fn verify_digital_passport_policy(
         "did:midnight:undeployed:{}",
         hex::encode(credential.issuer.did_contract_address)
     );
-    if issuer_did != trust_anchor.issuer_did
+    if issuer_did != trust_anchor.issuer_did()
         || credential.issuer.method_id != trust_anchor.method_id
         || proof.signer != credential.issuer
         || point_bytes(proof.public_key).as_ref() != Some(&trust_anchor.public_key)
