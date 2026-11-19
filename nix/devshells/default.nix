@@ -5,17 +5,24 @@
     { pkgs, self', ... }:
     let
       midnightDidPackages = inputs.midnight-did-toolchain.packages.${pkgs.stdenv.hostPlatform.system};
-      rustToolchain = inputs.fenix.packages.${pkgs.stdenv.hostPlatform.system}.toolchainOf {
+      fenix = inputs.fenix.packages.${pkgs.stdenv.hostPlatform.system};
+      rustToolchainSpec = {
         channel = "1.99.0";
         sha256 = "sha256-zm3dyIY2T414ZRR3EhLOvptzG6gta4WZUcawzMUWtqI=";
       };
-      rustComponents = rustToolchain.withComponents [
+      rustToolchain = fenix.toolchainOf rustToolchainSpec;
+      rustComponentNames = [
         "cargo"
         "clippy"
         "rust-src"
         "rustc"
         "rustfmt"
       ];
+      rustComponents = rustToolchain.withComponents rustComponentNames;
+      wasmToolchain = fenix.targets.wasm32-unknown-unknown.toolchainOf rustToolchainSpec;
+      uiRustComponents = fenix.combine (
+        (map (name: rustToolchain.${name}) rustComponentNames) ++ [ wasmToolchain.rust-std ]
+      );
       linuxLibraries = pkgs.lib.optionals pkgs.stdenv.hostPlatform.isLinux [
         pkgs.glib
         pkgs.gtk3
@@ -23,14 +30,14 @@
         pkgs.webkitgtk_4_1
         pkgs.xdotool
       ];
-      ciRustPackages = with pkgs; [
+      ciToolPackages = with pkgs; [
         git
         nodejs_24
         pkg-config
         ripgrep
-        rustComponents
         sccache
       ];
+      ciRustPackages = ciToolPackages ++ [ rustComponents ];
       ciQualityPackages =
         ciRustPackages
         ++ (with pkgs; [
@@ -73,7 +80,7 @@
       };
 
       devShells.ci-ui = pkgs.mkShell {
-        packages = ciRustPackages;
+        packages = ciToolPackages ++ [ uiRustComponents ];
         buildInputs = [ pkgs.openssl ] ++ linuxLibraries;
         shellHook = ''
           ${ciRustShellHook}
