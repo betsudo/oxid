@@ -45,6 +45,8 @@ use super::portal::PortalIdentityConfiguration;
     )
 ))]
 use oxid_adapter_midnight::MidnightStandaloneConfig;
+#[cfg(not(target_arch = "wasm32"))]
+use oxid_adapter_midnight::MidnightSubmissionJournalConfig;
 #[cfg(all(
     not(target_arch = "wasm32"),
     any(
@@ -55,7 +57,11 @@ use oxid_adapter_midnight::MidnightStandaloneConfig;
         )
     )
 ))]
-use oxid_adapter_midnight::protected_standalone_midnight_wallet_with_checkpoint_options_and_proving_material;
+use oxid_adapter_midnight::{
+    MidnightAccountCheckpointConfig, MidnightDustCheckpointConfig,
+    MidnightShieldedCheckpointConfig,
+    protected_standalone_midnight_wallet_with_checkpoint_options_and_proving_material,
+};
 #[cfg(all(
     not(target_arch = "wasm32"),
     any(
@@ -68,7 +74,7 @@ use oxid_adapter_midnight::protected_standalone_midnight_wallet_with_checkpoint_
 use oxid_adapter_midnight::{MidnightIndexerConfigError, MidnightStandaloneConfigError};
 #[cfg(any(target_os = "ios", target_os = "android"))]
 use oxid_adapter_midnight::{
-    MidnightSubmissionJournalConfig, protected_simulated_midnight_wallet,
+    protected_simulated_midnight_wallet,
     protected_simulated_midnight_wallet_with_submission_journal,
 };
 
@@ -749,13 +755,31 @@ where
     let network_id = config.indexer().network_id().as_str().to_owned();
     let passport_vault_state_source = node_anchored_passport_vault_state_source(&config);
     let did_config = config.clone();
+    let private_store = profiles
+        .configured_path()
+        .and_then(|profile_path| profile_path.parent())
+        .map(|directory| directory.join("private"));
+    let account_checkpoints = private_store.as_ref().and_then(|directory| {
+        MidnightAccountCheckpointConfig::new(directory.join("midnight-account-checkpoints.json"))
+            .ok()
+    });
+    let dust_checkpoints = private_store.as_ref().and_then(|directory| {
+        MidnightDustCheckpointConfig::new(directory.join("midnight-dust-checkpoints.bin")).ok()
+    });
+    let shielded_checkpoints = private_store.as_ref().and_then(|directory| {
+        MidnightShieldedCheckpointConfig::new(directory.join("midnight-shielded-checkpoints.bin"))
+            .ok()
+    });
+    let submission_journal = private_store.as_ref().and_then(|directory| {
+        MidnightSubmissionJournalConfig::new(directory.join("midnight-submissions.json")).ok()
+    });
     let midnight = Arc::new(
         protected_standalone_midnight_wallet_with_checkpoint_options_and_proving_material(
             config,
-            None,
-            None,
-            None,
-            None,
+            account_checkpoints,
+            dust_checkpoints,
+            shielded_checkpoints,
+            submission_journal,
             native_did_proving_material(),
             Arc::clone(&clock),
             Arc::clone(&security),
