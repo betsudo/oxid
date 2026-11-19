@@ -80,6 +80,37 @@ impl AuthenticatedProductionDeployment {
     pub const fn profile(&self) -> &AuthenticatedDeploymentProfile {
         &self.profile
     }
+
+    /// Binds the reviewed Portal manifest to the same signed profile and
+    /// genesis check used for the native wallet. A profile without an issuance
+    /// pin remains an observation profile.
+    #[cfg(any(
+        feature = "mobile-portal",
+        not(any(target_os = "ios", target_os = "android"))
+    ))]
+    pub fn authenticate_portal_manifest(
+        &self,
+        bytes: &[u8],
+    ) -> Result<
+        oxid_adapter_openid4vci::PortalDeploymentManifest,
+        ProductionDeploymentCompositionError,
+    > {
+        let ssi = self.profile.ssi();
+        let digest = ssi
+            .portal_manifest_sha256()
+            .ok_or(ProductionDeploymentCompositionError::InvalidSsiProfile)?;
+        let network =
+            oxid_identity_application::MidnightNetwork::parse(self.profile.midnight().network_id())
+                .ok_or(ProductionDeploymentCompositionError::InvalidSsiProfile)?;
+        oxid_adapter_openid4vci::PortalDeploymentManifest::from_public_bytes(
+            bytes,
+            digest,
+            network,
+            ssi.issuer_metadata_url(),
+            ssi.did_resolver_url(),
+        )
+        .map_err(|_| ProductionDeploymentCompositionError::InvalidSsiProfile)
+    }
 }
 
 /// Payload-free failures from the production deployment composition gate.

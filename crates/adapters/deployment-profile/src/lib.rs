@@ -219,6 +219,7 @@ impl DeploymentProfileVerifier {
                 did_resolver_url: payload.ssi.did_resolver_url,
                 issuer_metadata_url: payload.ssi.issuer_metadata_url,
                 verifier_metadata_url: payload.ssi.verifier_metadata_url,
+                portal_manifest_sha256: payload.ssi.portal_manifest_sha256,
             },
         })
     }
@@ -338,6 +339,7 @@ pub struct AuthenticatedSsiDeployment {
     did_resolver_url: String,
     issuer_metadata_url: String,
     verifier_metadata_url: String,
+    portal_manifest_sha256: Option<String>,
 }
 
 impl fmt::Debug for AuthenticatedSsiDeployment {
@@ -362,6 +364,13 @@ impl AuthenticatedSsiDeployment {
     #[must_use]
     pub fn verifier_metadata_url(&self) -> &str {
         &self.verifier_metadata_url
+    }
+
+    /// Exact Ledger 9 Portal manifest authorized by the profile signer.
+    /// Absence leaves Portal issuance unconfigured.
+    #[must_use]
+    pub fn portal_manifest_sha256(&self) -> Option<&str> {
+        self.portal_manifest_sha256.as_deref()
     }
 }
 
@@ -389,6 +398,7 @@ pub enum DeploymentProfileError {
     InvalidNetwork,
     InvalidChainIdentity,
     InvalidEndpoint,
+    InvalidPortalManifestDigest,
 }
 
 impl fmt::Display for DeploymentProfileError {
@@ -415,6 +425,9 @@ impl fmt::Display for DeploymentProfileError {
             Self::InvalidNetwork => "deployment profile Midnight network is invalid",
             Self::InvalidChainIdentity => "deployment profile Midnight chain identity is invalid",
             Self::InvalidEndpoint => "deployment profile endpoint is invalid",
+            Self::InvalidPortalManifestDigest => {
+                "deployment profile Portal manifest digest is invalid"
+            }
         };
         formatter.write_str(message)
     }
@@ -462,6 +475,8 @@ struct SsiPayload {
     did_resolver_url: String,
     issuer_metadata_url: String,
     verifier_metadata_url: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    portal_manifest_sha256: Option<String>,
 }
 
 fn validate_identifier(value: &str) -> Result<(), DeploymentProfileError> {
@@ -484,12 +499,7 @@ fn validate_midnight(value: &MidnightPayload) -> Result<(), DeploymentProfileErr
     ) {
         return Err(DeploymentProfileError::InvalidNetwork);
     }
-    if value.genesis_hash_hex.len() != 64
-        || !value
-            .genesis_hash_hex
-            .bytes()
-            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
-    {
+    if !is_canonical_32_byte_hex(&value.genesis_hash_hex) {
         return Err(DeploymentProfileError::InvalidChainIdentity);
     }
     validate_https_endpoint(&value.indexer_http_url)?;
@@ -501,7 +511,22 @@ fn validate_midnight(value: &MidnightPayload) -> Result<(), DeploymentProfileErr
 fn validate_ssi(value: &SsiPayload) -> Result<(), DeploymentProfileError> {
     validate_https_endpoint(&value.did_resolver_url)?;
     validate_https_endpoint(&value.issuer_metadata_url)?;
-    validate_https_endpoint(&value.verifier_metadata_url)
+    validate_https_endpoint(&value.verifier_metadata_url)?;
+    if value
+        .portal_manifest_sha256
+        .as_deref()
+        .is_some_and(|digest| !is_canonical_32_byte_hex(digest))
+    {
+        return Err(DeploymentProfileError::InvalidPortalManifestDigest);
+    }
+    Ok(())
+}
+
+fn is_canonical_32_byte_hex(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
 fn validate_https_endpoint(value: &str) -> Result<(), DeploymentProfileError> {
@@ -578,6 +603,7 @@ mod tests {
                     "https://issuer.example.test/.well-known/openid-credential-issuer".to_owned(),
                 verifier_metadata_url:
                     "https://verifier.example.test/.well-known/openid-configuration".to_owned(),
+                portal_manifest_sha256: None,
             },
         }
     }
@@ -619,6 +645,48 @@ mod tests {
         let debug = format!("{profile:?} {:?}", profile.midnight());
         assert!(!debug.contains("indexer.example.test"));
         assert!(!debug.contains("issuer.example.test"));
+    }
+
+    #[test]
+    fn authenticates_the_optional_portal_pin_without_changing_legacy_profiles() {
+        let verifier = verifier(root(None, 1), 1);
+        let mut payload = payload(1);
+        assert_eq!(
+            verifier
+                .verify(&envelope(&payload, &signing_key()), NOW)
+                .unwrap()
+                .ssi()
+                .portal_manifest_sha256(),
+            None
+        );
+        let digest = "9a".repeat(32);
+        payload.ssi.portal_manifest_sha256 = Some(digest.clone());
+        let signed = envelope(&payload, &signing_key());
+        assert_eq!(
+            verifier
+                .verify(&signed, NOW)
+                .unwrap()
+                .ssi()
+                .portal_manifest_sha256(),
+            Some(digest.as_str())
+        );
+
+        for invalid in ["f".repeat(63), "AF".repeat(32), "g".repeat(64)] {
+            payload.ssi.portal_manifest_sha256 = Some(invalid);
+            assert_eq!(
+                verifier.verify(&envelope(&payload, &signing_key()), NOW),
+                Err(DeploymentProfileError::InvalidPortalManifestDigest)
+            );
+        }
+        payload.ssi.portal_manifest_sha256 = Some("8b".repeat(32));
+        let mut swapped: serde_json::Value = serde_json::from_slice(&signed).unwrap();
+        swapped["payload"] = URL_SAFE_NO_PAD
+            .encode(serde_json::to_vec(&payload).unwrap())
+            .into();
+        assert_eq!(
+            verifier.verify(&serde_json::to_vec(&swapped).unwrap(), NOW),
+            Err(DeploymentProfileError::InvalidSignature)
+        );
     }
 
     #[test]

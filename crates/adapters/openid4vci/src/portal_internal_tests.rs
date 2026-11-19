@@ -208,10 +208,131 @@ fn deployment(origin: &str) -> PortalDeploymentManifest {
             issuer_resolver_origin: origin.to_owned(),
             provenance_sha256: PORTAL_PROVENANCE_SHA256.to_owned(),
             schema: "oxid-portal-deployment-v3".to_owned(),
-            tailnet_origin: None,
+            routes: PortalManifestRoutes::Local,
         };
     let bytes = serde_json::to_vec(&manifest).expect("manifest");
     PortalDeploymentManifest::from_bytes(&bytes, &sha256_hex(&bytes)).expect("deployment")
+}
+
+fn public_deployment(network: MidnightNetwork) -> PortalDeploymentManifest {
+    let mut manifest = deployment("http://127.0.0.1:18090");
+    manifest.integration_commit = LEDGER9_SOURCE.commit.to_owned();
+    manifest.integration_tree = LEDGER9_SOURCE.tree.to_owned();
+    manifest.provenance_sha256 = LEDGER9_SOURCE.provenance_sha256.to_owned();
+    manifest.issuer_did = format!("did:midnight:{}:{}", network.as_str(), "ba".repeat(32));
+    manifest.issuer_method = format!("{}#key-assert", manifest.issuer_did);
+    manifest.issuer_origin = "https://issuer.example.test".to_owned();
+    manifest.issuer_resolver_origin = "https://resolver.example.test/issuer".to_owned();
+    manifest
+}
+
+#[test]
+fn admits_public_ledger9_manifest_only_against_exact_signed_inputs() {
+    for network in [MidnightNetwork::Preview, MidnightNetwork::Preprod] {
+        let manifest = public_deployment(network);
+        let bytes = serde_json::to_vec(&manifest).expect("canonical manifest");
+        let digest = sha256_hex(&bytes);
+        let issuer_metadata = format!("{}{ISSUER_METADATA_PATH}", manifest.issuer_origin);
+        let resolver = manifest.issuer_resolver_origin.as_str();
+        let parse = |expected_digest: &str, network, metadata: &str, resolver: &str| {
+            PortalDeploymentManifest::from_public_bytes(
+                &bytes,
+                expected_digest,
+                network,
+                metadata,
+                resolver,
+            )
+        };
+        let admitted = parse(digest.as_str(), network, &issuer_metadata, resolver)
+            .expect("trusted public manifest");
+        assert!(admitted.uses_ledger9_jubjub_jwk());
+        assert!(!admitted.is_ledger9_tailnet());
+        assert_eq!(admitted.issuer_did(), manifest.issuer_did);
+        assert!(PortalOid4vciClientFactory::new(admitted).is_ok());
+
+        assert_eq!(
+            parse(&"00".repeat(32), network, &issuer_metadata, resolver),
+            Err(PortalDeploymentManifestError::DigestMismatch)
+        );
+        let other_network = if network == MidnightNetwork::Preview {
+            MidnightNetwork::Preprod
+        } else {
+            MidnightNetwork::Preview
+        };
+        assert_eq!(
+            parse(&digest, other_network, &issuer_metadata, resolver),
+            Err(PortalDeploymentManifestError::InvalidIssuer)
+        );
+        assert_eq!(
+            parse(
+                &digest,
+                MidnightNetwork::Mainnet,
+                &issuer_metadata,
+                resolver
+            ),
+            Err(PortalDeploymentManifestError::InvalidIssuer)
+        );
+        for (metadata, did_resolver) in [
+            (
+                "https://elsewhere.example.test/.well-known/openid-credential-issuer",
+                resolver,
+            ),
+            (
+                "https://issuer.example.test/not-the-metadata-route",
+                resolver,
+            ),
+            (
+                &issuer_metadata,
+                "https://resolver.example.test/another-issuer",
+            ),
+        ] {
+            assert_eq!(
+                parse(&digest, network, metadata, did_resolver),
+                Err(PortalDeploymentManifestError::InvalidOrigin)
+            );
+        }
+        assert_eq!(
+            PortalDeploymentManifest::from_bytes(&bytes, &digest),
+            Err(PortalDeploymentManifestError::InvalidOrigin)
+        );
+    }
+}
+
+#[test]
+fn public_admission_rejects_legacy_provenance_and_local_routes() {
+    let network = MidnightNetwork::Preview;
+    let parse = |manifest: &PortalDeploymentManifest| {
+        let bytes = serde_json::to_vec(manifest).expect("canonical manifest");
+        PortalDeploymentManifest::from_public_bytes(
+            &bytes,
+            &sha256_hex(&bytes),
+            network,
+            &format!("{}{ISSUER_METADATA_PATH}", manifest.issuer_origin),
+            &manifest.issuer_resolver_origin,
+        )
+    };
+    let mut manifest = public_deployment(network);
+    manifest.integration_commit = BUNDLED_SOURCE.commit.to_owned();
+    manifest.integration_tree = BUNDLED_SOURCE.tree.to_owned();
+    manifest.provenance_sha256 = BUNDLED_SOURCE.provenance_sha256.to_owned();
+    assert_eq!(
+        parse(&manifest),
+        Err(PortalDeploymentManifestError::SourceLockMismatch)
+    );
+
+    for origin in [
+        "http://127.0.0.1:8090",
+        "https://127.0.0.1",
+        "https://[::1]",
+        "https://issuer.localhost.",
+    ] {
+        let mut manifest = public_deployment(network);
+        manifest.issuer_origin = origin.to_owned();
+        assert_eq!(
+            parse(&manifest),
+            Err(PortalDeploymentManifestError::InvalidOrigin)
+        );
+    }
 }
 
 fn offer(origin: &str) -> String {
