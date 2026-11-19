@@ -44,6 +44,21 @@
         importCargoLock = pkgs.buildPackages.callPackage versionedCargoVendor {
           inherit (rustToolchain) cargo;
           workspaceValuesSource = builtins.readFile (cargoVendorPath + "/replace-workspace-values.py");
+          # The legacy crate includes a public parameter from a sibling
+          # directory in Ledger's Git tree. Preserve those bytes in its
+          # standalone vendored package.
+          runCommand =
+            name: attrs: script:
+            pkgs.buildPackages.runCommand name attrs (
+              script
+              + pkgs.lib.optionalString (name == "midnight-transient-crypto-2.2.0") ''
+                parameter=bls_midnight_2p14
+                install -D -m 444 "$tree/../transient-crypto/static/$parameter" "$out/static/$parameter"
+                chmod u+w "$out/src"
+                substituteInPlace "$out/src/proofs.rs" \
+                  --replace-fail "../../transient-crypto/static/$parameter" "../static/$parameter"
+              ''
+            );
           # Compact's retained CI evidence mentions Nix store paths. Fetch the
           # reviewed Git tree directly so the evidence does not enter a fetchgit
           # fixed-output derivation. Keep the exact revision and NAR hash.
