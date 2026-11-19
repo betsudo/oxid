@@ -1,0 +1,23 @@
+appId: io.medianox.oxid
+name: Wallet status shows NIGHT sync and DUST separately
+---
+- runFlow: ../subflows/launch-clean.yaml
+- runFlow: ../subflows/demo-profile.yaml
+- tapOn: "Wallet"
+- scrollUntilVisible:
+    element: "NIGHT sync"
+    direction: DOWN
+    centerElement: true
+- scrollUntilVisible:
+    element: "DUST"
+    direction: DOWN
+    centerElement: true
+- runFlow: ../subflows/open-menu.yaml
+- assertVisible: "Private values hidden"
+- tapOn: "Session privacy.*"
+- runFlow: ../subflows/open-menu.yaml
+- assertVisible: "Private values revealed"
+- tapOn: "Session privacy.*"
+- scrollUntilVisible:
+    element: "Wallet status"
+    direction: DOWN

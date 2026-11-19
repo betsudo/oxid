@@ -6181,11 +6181,28 @@ fn AccountSyncCard(
     use_effect(move || {
         let _projection_generation = realm_projection_wake();
         begin_account_sync_card_observation(
+    let dust_settlement_port = services.wallet_dust_settlement();
+    let mut dust_settlement = use_signal(|| dust_settlement_port.subscribe().borrow().clone());
+    use_future(move || {
+        let mut subscription = dust_settlement_port.subscribe();
+        async move {
+            loop {
+                let next = subscription.borrow_and_update().clone();
+                if *dust_settlement.peek() != next {
+                    dust_settlement.set(next);
+                }
+                if subscription.changed().await.is_err() {
+                    break;
+                }
+            }
+        }
+    });
             load_services.clone(),
             load_profile.clone(),
             state,
             on_account_updated,
         );
+        let _settlement_observation = dust_settlement.read();
     });
 
     match state.read().clone() {
@@ -6240,11 +6257,22 @@ fn AccountSyncCard(
             let dust_balance = selected_realm_dust_balance(&realm.dust);
             let dust_state = selected_realm_dust_state(&realm.dust);
             let dust_note = selected_realm_dust_note(&realm.dust);
+            let account_state = selected_realm_sync::selected_realm_account_state(&realm.account);
+            let account_status = selected_realm_lifecycle_presentation(account_state);
+            let (dust_label, dust_tone) =
+                selected_realm_sync::wallet_dust_status(&projection, &dust_settlement.read());
+            let observed_dust = selected_realm_sync::wallet_dust_observed_amount(&realm.dust);
             let shielded_night = selected_realm_shielded_balance(&realm.shielded);
             let shielded_state = selected_realm_shielded_state(&realm.shielded);
             let shielded_note = selected_realm_shielded_note(&realm.shielded);
             let owned_notes = match &realm.shielded {
                 WalletRealmFamilyView::Ready(status) => status
+            let dust_progress = match &realm.dust {
+                WalletRealmFamilyView::Ready(status) if dust_state == "syncing" => {
+                    dust_progress_percent(status)
+                }
+                _ => None,
+            };
                     .owned_note_count
                     .map_or_else(|| "—".to_owned(), |count| count.to_string()),
                 _ => "—".to_owned(),
@@ -6260,9 +6288,44 @@ fn AccountSyncCard(
                             p { class: "card-eyebrow", "Selected realm" }
                             h2 { "Wallet status" }
                         }
-                        span { class: "{dust_status_pill_class(overall_state)}", "{lifecycle.label}" }
                     }
-                    p { class: "account-sync-card__summary", "{lifecycle.note}" }
+                    div { class: "account-sync-card__rows", "data-testid": "wallet-status-facets",
+                        div { class: "account-sync-card__row", "data-testid": "wallet-night-status",
+                            strong { "NIGHT sync" }
+                            span { class: "{dust_status_pill_class(account_state)}", "{account_status.label}" }
+                        }
+                        div { class: "account-sync-card__row", "data-testid": "wallet-dust-status",
+                            div {
+                                strong { "DUST" }
+                                if let Some(amount) = observed_dust.as_deref() {
+                                    small {
+                                        class: "privacy-value",
+                                        "data-testid": "wallet-dust-amount",
+                                        aria_hidden: if secret_mode.is_masked() { "true" } else { "false" },
+                                        "{amount}"
+                                    }
+                                } else {
+                                    small { "Balance unavailable" }
+                                }
+                            }
+                            span {
+                                class: "{dust_status_pill_class(dust_tone)}",
+                                role: "status",
+                                aria_label: "DUST {dust_label}",
+                                "{dust_label}"
+                            }
+                        }
+                    }
+                    if lifecycle.retry {
+                        p { class: "account-sync-card__summary", "{lifecycle.note}" }
+                    }
+                    if let Some(percent) = dust_progress {
+                        div { class: "wallet-sync-progress", role: "progressbar",
+                            aria_label: "DUST synchronization progress",
+                            aria_valuemin: "0", aria_valuemax: "100", aria_valuenow: "{percent}",
+                            div { class: "wallet-sync-progress__bar", style: "width: {percent}%" }
+                        }
+                    }
                     if cfg!(feature = "ui-profile-dev") {
                     details { class: "account-sync-card__details",
                         summary { "Synchronization details" }
@@ -6317,8 +6380,8 @@ fn AccountSyncCard(
                         }
                     }
                     }
-                    if let Some(percent) = progress {
-                        div { class: "wallet-sync-progress", aria_label: "Account synchronization progress",
+                    if let Some(percent) = progress.filter(|_| cfg!(feature = "ui-profile-dev")) {
+                        div { class: "wallet-sync-progress", aria_label: "Combined synchronization progress",
                             div { class: "wallet-sync-progress__bar", style: "width: {percent}%" }
                         }
                     }
@@ -12456,6 +12519,100 @@ mod tests {
             shielded_progress_percent(&shielded_status("syncing", Some(0), Some(2))),
             Some(33)
         );
+    #[test]
+    fn wallet_status_separates_live_night_dust_balance_and_registration() {
+        use oxid_wallet_application::{
+            ChainNetworkId, SelectedWalletRealmActionReadiness, SelectedWalletRealmIdentity,
+            SelectedWalletRealmObservation, SelectedWalletRealmSpendableNightView,
+            WalletDustRegistrationSettlementIdentity, WalletDustRegistrationSettlementState,
+            WalletProfileId,
+        };
+        use selected_realm_sync::{wallet_dust_observed_amount, wallet_dust_status};
+
+        let identity = SelectedWalletRealmIdentity {
+            profile: WalletProfileId::parse("profile_wallet_status").unwrap(),
+            realm: ChainNetworkId::parse("undeployed").unwrap(),
+        };
+        let mut dust = dust_status("synced", Some(2), Some(2));
+        dust.balance_atomic_units = Some("0".to_owned());
+        let mut realm = SelectedWalletRealmProjection {
+            generation: 7,
+            revision: 2,
+            fresh: true,
+            consistent: true,
+            actionable: SelectedWalletRealmActionReadiness::Ready,
+            observation: SelectedWalletRealmObservation::Settled,
+            spendable_night: SelectedWalletRealmSpendableNightView::Zero,
+            view: selected_realm_status(
+                WalletSyncState::Synced,
+                dust.clone(),
+                shielded_status("synced", Some(2), Some(2)),
+            ),
+            identity,
+        };
+        let mut settlement = WalletDustSettlementProjection::default();
+        settlement.identity = Some(WalletDustRegistrationSettlementIdentity {
+            profile: realm.identity.profile.clone(),
+            realm: realm.identity.realm.clone(),
+            generation: realm.generation,
+        });
+
+        assert_eq!(
+            selected_realm_sync::selected_realm_account_state(&realm.view.account),
+            "synced"
+        );
+        assert_eq!(
+            wallet_dust_observed_amount(&realm.view.dust).as_deref(),
+            Some("0 DUST")
+        );
+        for (state, expected) in [
+            (
+                WalletDustRegistrationSettlementState::NotEligible,
+                "Waiting for eligible NIGHT",
+            ),
+            (
+                WalletDustRegistrationSettlementState::Submitting,
+                "Registering",
+            ),
+            (
+                WalletDustRegistrationSettlementState::Confirming,
+                "Waiting for Midnight",
+            ),
+            (
+                WalletDustRegistrationSettlementState::Degraded,
+                "Needs attention",
+            ),
+            (
+                WalletDustRegistrationSettlementState::Ready,
+                "No spendable DUST",
+            ),
+        ] {
+            settlement.state = state;
+            assert_eq!(wallet_dust_status(&realm, &settlement).0, expected);
+        }
+
+        dust.balance_atomic_units = None;
+        realm.view.dust = WalletRealmFamilyView::Ready(dust.clone());
+        assert_eq!(wallet_dust_observed_amount(&realm.view.dust), None);
+        assert_eq!(
+            wallet_dust_status(&realm, &settlement).0,
+            "Updating balance"
+        );
+        dust.balance_atomic_units = Some("1".to_owned());
+        realm.view.dust = WalletRealmFamilyView::Ready(dust);
+        assert_eq!(wallet_dust_status(&realm, &settlement).0, "Ready");
+
+        settlement.state = WalletDustRegistrationSettlementState::Degraded;
+        realm.generation += 1;
+        assert_eq!(wallet_dust_status(&realm, &settlement).0, "Ready");
+        settlement.identity.as_mut().unwrap().generation = realm.generation;
+        realm.identity.profile = WalletProfileId::parse("profile_other").unwrap();
+        assert_eq!(wallet_dust_status(&realm, &settlement).0, "Ready");
+        settlement.identity.as_mut().unwrap().profile = realm.identity.profile.clone();
+        realm.identity.realm = ChainNetworkId::parse("preprod").unwrap();
+        assert_eq!(wallet_dust_status(&realm, &settlement).0, "Ready");
+    }
+
         assert_eq!(
             shielded_progress_percent(&shielded_status("synced", Some(2), Some(2))),
             Some(100)

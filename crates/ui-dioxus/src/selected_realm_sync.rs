@@ -3,6 +3,87 @@
 pub(super) mod action_watch;
 
 use super::*;
+use oxid_wallet_application::WalletDustRegistrationSettlementState as DustSettlement;
+
+pub(super) fn wallet_dust_status(
+    realm: &SelectedWalletRealmProjection,
+    settlement: &WalletDustSettlementProjection,
+) -> (&'static str, &'static str) {
+    let state = settlement.identity.as_ref().and_then(|identity| {
+        (identity.profile == realm.identity.profile
+            && identity.realm == realm.identity.realm
+            && identity.generation == realm.generation)
+            .then_some(settlement.state)
+    });
+    let live_balance = match &realm.view.dust {
+        WalletRealmFamilyView::Ready(status)
+            if status.state == "synced" && status.failure.is_none() =>
+        {
+            status
+                .balance_atomic_units
+                .as_deref()
+                .and_then(|value| value.parse::<u128>().ok())
+        }
+        _ => None,
+    };
+    match state {
+        Some(DustSettlement::NotEligible) if live_balance.unwrap_or(0) == 0 => {
+            ("Waiting for eligible NIGHT", "never_synced")
+        }
+        Some(DustSettlement::ActionRequired) => ("Registration pending", "syncing"),
+        Some(DustSettlement::AwaitingAuthorization | DustSettlement::Submitting) => {
+            ("Registering", "syncing")
+        }
+        Some(DustSettlement::Confirming | DustSettlement::Reconciling) => {
+            if settlement
+                .registration
+                .as_ref()
+                .is_some_and(|registration| registration.included)
+            {
+                ("Updating balance", "syncing")
+            } else {
+                ("Waiting for Midnight", "syncing")
+            }
+        }
+        Some(
+            DustSettlement::Cancelled
+            | DustSettlement::Offline
+            | DustSettlement::TimedOut
+            | DustSettlement::Degraded
+            | DustSettlement::Suspended,
+        ) => ("Needs attention", "stalled"),
+        _ => match live_balance {
+            Some(1..) => ("Ready", "synced"),
+            Some(0) => ("No spendable DUST", "never_synced"),
+            None => match selected_realm_dust_state(&realm.view.dust) {
+                "synced" if state != Some(DustSettlement::Ready) => {
+                    ("Not registered", "never_synced")
+                }
+                "stalled" | "cancelled" => ("Needs attention", "stalled"),
+                "unavailable" | "unsupported" | "invalid_data" => ("Unavailable", "unavailable"),
+                _ => ("Updating balance", "syncing"),
+            },
+        },
+    }
+}
+
+pub(super) fn wallet_dust_observed_amount(
+    family: &WalletRealmFamilyView<WalletDustSyncView>,
+) -> Option<String> {
+    let WalletRealmFamilyView::Ready(status) = family else {
+        return None;
+    };
+    let value = status.balance_atomic_units.as_deref()?;
+    let qualifier = if status.state == "synced" && status.failure.is_none() {
+        ""
+    } else {
+        " · last known"
+    };
+    Some(format!(
+        "{} DUST{qualifier}",
+        ui::format_atomic_units(value, ui::DUST_DECIMALS)
+    ))
+}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) enum AccountSyncCardState {
@@ -45,6 +126,19 @@ pub(super) fn begin_account_sync_card_observation(
             run_ui_blocking(move || load_account_sync_card(&query_services, &query_profile))
                 .await
                 .unwrap_or_else(|error| AccountSyncCardState::Failed(error.to_string()));
+        let loaded = match (&*state.peek(), loaded) {
+            (
+                current @ AccountSyncCardState::Ready { .. },
+                AccountSyncCardState::Ready { realm, .. },
+            ) => {
+                let Some(next) = merge_polled_account_sync_card(current, realm) else {
+                    return;
+                };
+                next
+            }
+            (AccountSyncCardState::Ready { .. }, AccountSyncCardState::Failed(_)) => return,
+            (_, loaded) => loaded,
+        };
         let observation = match &loaded {
             AccountSyncCardState::Ready { realm, .. }
                 if realm.observation.poll_after().is_some() =>
@@ -174,8 +268,8 @@ fn merge_polled_account_sync_card(
     };
     retain_polled_card_feedback(
         candidate.identity == realm.identity,
-        candidate.revision,
-        realm.revision,
+        (candidate.generation, candidate.revision),
+        (realm.generation, realm.revision),
         *action_busy,
         operation_error,
     )
@@ -195,11 +289,7 @@ pub(super) fn account_sync_card_accepts_projection(
     matches!(
         current,
         AccountSyncCardState::Ready { realm, .. }
-            if projection_can_publish(
-                candidate.identity == realm.identity,
-                candidate.revision,
-                realm.revision,
-            )
+            if candidate.supersedes(realm)
     )
 }
 
@@ -213,7 +303,7 @@ pub(super) fn finish_account_sync_card_action(
             realm,
             operation_error,
             ..
-        } if realm.identity == expected.identity && realm.revision >= expected.revision => {
+        } if realm.generation == expected.generation && realm.supersedes(expected) => {
             Some(AccountSyncCardState::Ready {
                 realm,
                 action_busy: false,
@@ -231,21 +321,13 @@ pub(super) fn finish_account_sync_card_action(
 
 fn retain_polled_card_feedback(
     same_realm: bool,
-    candidate_revision: u64,
-    current_revision: u64,
+    candidate_revision: (u64, u64),
+    current_revision: (u64, u64),
     action_busy: bool,
     operation_error: &Option<String>,
 ) -> Option<(bool, Option<String>)> {
-    projection_can_publish(same_realm, candidate_revision, current_revision)
+    (same_realm && candidate_revision >= current_revision)
         .then(|| (action_busy, operation_error.clone()))
-}
-
-const fn projection_can_publish(
-    same_realm: bool,
-    candidate_revision: u64,
-    current_revision: u64,
-) -> bool {
-    same_realm && candidate_revision >= current_revision
 }
 
 fn poll_still_owns_account_sync_card(
@@ -377,7 +459,9 @@ pub(super) fn selected_realm_chain_tip(realm: &SelectedWalletRealmSyncView) -> S
     }
 }
 
-fn selected_realm_account_state(family: &WalletRealmFamilyView<WalletAccountView>) -> &str {
+pub(super) fn selected_realm_account_state(
+    family: &WalletRealmFamilyView<WalletAccountView>,
+) -> &str {
     match family {
         WalletRealmFamilyView::Ready(account) => account.sync.state.as_str(),
         WalletRealmFamilyView::Busy => "syncing",
@@ -591,7 +675,9 @@ mod poll_tests {
 
     #[test]
     fn stale_poll_cannot_replace_a_newer_manual_projection() {
-        assert!(retain_polled_card_feedback(true, 1, 2, true, &None).is_none());
+        assert!(retain_polled_card_feedback(true, (1, 1), (1, 2), true, &None).is_none());
+        assert!(retain_polled_card_feedback(true, (1, 9), (2, 1), true, &None).is_none());
+        assert!(retain_polled_card_feedback(false, (2, 2), (1, 1), true, &None).is_none());
         assert!(!poll_owns_current_projection(false, false));
     }
 
@@ -599,7 +685,7 @@ mod poll_tests {
     fn equal_poll_preserves_the_current_action_state() {
         let operation_error = Some("manual action pending".to_owned());
         let (action_busy, retained_error) =
-            retain_polled_card_feedback(true, 2, 2, true, &operation_error)
+            retain_polled_card_feedback(true, (1, 2), (1, 2), true, &operation_error)
                 .expect("equal projection remains admissible");
 
         assert!(action_busy);

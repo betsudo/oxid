@@ -86,9 +86,6 @@ pub(super) fn AssetsPage(
             let night = balance_for(&account, "NIGHT")
                 .map(|balance| ui::format_atomic_units(&balance.atomic_units, balance.decimals))
                 .unwrap_or_else(|| "—".to_owned());
-            let dust = balance_for(&account, "DUST")
-                .map(|balance| ui::format_atomic_units(&balance.atomic_units, balance.decimals))
-                .unwrap_or_else(|| "—".to_owned());
             let unavailable = account.source == WalletAccountSource::Unavailable;
             let is_busy = busy.is_some();
             let account_hint = account_hint(&account, busy);
@@ -110,6 +107,7 @@ pub(super) fn AssetsPage(
             #[cfg(not(feature = "ui-profile-dev"))]
             let lifecycle_label = None::<String>;
             let selected_network_id = networks.selected_network_id.clone();
+            let realm_card_key = format!("{}:{}", active_profile.id, account.network_id);
             let select_services = services.clone();
             let select_profile_id = active_profile.id.clone();
             let mut select_state = state;
@@ -134,14 +132,6 @@ pub(super) fn AssetsPage(
                             "{night}"
                         }
                         span { "NIGHT" }
-                    }
-                    div { class: "dust-pill",
-                        strong {
-                            class: "privacy-value",
-                            aria_hidden: if secret_mode.is_masked() { "true" } else { "false" },
-                            "{dust}"
-                        }
-                        span { "DUST" }
                     }
                     p { class: "wallet-hero__hint", "{account_hint}" }
                 }
@@ -354,6 +344,7 @@ pub(super) fn AssetsPage(
                 }
 
                 AccountSyncCard {
+                    key: "{realm_card_key}",
                     profile_id: active_profile.id.clone(),
                     secret_mode,
                     can_sync: protection_unlocked,
