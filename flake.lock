@@ -115,18 +115,22 @@
     "midnight-identity-ledger9": {
       "flake": false,
       "locked": {
+        "allRefs": true,
         "lastModified": 1794993069,
-        "narHash": "sha256-EClXcL4MpyDjYcEt6nEaNINJJNan+Nr15NOGk3xaooY=",
-        "owner": "betsudo",
-        "repo": "midnight-identity",
+        "narHash": "sha256-J684SunbTIK8fblcMAtBg7lTFj0lzyzpiRNDW9w2Uv4=",
+        "ref": "refs/heads/rust-codegen",
         "rev": "e7e28eea94515d59b5e7360a717f5c0dee3eecdf",
-        "type": "github"
+        "revCount": 276,
+        "submodules": true,
+        "type": "git",
+        "url": "https://github.com/betsudo/midnight-identity"
       },
       "original": {
-        "owner": "betsudo",
-        "repo": "midnight-identity",
+        "allRefs": true,
         "rev": "e7e28eea94515d59b5e7360a717f5c0dee3eecdf",
-        "type": "github"
+        "submodules": true,
+        "type": "git",
+        "url": "https://github.com/betsudo/midnight-identity"
       }
     },
     "midnight-verifiable-credentials": {

@@ -13,6 +13,28 @@
         cargo = rustToolchain.cargo;
         rustc = rustToolchain.rustc;
       };
+      compactSource =
+        (builtins.fromJSON (builtins.readFile ../../config/midnight-integration-compatibility.json))
+        .wallet.compact;
+      buildRustPackage = rustPlatform.buildRustPackage.override {
+        importCargoLock = rustPlatform.importCargoLock.override {
+          # Compact's retained CI evidence mentions Nix store paths. Fetch the
+          # reviewed Git tree directly so the evidence does not enter a fetchgit
+          # fixed-output derivation. Keep the exact revision and NAR hash.
+          fetchgit =
+            source:
+            if source.url == compactSource.repository && source.rev == compactSource.revision then
+              (builtins.fetchTree {
+                type = "git";
+                inherit (source) url rev;
+                allRefs = true;
+                submodules = true;
+                narHash = source.sha256;
+              }).outPath
+            else
+              pkgs.fetchgit source;
+        };
+      };
       midnightDidCompactArtifacts = pkgs.callPackage ./midnight-did-compact-artifacts.nix { };
       midnightDidLedger9Zkir = pkgs.callPackage ./midnight-did-ledger9-zkir.nix {
         midnightIdentitySource = inputs.midnight-identity-ledger9;
@@ -23,8 +45,6 @@
       cargoOutputHashes = {
         "midnight-base-crypto-1.1.1" = "sha256-7nPujsILZToXHIBcRemu8NLrxmrg2+QM4sKPsJwGgu0=";
         "midnight-compact-runtime-0.2.0" = "sha256-Z7UM69FOS0DWefFGW71GlEz2lYWTOFoi1XnekD2jgM8=";
-        # Cargo's Git fetch includes submodules. The GitHub archive in
-        # flake.lock has a separate hash for the same source revision.
         "midnight-did-domain-0.5.0" = "sha256-J684SunbTIK8fblcMAtBg7lTFj0lzyzpiRNDW9w2Uv4=";
         "midnight-proofs-0.8.2" = "sha256-lofqa58hDlJ0C3vIWFodsdwYYwYoPEDpS1PMGV9TULg=";
         "midnight-zkir-3.2.1" = "sha256-GtULoNDWGXjgIf9Vh8C4OXKlRLwm37lDQ+f0DAay/9c=";
@@ -35,7 +55,7 @@
         midnightCircuitParams = midnightDidPackages.midnight-circuit-params;
         midnightVcSource = inputs.midnight-verifiable-credentials;
       };
-      oxidApp = rustPlatform.buildRustPackage {
+      oxidApp = buildRustPackage {
         pname = "oxid";
         version = "0.2.0";
         src = pkgs.lib.cleanSource ../..;
@@ -65,7 +85,7 @@
           mainProgram = "oxid-app";
         };
       };
-      brandCheck = rustPlatform.buildRustPackage {
+      brandCheck = buildRustPackage {
         pname = "oxid-brand-check";
         version = "0.2.0";
         src = pkgs.lib.cleanSource ../..;
@@ -124,7 +144,7 @@
 
         brand-check = brandCheck;
 
-        headless = rustPlatform.buildRustPackage {
+        headless = buildRustPackage {
           pname = "oxid-headless";
           version = "0.2.0";
           src = pkgs.lib.cleanSource ../..;

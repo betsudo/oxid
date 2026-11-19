@@ -35,10 +35,8 @@ test("Nix consumes the same immutable Ledger 9 identity and validates ZKIR compa
     new URL("../../config/midnight-integration-compatibility.json", import.meta.url),
     "utf8",
   ));
-  assert.match(
-    flake,
-    new RegExp(`github:betsudo/midnight-identity/${manifest.wallet.nativeIdentity.revision}`, "u"),
-  );
+  const identity = manifest.wallet.nativeIdentity;
+  assert.ok(flake.includes(`git+${identity.repository}?rev=${identity.revision}&allRefs=1&submodules=1`));
 
   const derivation = await readFile(
     new URL("../../nix/packages/midnight-did-ledger9-zkir.nix", import.meta.url),

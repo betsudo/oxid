@@ -103,14 +103,16 @@ export function auditCompatibility({ portalSource, environment = process.env } =
   }
 
   const flake = readFileSync(path.join(root, "flake.nix"), "utf8");
-  if (!flake.includes(`github:betsudo/midnight-identity/${identity.revision}`)) {
+  if (!flake.includes(`git+${identity.repository}?rev=${identity.revision}&allRefs=1&submodules=1`)) {
     fail("Nix identity source differs from the reviewed Ledger 9 cohort");
   }
   const flakeLock = JSON.parse(readFileSync(path.join(root, "flake.lock"), "utf8"));
   const identityLock = flakeLock.nodes?.["midnight-identity-ledger9"];
   if (identityLock?.flake !== false
-    || identityLock?.locked?.owner !== "betsudo"
-    || identityLock?.locked?.repo !== "midnight-identity"
+    || identityLock?.locked?.type !== "git"
+    || identityLock?.locked?.url !== identity.repository
+    || identityLock?.locked?.submodules !== true
+    || identityLock?.locked?.allRefs !== true
     || identityLock?.locked?.rev !== identity.revision) {
     fail("Nix identity lock differs from the reviewed Ledger 9 cohort");
   }
