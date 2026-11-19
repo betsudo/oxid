@@ -58,10 +58,13 @@ type DevelopmentStorage = (
 
 pub(super) fn development_security_and_profiles(clock: &Arc<SystemClock>) -> DevelopmentStorage {
     let profiles = Arc::new(JsonWalletProfileRepository::at_default_location());
+    // Wallet-only and Portal builds must reopen the same mobile development
+    // custody store. The Portal feature must not determine whether a root survives.
     #[cfg(all(
         not(target_arch = "wasm32"),
         any(
             all(not(target_os = "ios"), not(target_os = "android")),
+            feature = "standalone-development",
             feature = "mobile-portal"
         )
     ))]
@@ -80,6 +83,7 @@ pub(super) fn development_security_and_profiles(clock: &Arc<SystemClock>) -> Dev
         target_arch = "wasm32",
         all(
             any(target_os = "ios", target_os = "android"),
+            not(feature = "standalone-development"),
             not(feature = "mobile-portal")
         )
     ))]
