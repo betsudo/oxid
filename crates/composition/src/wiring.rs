@@ -962,10 +962,10 @@ where
         Arc::clone(&clock),
     ));
     let protection_port = protection_for_security(Arc::clone(&security));
-    let protection = Arc::new(WalletProtectionService::with_approvals(
-        protection_port,
-        approvals.clone(),
-    ));
+    let protection = Arc::new(
+        WalletProtectionService::with_approvals(protection_port, approvals.clone())
+            .with_profile_associations(repository.clone()),
+    );
     let portable_backup = Arc::new(WalletPortableBackupService::new(Arc::clone(&security)));
     let sensitive_keys = Arc::new(oxid_wallet_application::WalletSensitiveKeyService::new(
         security.clone(),
