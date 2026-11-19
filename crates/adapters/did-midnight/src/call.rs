@@ -912,6 +912,28 @@ mod tests {
         ));
         assert!(operations[3].clone().into_runtime().is_ok());
 
+        let point = derive_public_key_from_seed(&[11; 32]);
+        let coordinate = |value: Option<runtime::Field>| {
+            value
+                .expect("fixture is not the identity")
+                .as_le_bytes()
+                .try_into()
+                .expect("canonical coordinate")
+        };
+        let valid_assertion = MidnightDidCallOperation::AddAssertionMethod {
+            method_id: "#key-assertion".to_owned(),
+            x: coordinate(point.x()),
+            y: coordinate(point.y()),
+        };
+        assert_eq!(valid_assertion.validate(), Ok(()));
+        assert!(matches!(
+            valid_assertion.into_runtime().expect("valid Jubjub key"),
+            RuntimeDidOperation::SetSchnorrJubjubVerificationMethod {
+                mutation: types::MapMutation::Insert,
+                ..
+            }
+        ));
+
         assert_eq!(
             MidnightDidCallOperation::AddAuthenticationMethod {
                 method_id: "not-a-fragment".to_owned(),

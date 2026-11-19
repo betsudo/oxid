@@ -1208,10 +1208,59 @@ const fn map_store_error(
 
 #[cfg(test)]
 mod tests {
-    use futures::channel::oneshot;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use futures::{channel::oneshot, executor::block_on};
     use midnight_ledger::structure::INITIAL_PARAMETERS;
+    use oxid_foundation::UnixTimestampMillis;
 
     use super::*;
+    use crate::{
+        UnavailableMidnightAccountSource,
+        submission_journal::{
+            MemoryMidnightSubmissionJournalStore, MidnightSubmissionJournalStore,
+        },
+        transaction::MidnightSubmissionReconciler,
+    };
+
+    #[derive(Default)]
+    struct RegistrationObservations(AtomicUsize);
+
+    impl MidnightSubmissionReconciler for RegistrationObservations {
+        fn reconcile(
+            &self,
+            entry: &StoredSubmissionJournalEntry,
+        ) -> Result<MidnightSubmissionReconciliation, WalletTransactionPortError> {
+            assert_eq!(entry.state, StoredSubmissionState::OutcomeUnknown);
+            assert_eq!(entry.transaction_hash, [7; 32]);
+            match self.0.fetch_add(1, Ordering::Relaxed) {
+                0 => Ok(MidnightSubmissionReconciliation::Unresolved),
+                1 => Ok(MidnightSubmissionReconciliation::Included {
+                    block_hash: [9; 32],
+                    block_height: 9,
+                }),
+                _ => panic!("included registration must not be reconciled again"),
+            }
+        }
+    }
+
+    fn registration_entry(state: StoredSubmissionState) -> StoredSubmissionJournalEntry {
+        StoredSubmissionJournalEntry {
+            profile_id: WalletProfileId::parse("profile-dust-recovery").expect("profile"),
+            network_id: oxid_wallet_domain::ChainNetworkId::parse("undeployed").expect("network"),
+            draft_id: WalletTransactionDraftId::parse("dustreg_recovery").expect("draft"),
+            planning_fingerprint: [1; 32],
+            expires_at: UnixTimestampMillis::new(2_000),
+            updated_at: UnixTimestampMillis::new(1_000),
+            fee_specks: 42,
+            transaction_hash: [7; 32],
+            anchor_block_hash: [8; 32],
+            block_hash: None,
+            block_height: None,
+            state,
+            mode: oxid_wallet_domain::WalletTransferSubmissionMode::Live,
+        }
+    }
 
     fn utxo(
         value: u128,
@@ -1226,6 +1275,56 @@ mod tests {
             created_at_seconds: created,
             registered_for_dust_generation: registered,
         }
+    }
+
+    #[test]
+    fn stored_unknown_dust_registration_keeps_its_broadcast_until_inclusion_is_durable() {
+        let journal = Arc::new(MemoryMidnightSubmissionJournalStore::default());
+        let observations = Arc::new(RegistrationObservations::default());
+        let entry = registration_entry(StoredSubmissionState::OutcomeUnknown);
+        journal.save(&entry).expect("unknown broadcast persists");
+
+        let initial = MidnightWalletAdapter::new(UnavailableMidnightAccountSource)
+            .with_submission_recovery(journal.clone(), observations.clone());
+        let unresolved = block_on(initial.reconcile_submission(&entry.profile_id, &entry.draft_id))
+            .expect("unresolved observation persists");
+        assert_eq!(
+            unresolved.state(),
+            WalletTransactionSubmissionState::OutcomeUnknown
+        );
+        assert_eq!(
+            journal
+                .load(&entry.profile_id, &entry.draft_id)
+                .expect("journal reads"),
+            Some(entry.clone()),
+            "an unresolved observation preserves the original broadcast"
+        );
+
+        let restored = MidnightWalletAdapter::new(UnavailableMidnightAccountSource)
+            .with_submission_recovery(journal.clone(), observations.clone());
+        let included = block_on(restored.reconcile_submission(&entry.profile_id, &entry.draft_id))
+            .expect("restored wallet records finalized inclusion");
+        assert_eq!(included.state(), WalletTransactionSubmissionState::Included);
+        assert_eq!(
+            included
+                .submission()
+                .expect("included status has the original transaction")
+                .transaction_id()
+                .as_str(),
+            hex::encode(entry.transaction_hash)
+        );
+        let repeated = block_on(restored.reconcile_submission(&entry.profile_id, &entry.draft_id))
+            .expect("repeat reads the durable status");
+        assert_eq!(repeated, included);
+        assert_eq!(observations.0.load(Ordering::Relaxed), 2);
+        let mut expected = entry;
+        expected.state = StoredSubmissionState::Included;
+        expected.block_hash = Some([9; 32]);
+        expected.block_height = Some(9);
+        assert_eq!(
+            journal.list(&expected.profile_id).expect("journal reads"),
+            vec![expected]
+        );
     }
 
     #[test]
