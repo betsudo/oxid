@@ -44,6 +44,7 @@ run_repository() {
   require_command node
   node --test tests/repository/audit-report-contract.test.mjs
   node --test tests/repository/audit-evidence-contract.test.mjs
+  node --test tests/repository/advisory-reachability-contract.test.mjs
   node --test tests/repository/contribution-policy-contract.test.mjs
   node --test tests/repository/local-git-hooks-contract.test.mjs
   node --test tests/repository/factory-metrics-contract.test.mjs
@@ -104,10 +105,12 @@ run_repository() {
   node --test tests/repository/oxid-size-budget-compatibility.test.mjs
   node --test tests/repository/pi-observability-contract.test.mjs
   node --test tests/repository/portal-ios-fixture-contract.test.mjs
+  node --test tests/repository/portal-ledger9-source-lock.test.mjs
   node --test tests/repository/portal-manual-phases-command-contract.test.mjs
   node --test tests/repository/portal-mobile-phase-parity-contract.test.mjs
   node --test tests/repository/portal-services-lifecycle-command-contract.test.mjs
   node --test tests/repository/midnight-integration-compatibility-contract.test.mjs
+  node --test tests/repository/shared-ledger9-native-did-e2e-contract.test.mjs
   node --test tests/repository/taskflow-conformance.test.mjs
   node --test tests/repository/ui-page-hierarchy-contract.test.mjs
   node --test tests/repository/ui-source-scan-contract.test.mjs

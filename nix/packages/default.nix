@@ -17,7 +17,8 @@
       midnightDidLedger9Zkir = pkgs.callPackage ./midnight-did-ledger9-zkir.nix {
         midnightIdentitySource = inputs.midnight-identity-ledger9;
         zkirCompiler = inputs.midnight-zkir-ledger9.packages.${pkgs.stdenv.hostPlatform.system}.zkir;
-        publicParams = inputs.midnight-zkir-ledger9.packages.${pkgs.stdenv.hostPlatform.system}.public-params;
+        publicParams =
+          inputs.midnight-zkir-ledger9.packages.${pkgs.stdenv.hostPlatform.system}.public-params;
       };
       cargoOutputHashes = {
         "midnight-base-crypto-1.1.1" = "sha256-7nPujsILZToXHIBcRemu8NLrxmrg2+QM4sKPsJwGgu0=";
