@@ -34,15 +34,28 @@ use url::Url;
 use zeroize::Zeroizing;
 
 use super::{
-    EndpointPolicy, JwtProofs, ParsedOffer, PortalCredentialRequest, PortalMidnightRequest,
-    decode_json_string, host_is_loopback, map_get_did_error, map_holder_proof_error,
-    parse_issuer_metadata, parse_offer, parse_strict_json, required_object, required_string,
-    required_unique_strings, resolve_holder_binding, serialize_sensitive_json, validate_endpoint,
+    EndpointPolicy, JwtProofs, ParsedOffer, decode_json_string, host_is_loopback,
+    map_get_did_error, map_holder_proof_error, parse_issuer_metadata, parse_offer,
+    parse_strict_json, required_object, required_string, required_unique_strings,
+    resolve_holder_binding, serialize_sensitive_json, validate_endpoint,
 };
 
 #[path = "portal_response.rs"]
 mod response;
 use response::*;
+
+#[derive(Serialize)]
+struct PortalMidnightRequest<'a> {
+    #[serde(rename = "holderBindingMethod")]
+    holder_binding_method: &'a str,
+}
+
+#[derive(Serialize)]
+struct PortalCredentialRequest<'a> {
+    credential_configuration_id: &'a str,
+    midnight: PortalMidnightRequest<'a>,
+    proofs: JwtProofs<'a>,
+}
 
 struct SensitiveHttpBody(Zeroizing<Vec<u8>>);
 
