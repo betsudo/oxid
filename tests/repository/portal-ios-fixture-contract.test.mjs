@@ -20,6 +20,9 @@ test("Portal iOS holder preparation follows the current DID detail contract", as
   assert.match(fixture, /WalletOnboardingFixture\.completeDevelopmentRecoveryCeremony/u);
   assert.match(fixture, /requestFixedGrant\(for: address\)/u);
   assert.match(fixture, /staticTexts\["Transfer confirmed"\]/u);
+  assert.match(fixture, /func testFundedWalletRecoversAcrossRestart\(\)/u);
+  assert.match(fixture, /\["DUST Ready"\]/u);
+  assert.match(fixture, /readReceiveLabel\(\) == before/u);
   assert.doesNotMatch(fixture, /staticTexts\["Identity"\]/u);
   assert.match(
     fixture,
@@ -79,7 +82,11 @@ test("Portal acceptance uses only named development authority and bounded cleanu
   );
   assert.match(
     headlessProfile,
-    /all\(not\(target_os = "ios"\), not\(target_os = "android"\)\),\s*feature = "mobile-portal"/u,
+    /all\(not\(target_os = "ios"\), not\(target_os = "android"\)\),\s*feature = "standalone-development",\s*feature = "mobile-portal"/u,
+  );
+  assert.match(
+    headlessProfile,
+    /any\(target_os = "ios", target_os = "android"\),\s*not\(feature = "standalone-development"\),\s*not\(feature = "mobile-portal"\)/u,
   );
   assert.match(
     headlessProfile,
