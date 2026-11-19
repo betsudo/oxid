@@ -347,7 +347,9 @@ final class PortalFlowTests: XCTestCase {
         let addressElement = application.descendants(matching: .any)
             .matching(NSPredicate(format: "label BEGINSWITH %@", "Full validated raw Unshielded receive address "))
             .firstMatch
-        let dustReady = application.descendants(matching: .any)["DUST Ready"].firstMatch
+        let dustReady = application.descendants(matching: .any)
+            .matching(NSPredicate(format: "label == %@ OR label BEGINSWITH %@", "DUST Ready", "DUST Ready, "))
+            .firstMatch
 
         func readReceiveLabel() -> String {
             application.buttons["Home"].tap()
