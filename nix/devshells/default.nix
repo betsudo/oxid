@@ -44,6 +44,11 @@
           cargo-audit
           cargo-deny
         ]);
+      rustLlvmBin = "${rustToolchain.llvm-tools-preview}/lib/rustlib/${pkgs.stdenv.hostPlatform.rust.rustcTarget}/bin";
+      coverageShellHook = ''
+        export LLVM_COV=${rustLlvmBin}/llvm-cov
+        export LLVM_PROFDATA=${rustLlvmBin}/llvm-profdata
+      '';
       ciRustShellHook = ''
         export RUST_SRC_PATH=${rustToolchain.rust-src}/lib/rustlib/src/rust/library
         export RUSTC_WRAPPER=${pkgs.sccache}/bin/sccache
@@ -93,13 +98,11 @@
       devShells.ci-coverage = pkgs.mkShell {
         packages = ciRustPackages ++ [
           pkgs.cargo-llvm-cov
-          pkgs.llvmPackages.llvm
         ];
         buildInputs = [ pkgs.openssl ];
         shellHook = ''
           ${ciRustShellHook}
-          export LLVM_COV=${pkgs.llvmPackages.llvm}/bin/llvm-cov
-          export LLVM_PROFDATA=${pkgs.llvmPackages.llvm}/bin/llvm-profdata
+          ${coverageShellHook}
           # Coverage must exercise the same pinned native DID paths as the
           # developer shell. Without these inputs the artifact-backed tests
           # return early while still reporting success.
@@ -162,8 +165,7 @@
 
         shellHook = ''
           export RUST_SRC_PATH=${rustToolchain.rust-src}/lib/rustlib/src/rust/library
-          export LLVM_COV=${pkgs.llvmPackages.llvm}/bin/llvm-cov
-          export LLVM_PROFDATA=${pkgs.llvmPackages.llvm}/bin/llvm-profdata
+          ${coverageShellHook}
           export JAVA_HOME=${pkgs.jdk17.home}
           export PATH="$JAVA_HOME/bin:$PATH"
           export COMPACT_DIRECTORY=${midnightDidPackages.compact-toolchain}
