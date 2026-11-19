@@ -6175,12 +6175,6 @@ fn AccountSyncCard(
     let mut realm_lifecycle_wake = consume_context::<Signal<WalletRealmLifecycleWake>>();
     let WalletRealmProjectionWake(realm_projection_wake) =
         consume_context::<WalletRealmProjectionWake>();
-    let state = use_signal(|| AccountSyncCardState::Loading);
-    let load_services = services.clone();
-    let load_profile = profile_id.clone();
-    use_effect(move || {
-        let _projection_generation = realm_projection_wake();
-        begin_account_sync_card_observation(
     let dust_settlement_port = services.wallet_dust_settlement();
     let mut dust_settlement = use_signal(|| dust_settlement_port.subscribe().borrow().clone());
     use_future(move || {
@@ -6197,12 +6191,18 @@ fn AccountSyncCard(
             }
         }
     });
+    let state = use_signal(|| AccountSyncCardState::Loading);
+    let load_services = services.clone();
+    let load_profile = profile_id.clone();
+    use_effect(move || {
+        let _projection_generation = realm_projection_wake();
+        let _settlement_observation = dust_settlement.read();
+        begin_account_sync_card_observation(
             load_services.clone(),
             load_profile.clone(),
             state,
             on_account_updated,
         );
-        let _settlement_observation = dust_settlement.read();
     });
 
     match state.read().clone() {
@@ -6251,28 +6251,28 @@ fn AccountSyncCard(
             let syncing = selected_realm_is_syncing(realm);
             let overall_state = selected_realm_sync_state(realm);
             let lifecycle = selected_realm_lifecycle_presentation(overall_state);
-            let provenance = selected_realm_provenance(realm);
-            let chain_tip = selected_realm_chain_tip(realm);
-            let progress = selected_realm_sync_progress(realm);
-            let dust_balance = selected_realm_dust_balance(&realm.dust);
-            let dust_state = selected_realm_dust_state(&realm.dust);
-            let dust_note = selected_realm_dust_note(&realm.dust);
             let account_state = selected_realm_sync::selected_realm_account_state(&realm.account);
             let account_status = selected_realm_lifecycle_presentation(account_state);
             let (dust_label, dust_tone) =
                 selected_realm_sync::wallet_dust_status(&projection, &dust_settlement.read());
             let observed_dust = selected_realm_sync::wallet_dust_observed_amount(&realm.dust);
-            let shielded_night = selected_realm_shielded_balance(&realm.shielded);
-            let shielded_state = selected_realm_shielded_state(&realm.shielded);
-            let shielded_note = selected_realm_shielded_note(&realm.shielded);
-            let owned_notes = match &realm.shielded {
-                WalletRealmFamilyView::Ready(status) => status
+            let provenance = selected_realm_provenance(realm);
+            let chain_tip = selected_realm_chain_tip(realm);
+            let progress = selected_realm_sync_progress(realm);
+            let dust_balance = selected_realm_dust_balance(&realm.dust);
+            let dust_state = selected_realm_dust_state(&realm.dust);
             let dust_progress = match &realm.dust {
                 WalletRealmFamilyView::Ready(status) if dust_state == "syncing" => {
                     dust_progress_percent(status)
                 }
                 _ => None,
             };
+            let dust_note = selected_realm_dust_note(&realm.dust);
+            let shielded_night = selected_realm_shielded_balance(&realm.shielded);
+            let shielded_state = selected_realm_shielded_state(&realm.shielded);
+            let shielded_note = selected_realm_shielded_note(&realm.shielded);
+            let owned_notes = match &realm.shielded {
+                WalletRealmFamilyView::Ready(status) => status
                     .owned_note_count
                     .map_or_else(|| "—".to_owned(), |count| count.to_string()),
                 _ => "—".to_owned(),
@@ -12514,12 +12514,6 @@ mod tests {
     }
 
     #[test]
-    fn shielded_progress_and_cached_copy_preserve_live_readiness() {
-        assert_eq!(
-            shielded_progress_percent(&shielded_status("syncing", Some(0), Some(2))),
-            Some(33)
-        );
-    #[test]
     fn wallet_status_separates_live_night_dust_balance_and_registration() {
         use oxid_wallet_application::{
             ChainNetworkId, SelectedWalletRealmActionReadiness, SelectedWalletRealmIdentity,
@@ -12613,6 +12607,12 @@ mod tests {
         assert_eq!(wallet_dust_status(&realm, &settlement).0, "Ready");
     }
 
+    #[test]
+    fn shielded_progress_and_cached_copy_preserve_live_readiness() {
+        assert_eq!(
+            shielded_progress_percent(&shielded_status("syncing", Some(0), Some(2))),
+            Some(33)
+        );
         assert_eq!(
             shielded_progress_percent(&shielded_status("synced", Some(2), Some(2))),
             Some(100)
