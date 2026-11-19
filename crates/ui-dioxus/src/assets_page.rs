@@ -344,22 +344,24 @@ pub(super) fn AssetsPage(
                     }
                 }
 
-                AccountSyncCard {
-                    key: "{realm_card_key}",
-                    profile_id: active_profile.id.clone(),
-                    secret_mode,
-                    can_sync: protection_unlocked,
-                    account_unavailable: unavailable,
-                    on_account_updated: move |updated_account| {
-                        state.set(AccountPageState::Ready {
-                            networks: networks.clone(),
-                            account: Box::new(updated_account),
-                            security,
-                            custody_recovery_required,
-                            busy: None,
-                        });
-                    },
-                }
+                {rsx! {
+                    AccountSyncCard {
+                        key: "{realm_card_key}",
+                        profile_id: active_profile.id.clone(),
+                        secret_mode,
+                        can_sync: protection_unlocked,
+                        account_unavailable: unavailable,
+                        on_account_updated: move |updated_account| {
+                            state.set(AccountPageState::Ready {
+                                networks: networks.clone(),
+                                account: Box::new(updated_account),
+                                security,
+                                custody_recovery_required,
+                                busy: None,
+                            });
+                        },
+                    }
+                }}
 
                 if custody_recovery_required {
                     article { class: "surface-card account-sync-card", role: "alert",

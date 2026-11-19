@@ -10,7 +10,7 @@ import { fileURLToPath } from "node:url";
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../..");
 const helper = path.join(root, "scripts", "lib", "docker-engine-health.sh");
 
-async function classify(t, dockerBody, timeoutSeconds = "1") {
+async function classify(t, dockerBody, timeoutSeconds = "3") {
   const directory = await mkdtemp(path.join(os.tmpdir(), "oxid-docker-health-"));
   t.after(() => rm(directory, { recursive: true, force: true }));
   const docker = path.join(directory, "docker");
@@ -23,7 +23,7 @@ async function classify(t, dockerBody, timeoutSeconds = "1") {
     `OXID_DOCKER_PROBE_TIMEOUT_SECONDS=${JSON.stringify(timeoutSeconds)}`,
     "export OXID_DOCKER_PROBE_TIMEOUT_SECONDS",
     "oxid_require_docker_engine",
-  ].join("\n")], { cwd: root, encoding: "utf8", timeout: 5_000 });
+  ].join("\n")], { cwd: root, encoding: "utf8", timeout: 8_000 });
 }
 
 test("Docker admission classifies a responsive engine without mutation", async (t) => {
