@@ -27,10 +27,15 @@
         import (
           builtins.toFile "oxid-import-cargo-lock.nix" (
             builtins.replaceStrings
-              [ lookupByName "./replace-workspace-values.py" ]
+              [
+                lookupByName
+                "  jq,\n"
+                "readFile ./replace-workspace-values.py"
+              ]
               [
                 lookupByVersion
-                (builtins.toJSON (toString (cargoVendorPath + "/replace-workspace-values.py")))
+                "  jq,\n  workspaceValuesSource,\n"
+                "workspaceValuesSource"
               ]
               cargoVendorSource
           )
@@ -38,6 +43,7 @@
       buildRustPackage = rustPlatform.buildRustPackage.override {
         importCargoLock = pkgs.buildPackages.callPackage versionedCargoVendor {
           inherit (rustToolchain) cargo;
+          workspaceValuesSource = builtins.readFile (cargoVendorPath + "/replace-workspace-values.py");
           # Compact's retained CI evidence mentions Nix store paths. Fetch the
           # reviewed Git tree directly so the evidence does not enter a fetchgit
           # fixed-output derivation. Keep the exact revision and NAR hash.
