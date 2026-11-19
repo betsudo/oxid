@@ -1927,7 +1927,7 @@ mod tests {
                 .await
                 .expect("test node binds");
             let address = listener.local_addr().expect("test node address");
-            let endpoint = format!("ws://{address}");
+            let endpoint = format!("wss://{address}");
             let disconnect = async {
                 let (connection, _) = timeout(CONNECT_TIMEOUT, listener.accept())
                     .await
