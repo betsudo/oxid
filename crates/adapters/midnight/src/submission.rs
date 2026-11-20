@@ -50,9 +50,7 @@ use reqwest::{Method, StatusCode, Url, header::CONTENT_TYPE};
 use serde_json::{Value, json};
 use subxt::{OnlineClient, SubstrateConfig, backend::rpc::RpcClient, dynamic};
 use tokio::time::timeout;
-use tokio_tungstenite::tungstenite::{
-    Message, client::IntoClientRequest, protocol::WebSocketConfig,
-};
+use tokio_tungstenite::tungstenite::{Message, protocol::WebSocketConfig};
 
 use crate::{
     MidnightIndexerConfig, MidnightIndexerConfigError, MidnightLocalProvingConfig,
@@ -71,6 +69,11 @@ use crate::{
 const DUST_QUERY: &str = include_str!("../queries/dust_ledger_events.graphql");
 const CHAIN_TIP_QUERY: &str = include_str!("../queries/chain_tip.graphql");
 const DUST_BALANCE_SEGMENT: u16 = 0xFEED;
+use crate::preprod_transport::{
+    INDEXER_ROUTE, INDEXER_SOCKET_ROUTE, MidnightPreprodCredential, MidnightPreprodPreflightError,
+    MidnightTransportRoute, is_preprod_node_route, preflight_blockfrost_preprod,
+};
+
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
 const ACK_TIMEOUT: Duration = Duration::from_secs(15);
 const IDLE_TIMEOUT: Duration = Duration::from_secs(5);
@@ -236,6 +239,55 @@ impl MidnightStandaloneConfig {
         })
     }
 
+    /// Installs one PreProd credential atomically for the exact configured node and indexer cohort.
+    pub fn with_preprod_credential(
+        mut self,
+        credential: MidnightPreprodCredential,
+    ) -> Result<Self, MidnightStandaloneConfigError> {
+        if self.indexer.network_id().as_str() != "preprod"
+            || self.indexer_http_url != INDEXER_ROUTE
+            || self.indexer.websocket_url() != INDEXER_SOCKET_ROUTE
+            || !is_preprod_node_route(&self.node_websocket_url)
+        {
+            return Err(MidnightStandaloneConfigError::InvalidPreprodRoutes);
+        }
+        self.indexer.preprod_credential = Some(Arc::new(credential));
+        Ok(self)
+    }
+
+    /// Executes a read-only genesis and indexer check using the configured routes.
+    pub async fn verify_preprod_chain(
+        &self,
+        genesis_hash: &[u8; 32],
+    ) -> Result<u64, MidnightPreprodPreflightError> {
+        let credential = self
+            .indexer
+            .preprod_credential
+            .as_deref()
+            .ok_or(MidnightPreprodPreflightError::InvalidCredential)?;
+        preflight_blockfrost_preprod(
+            self.node_websocket_url(),
+            self.indexer_http_url(),
+            genesis_hash,
+            credential,
+        )
+        .await
+    }
+
+    pub(crate) fn indexer_http_route(&self) -> MidnightTransportRoute<'_> {
+        MidnightTransportRoute::new(
+            &self.indexer_http_url,
+            self.indexer.preprod_credential.as_deref(),
+        )
+    }
+
+    fn node_route(&self) -> MidnightTransportRoute<'_> {
+        MidnightTransportRoute::new(
+            &self.node_websocket_url,
+            self.indexer.preprod_credential.as_deref(),
+        )
+    }
+
     #[must_use]
     pub const fn indexer(&self) -> &MidnightIndexerConfig {
         &self.indexer
@@ -264,6 +316,7 @@ pub enum MidnightStandaloneConfigError {
     InvalidIndexerHttpEndpoint,
     InvalidNodeEndpoint,
     InvalidProofEndpoint,
+    InvalidPreprodRoutes,
 }
 
 impl fmt::Display for MidnightStandaloneConfigError {
@@ -275,6 +328,9 @@ impl fmt::Display for MidnightStandaloneConfigError {
             }
             Self::InvalidNodeEndpoint => {
                 formatter.write_str("Midnight node WebSocket endpoint is invalid")
+            }
+            Self::InvalidPreprodRoutes => {
+                formatter.write_str("Midnight PreProd routes are invalid")
             }
             Self::InvalidProofEndpoint => formatter.write_str(
                 "Midnight proof endpoint must use loopback HTTP or HTTPS without credentials",
@@ -315,24 +371,11 @@ pub async fn authenticate_midnight_chain_identity(
     node_websocket_url: &str,
     expected_genesis_hash: &[u8; 32],
 ) -> Result<(), MidnightChainIdentityError> {
-    authenticate_midnight_chain_identity_with_headers(
-        node_websocket_url,
-        expected_genesis_hash,
-        reqwest::header::HeaderMap::new(),
-    )
-    .await
-}
-
-pub(super) async fn authenticate_midnight_chain_identity_with_headers(
-    node_websocket_url: &str,
-    expected_genesis_hash: &[u8; 32],
-    headers: reqwest::header::HeaderMap,
-) -> Result<(), MidnightChainIdentityError> {
     super::indexer::validate_websocket_url(node_websocket_url)
         .map_err(|_| MidnightChainIdentityError::InvalidNodeEndpoint)?;
     let client = timeout(
         CONNECT_TIMEOUT,
-        connect_midnight_node_with_headers(node_websocket_url, headers),
+        connect_midnight_node(MidnightTransportRoute::new(node_websocket_url, None)),
     )
     .await
     .map_err(|_| MidnightChainIdentityError::NodeUnavailable)?
@@ -346,8 +389,10 @@ pub(super) async fn authenticate_midnight_chain_identity_with_headers(
     }
 }
 
-async fn connect_midnight_node(endpoint: &str) -> Result<OnlineClient<SubstrateConfig>, ()> {
-    connect_midnight_node_with_headers(endpoint, reqwest::header::HeaderMap::new()).await
+async fn connect_midnight_node(
+    route: MidnightTransportRoute<'_>,
+) -> Result<OnlineClient<SubstrateConfig>, ()> {
+    connect_midnight_node_with_headers(route.endpoint(), route.headers().map_err(|_| ())?).await
 }
 
 async fn connect_midnight_node_with_headers(
@@ -464,13 +509,10 @@ async fn reconcile_live_submission(
     config: &MidnightStandaloneConfig,
     entry: &StoredSubmissionJournalEntry,
 ) -> Result<MidnightSubmissionReconciliation, WalletTransactionPortError> {
-    let client = timeout(
-        CONNECT_TIMEOUT,
-        connect_midnight_node(config.node_websocket_url()),
-    )
-    .await
-    .map_err(|_| WalletTransactionPortError::Timeout)?
-    .map_err(|_| WalletTransactionPortError::Unavailable)?;
+    let client = timeout(CONNECT_TIMEOUT, connect_midnight_node(config.node_route()))
+        .await
+        .map_err(|_| WalletTransactionPortError::Timeout)?
+        .map_err(|_| WalletTransactionPortError::Unavailable)?;
     let mut block = timeout(CONNECT_TIMEOUT, client.blocks().at_latest())
         .await
         .map_err(|_| WalletTransactionPortError::Timeout)?
@@ -525,7 +567,7 @@ async fn reconcile_live_submission(
     if !reached_anchor {
         return Ok(MidnightSubmissionReconciliation::Unresolved);
     }
-    let chain_tip = fetch_chain_tip(config.indexer_http_url()).await?;
+    let chain_tip = fetch_chain_tip(config.indexer_http_route()).await?;
     if Timestamp::from_secs(entry.expires_at.value() / 1_000) <= chain_tip.timestamp {
         Ok(MidnightSubmissionReconciliation::Expired)
     } else {
@@ -539,7 +581,7 @@ where
 {
     fn registration_context(&self) -> MidnightRegistrationContextFuture<'_> {
         Box::pin(async move {
-            let chain_tip = fetch_chain_tip(self.config.indexer_http_url()).await?;
+            let chain_tip = fetch_chain_tip(self.config.indexer_http_route()).await?;
             Ok(MidnightRegistrationContext {
                 timestamp: chain_tip.timestamp,
                 parameters: chain_tip.parameters,
@@ -590,7 +632,7 @@ where
 {
     let cancellation = request.cancellation_token();
     ensure_submission_active(&cancellation)?;
-    let chain_tip = fetch_chain_tip(config.indexer_http_url()).await?;
+    let chain_tip = fetch_chain_tip(config.indexer_http_route()).await?;
     ensure_submission_active(&cancellation)?;
     let dust_public_key = DustPublicKey::from(dust_key.clone());
     let checkpoint = checkpoints
@@ -615,7 +657,7 @@ where
         Ok(())
     };
     let synchronized = synchronize_dust_with_control(
-        config.indexer.websocket_url(),
+        config.indexer.websocket_route(),
         dust_key,
         chain_tip.parameters.dust,
         checkpoint,
@@ -704,13 +746,8 @@ where
         return Err(WalletTransactionPortError::InvalidData);
     }
     ensure_submission_active(&cancellation)?;
-    let (transaction_hash, block_hash, block_height) = submit_unsigned(
-        config.node_websocket_url(),
-        transaction_bytes,
-        &request,
-        fee_specks,
-    )
-    .await?;
+    let (transaction_hash, block_hash, block_height) =
+        submit_unsigned(config.node_route(), transaction_bytes, &request, fee_specks).await?;
     Ok(MidnightCompletionOutcome {
         fee_specks,
         transaction_hash,
@@ -749,15 +786,50 @@ pub(crate) struct ChainTip {
 }
 
 pub(crate) async fn fetch_chain_tip(
-    endpoint: &str,
+    route: MidnightTransportRoute<'_>,
 ) -> Result<ChainTip, WalletTransactionPortError> {
-    fetch_chain_tip_with_headers(endpoint, reqwest::header::HeaderMap::new()).await
+    let headers = route
+        .headers()
+        .map_err(|_| WalletTransactionPortError::Unavailable)?;
+    fetch_chain_tip_with_headers(route.endpoint(), headers).await
 }
 
 pub(super) async fn fetch_chain_tip_with_headers(
     endpoint: &str,
     headers: reqwest::header::HeaderMap,
 ) -> Result<ChainTip, WalletTransactionPortError> {
+    let body = fetch_chain_tip_body(endpoint, headers).await?;
+    decode_chain_tip_body(&body)
+}
+
+/// Returns the Ledger 9 tip height and its 32-byte block hash for node comparison.
+pub(super) async fn fetch_identified_chain_tip(
+    route: MidnightTransportRoute<'_>,
+) -> Result<(u64, [u8; 32]), WalletTransactionPortError> {
+    let headers = route
+        .headers()
+        .map_err(|_| WalletTransactionPortError::Unavailable)?;
+    let body = fetch_chain_tip_body(route.endpoint(), headers).await?;
+    decode_identified_chain_tip(&body)
+}
+
+fn decode_identified_chain_tip(body: &[u8]) -> Result<(u64, [u8; 32]), WalletTransactionPortError> {
+    let root = parse_chain_tip_body(body)?;
+    let tip = decode_chain_tip(&root)?;
+    let hash = root
+        .pointer("/data/block/hash")
+        .and_then(Value::as_str)
+        .ok_or(WalletTransactionPortError::InvalidChainState)?;
+    let mut bytes = [0; 32];
+    hex::decode_to_slice(hash.strip_prefix("0x").unwrap_or(hash), &mut bytes)
+        .map_err(|_| WalletTransactionPortError::InvalidChainState)?;
+    Ok((tip.height, bytes))
+}
+
+async fn fetch_chain_tip_body(
+    endpoint: &str,
+    headers: reqwest::header::HeaderMap,
+) -> Result<Vec<u8>, WalletTransactionPortError> {
     ensure_tls_provider()?;
     let endpoint = Url::parse(endpoint).map_err(|_| WalletTransactionPortError::Unavailable)?;
     let client = chain_tip_client(&endpoint)?;
@@ -768,10 +840,9 @@ pub(super) async fn fetch_chain_tip_with_headers(
         .await
         .map_err(|_| WalletTransactionPortError::Unavailable)?;
     validate_chain_tip_status(response.status())?;
-    let body = bounded_response(response, MAX_CHAIN_TIP_BYTES)
+    bounded_response(response, MAX_CHAIN_TIP_BYTES)
         .await
-        .map_err(|_| WalletTransactionPortError::InvalidChainState)?;
-    decode_chain_tip_body(&body)
+        .map_err(|_| WalletTransactionPortError::InvalidChainState)
 }
 
 fn chain_tip_request(endpoint: &str) -> Result<reqwest::Request, WalletTransactionPortError> {
@@ -808,12 +879,14 @@ fn validate_chain_tip_status(status: StatusCode) -> Result<(), WalletTransaction
 }
 
 fn decode_chain_tip_body(body: &[u8]) -> Result<ChainTip, WalletTransactionPortError> {
+    decode_chain_tip(&parse_chain_tip_body(body)?)
+}
+
+fn parse_chain_tip_body(body: &[u8]) -> Result<Value, WalletTransactionPortError> {
     if body.len() > MAX_CHAIN_TIP_BYTES {
         return Err(WalletTransactionPortError::InvalidChainState);
     }
-    let root: Value =
-        serde_json::from_slice(body).map_err(|_| WalletTransactionPortError::InvalidChainState)?;
-    decode_chain_tip(&root)
+    serde_json::from_slice(body).map_err(|_| WalletTransactionPortError::InvalidChainState)
 }
 
 fn decode_chain_tip(root: &Value) -> Result<ChainTip, WalletTransactionPortError> {
@@ -864,7 +937,7 @@ async fn synchronize_dust(
     let cancellation = AtomicBool::new(false);
     let mut ignore_progress = |_: &DustSyncProgress<'_>| Ok(());
     synchronize_dust_controlled(
-        endpoint,
+        MidnightTransportRoute::new(endpoint, None),
         dust_key,
         parameters,
         checkpoint,
@@ -875,7 +948,7 @@ async fn synchronize_dust(
 }
 
 pub(crate) async fn synchronize_dust_controlled(
-    endpoint: &str,
+    route: MidnightTransportRoute<'_>,
     dust_key: &DustSecretKey,
     parameters: DustParameters,
     checkpoint: Option<StoredDustCheckpoint>,
@@ -915,20 +988,14 @@ pub(crate) async fn synchronize_dust_controlled(
             };
             let starting_id = i64::try_from(starting_id)
                 .map_err(|_| WalletTransactionPortError::InvalidChainState)?;
-            let mut request = endpoint
-                .into_client_request()
+            let request = route
+                .graphql_request()
                 .map_err(|_| WalletTransactionPortError::Unavailable)?;
-            request.headers_mut().insert(
-                "Sec-WebSocket-Protocol",
-                "graphql-transport-ws"
-                    .parse()
-                    .map_err(|_| WalletTransactionPortError::InvalidChainState)?,
-            );
             let mut websocket_config = WebSocketConfig::default();
             websocket_config.max_message_size = Some(MAX_MESSAGE_BYTES);
             websocket_config.max_frame_size = Some(MAX_FRAME_BYTES);
-            let endpoint_url =
-                Url::parse(endpoint).map_err(|_| WalletTransactionPortError::Unavailable)?;
+            let endpoint_url = Url::parse(route.endpoint())
+                .map_err(|_| WalletTransactionPortError::Unavailable)?;
             let connector = websocket_connector_for(&endpoint_url)
                 .map_err(|_| WalletTransactionPortError::Unavailable)?;
             let connected = timeout(
@@ -1235,7 +1302,7 @@ async fn synchronize_dust_with_fallback(
     let cancellation = AtomicBool::new(false);
     let mut ignore_progress = |_: &DustSyncProgress<'_>| Ok(());
     synchronize_dust_with_control(
-        endpoint,
+        MidnightTransportRoute::new(endpoint, None),
         dust_key,
         parameters,
         checkpoint,
@@ -1246,7 +1313,7 @@ async fn synchronize_dust_with_fallback(
 }
 
 pub(crate) async fn synchronize_dust_with_control(
-    endpoint: &str,
+    route: MidnightTransportRoute<'_>,
     dust_key: &DustSecretKey,
     parameters: DustParameters,
     checkpoint: Option<StoredDustCheckpoint>,
@@ -1267,7 +1334,7 @@ pub(crate) async fn synchronize_dust_with_control(
             result
         };
         synchronize_dust_controlled(
-            endpoint,
+            route,
             dust_key,
             parameters,
             checkpoint,
@@ -1280,7 +1347,7 @@ pub(crate) async fn synchronize_dust_with_control(
         Err(WalletTransactionPortError::InvalidChainState)
             if had_checkpoint && !emitted_progress && !observer_failed =>
         {
-            synchronize_dust_controlled(endpoint, dust_key, parameters, None, cancellation, observe)
+            synchronize_dust_controlled(route, dust_key, parameters, None, cancellation, observe)
                 .await
         }
         result => result,
@@ -1607,12 +1674,12 @@ async fn prove_via_http(
 }
 
 async fn submit_unsigned(
-    endpoint: &str,
+    route: MidnightTransportRoute<'_>,
     transaction: Vec<u8>,
     request: &MidnightCompletionRequest,
     fee_specks: u128,
 ) -> Result<([u8; 32], [u8; 32], u64), WalletTransactionPortError> {
-    let client = timeout(CONNECT_TIMEOUT, connect_midnight_node(endpoint))
+    let client = timeout(CONNECT_TIMEOUT, connect_midnight_node(route))
         .await
         .map_err(|_| WalletTransactionPortError::Timeout)?
         .map_err(|_| WalletTransactionPortError::Unavailable)?;
@@ -1935,6 +2002,42 @@ mod tests {
     }
 
     #[test]
+    fn blockfrost_credential_can_only_be_installed_on_complete_preprod_route_cohort() {
+        fn config(network: &str, ws: &str) -> MidnightStandaloneConfig {
+            MidnightStandaloneConfig::new_without_unshielded_address(
+                network,
+                ws,
+                INDEXER_ROUTE,
+                crate::preprod_transport::NODE_ROUTE,
+                "https://proof.example.test",
+            )
+            .unwrap()
+        }
+        fn credential() -> MidnightPreprodCredential {
+            MidnightPreprodCredential::new(format!("nightpreprod{}", "X".repeat(32))).unwrap()
+        }
+
+        let config_before = config("preprod", INDEXER_SOCKET_ROUTE);
+        assert!(config_before.indexer_http_route().headers().is_err());
+        assert!(config_before.node_route().headers().is_err());
+        let configured = config_before.with_preprod_credential(credential()).unwrap();
+        assert_eq!(configured.indexer_http_url(), INDEXER_ROUTE);
+        assert_eq!(configured.indexer().websocket_url(), INDEXER_SOCKET_ROUTE);
+        assert!(configured.node_route().headers().unwrap()["project_id"].is_sensitive());
+        assert!(configured.indexer_http_route().headers().unwrap()["project_id"].is_sensitive());
+        assert!(!format!("{configured:?}").contains("nightpreprodXXXX"));
+        for (network, ws) in [
+            ("preview", INDEXER_SOCKET_ROUTE),
+            ("preprod", "wss://other.example.test/api/v0/ws"),
+        ] {
+            assert_eq!(
+                config(network, ws).with_preprod_credential(credential()),
+                Err(MidnightStandaloneConfigError::InvalidPreprodRoutes),
+            );
+        }
+    }
+
+    #[test]
     fn transaction_submission_connection_failure_does_not_create_a_broadcast_record() {
         let entry = submission_entry(StoredSubmissionState::Broadcasting);
         let journal: Arc<dyn MidnightSubmissionJournalStore> =
@@ -1975,7 +2078,12 @@ mod tests {
                 drop(connection);
             };
             let (result, ()) = tokio::join!(
-                submit_unsigned(&endpoint, vec![0], &request, entry.fee_specks),
+                submit_unsigned(
+                    MidnightTransportRoute::new(&endpoint, None),
+                    vec![0],
+                    &request,
+                    entry.fee_specks
+                ),
                 disconnect,
             );
             result
@@ -2564,6 +2672,26 @@ mod tests {
     }
 
     #[test]
+    fn preprod_identified_tip_requires_a_full_hash_and_ledger9_parameters() {
+        let mut parameters = Vec::new();
+        midnight_serialize::tagged_serialize(&INITIAL_PARAMETERS, &mut parameters).unwrap();
+        let mut tip = json!({
+            "data": { "block": {
+                "height": 42,
+                "timestamp": 1_750_000_000_000_u64,
+                "hash": "42".repeat(32),
+                "ledgerParameters": hex::encode(parameters),
+            }}
+        });
+        assert_eq!(
+            decode_identified_chain_tip(&serde_json::to_vec(&tip).unwrap()).unwrap(),
+            (42, [0x42; 32]),
+        );
+        tip["data"]["block"]["hash"] = json!("1234");
+        assert!(decode_identified_chain_tip(&serde_json::to_vec(&tip).unwrap()).is_err());
+    }
+
+    #[test]
     fn chain_tip_authenticates_one_request_and_refuses_redirects() {
         const PROJECT_ID: &str = "fixture-indexer-credential";
         let redirect_target = TcpListener::bind(("127.0.0.1", 0)).unwrap();
@@ -2785,7 +2913,7 @@ mod tests {
         let mut observed = Vec::new();
         let synchronized = runtime()
             .block_on(synchronize_dust_controlled(
-                &endpoint,
+                MidnightTransportRoute::new(&endpoint, None),
                 &dust_key,
                 INITIAL_PARAMETERS.dust,
                 None,
@@ -2882,7 +3010,7 @@ mod tests {
         let cancellation = AtomicBool::new(false);
         let mut observed = Vec::new();
         let result = runtime().block_on(synchronize_dust_controlled(
-            &endpoint,
+            MidnightTransportRoute::new(&endpoint, None),
             &dust_key,
             INITIAL_PARAMETERS.dust,
             None,
@@ -2942,7 +3070,7 @@ mod tests {
         let cancellation = AtomicBool::new(false);
         let mut observer_calls = 0_usize;
         let result = runtime().block_on(synchronize_dust_with_control(
-            &endpoint,
+            MidnightTransportRoute::new(&endpoint, None),
             &dust_key,
             INITIAL_PARAMETERS.dust,
             Some(StoredDustCheckpoint {

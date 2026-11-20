@@ -9,8 +9,8 @@ use oxid_adapter_did_midnight::{HttpDidResolver, HttpDidResolverConfig};
 use oxid_adapter_midnight::unavailable_midnight_wallet;
 #[cfg(not(target_arch = "wasm32"))]
 use oxid_adapter_midnight::{
-    MidnightStandaloneConfig, authenticate_midnight_chain_identity,
-    protected_standalone_midnight_wallet,
+    MidnightPreprodCredential, MidnightPreprodPreflightError, MidnightStandaloneConfig,
+    authenticate_midnight_chain_identity, protected_standalone_midnight_wallet,
 };
 
 use super::identity::{
@@ -159,6 +159,8 @@ pub enum ProductionDeploymentCompositionError {
     PreviewStartupRuntimeUnavailable,
     ChainIdentityUnavailable,
     ChainIdentityMismatch,
+    PreprodIndexerUnavailable,
+    PreprodChainViewMismatch,
     InvalidSsiProfile,
     PlatformStorageUnavailable,
     NativeDidDeploymentUnavailable,
@@ -178,6 +180,10 @@ impl fmt::Display for ProductionDeploymentCompositionError {
             Self::ChainIdentityMismatch => {
                 "authenticated Midnight chain identity does not match the node"
             }
+            Self::PreprodIndexerUnavailable => "authenticated PreProd indexer is unavailable",
+            Self::PreprodChainViewMismatch => {
+                "PreProd node and indexer disagree on the indexed block"
+            }
             Self::InvalidSsiProfile => "authenticated SSI deployment profile is invalid",
             Self::PlatformStorageUnavailable => "protected platform storage is unavailable",
             Self::NativeDidDeploymentUnavailable => "native Midnight DID deployment is unavailable",
@@ -188,6 +194,21 @@ impl fmt::Display for ProductionDeploymentCompositionError {
 #[cfg(not(target_arch = "wasm32"))]
 impl std::error::Error for ProductionDeploymentCompositionError {}
 
+#[cfg(not(target_arch = "wasm32"))]
+fn production_midnight_config(
+    profile: &AuthenticatedDeploymentProfile,
+) -> Result<MidnightStandaloneConfig, ProductionDeploymentCompositionError> {
+    let midnight = profile.midnight();
+    MidnightStandaloneConfig::new_without_unshielded_address(
+        midnight.network_id(),
+        midnight.indexer_websocket_url(),
+        midnight.indexer_http_url(),
+        midnight.node_websocket_url(),
+        midnight.proof_server_url(),
+    )
+    .map_err(|_| ProductionDeploymentCompositionError::InvalidMidnightProfile)
+}
+
 /// Binds a signed deployment profile to the genesis hash returned by its
 /// reviewed node route. The caller cannot provide alternate endpoints after
 /// this asynchronous gate succeeds.
@@ -195,15 +216,8 @@ impl std::error::Error for ProductionDeploymentCompositionError {}
 pub async fn authenticate_production_deployment(
     profile: AuthenticatedDeploymentProfile,
 ) -> Result<AuthenticatedProductionDeployment, ProductionDeploymentCompositionError> {
+    let config = production_midnight_config(&profile)?;
     let midnight = profile.midnight();
-    let config = MidnightStandaloneConfig::new_without_unshielded_address(
-        midnight.network_id(),
-        midnight.indexer_websocket_url(),
-        midnight.indexer_http_url(),
-        midnight.node_websocket_url(),
-        midnight.proof_server_url(),
-    )
-    .map_err(|_| ProductionDeploymentCompositionError::InvalidMidnightProfile)?;
     authenticate_midnight_chain_identity(midnight.node_websocket_url(), midnight.genesis_hash())
         .await
         .map_err(|error| match error {
@@ -213,6 +227,45 @@ pub async fn authenticate_production_deployment(
             oxid_adapter_midnight::MidnightChainIdentityError::InvalidNodeEndpoint
             | oxid_adapter_midnight::MidnightChainIdentityError::NodeUnavailable => {
                 ProductionDeploymentCompositionError::ChainIdentityUnavailable
+            }
+        })?;
+    Ok(AuthenticatedProductionDeployment {
+        profile,
+        midnight: config,
+    })
+}
+
+/// Binds the signed PreProd deployment to the authenticated Blockfrost cohort.
+#[cfg(not(target_arch = "wasm32"))]
+pub async fn authenticate_preprod_deployment(
+    profile: AuthenticatedDeploymentProfile,
+    credential: MidnightPreprodCredential,
+) -> Result<AuthenticatedProductionDeployment, ProductionDeploymentCompositionError> {
+    let config = production_midnight_config(&profile)?;
+    let midnight = profile.midnight();
+    // Validate every wallet route before the provider credential reaches a request.
+    let config = config
+        .with_preprod_credential(credential)
+        .map_err(|_| ProductionDeploymentCompositionError::InvalidMidnightProfile)?;
+    config
+        .verify_preprod_chain(midnight.genesis_hash())
+        .await
+        .map_err(|error| match error {
+            MidnightPreprodPreflightError::GenesisMismatch => {
+                ProductionDeploymentCompositionError::ChainIdentityMismatch
+            }
+            MidnightPreprodPreflightError::IndexerUnavailable => {
+                ProductionDeploymentCompositionError::PreprodIndexerUnavailable
+            }
+            MidnightPreprodPreflightError::ChainViewMismatch => {
+                ProductionDeploymentCompositionError::PreprodChainViewMismatch
+            }
+            MidnightPreprodPreflightError::NodeUnavailable => {
+                ProductionDeploymentCompositionError::ChainIdentityUnavailable
+            }
+            MidnightPreprodPreflightError::InvalidCredential
+            | MidnightPreprodPreflightError::InvalidRoute => {
+                ProductionDeploymentCompositionError::InvalidMidnightProfile
             }
         })?;
     Ok(AuthenticatedProductionDeployment {

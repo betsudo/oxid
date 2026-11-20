@@ -67,6 +67,23 @@ stored in the app data directory scoped by network and genesis.
 Deploy the artifact only to the receipt-owned simulator. Preview requires live
 qualification. PreProd startup also requires the separate Blockfrost transport.
 
+## Check the PreProd network before starting the wallet
+
+Use the expected genesis from the independently reviewed signed profile.
+Supply the PreProd project ID from a private input source that emits only the
+credential, such as an owner-readable file. Use the normal local toolchain to
+build the operator probe.
+
+```bash
+./bootstrap.sh -- cargo build --locked -p oxid-adapter-midnight --example preprod_preflight
+target/debug/examples/preprod_preflight "$REVIEWED_PREPROD_GENESIS_HEX"   < "$OXID_PREPROD_PROJECT_ID_FILE"
+```
+
+The probe confirms the signed genesis over node WSS and checks the exact hash
+of the HTTP indexer tip at the same node height. Its receipt contains a public
+height or a bounded failure category. The mobile PreProd startup and Portal
+issuance require their own qualification.
+
 ## Qualify the public app
 
 Use protected native custody. On the receipt-owned simulator, fund the fresh

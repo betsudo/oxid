@@ -27,17 +27,19 @@ connection deadlines, response limits, and redirect refusal. Request failures
 surface bounded categories. They never report headers, remote response
 payloads, or the provider token. Do not persist the token with the profile or
 the wallet. The read-only preflight checks node genesis against the signed
-profile and verifies that the exact indexer returns a valid Ledger 9 tip.
+profile and compares the indexer's Ledger 9 tip hash with the canonical
+node block at the same height. A node/indexer mismatch blocks composition.
 
 ## Verification and adoption
 
 1. Test native request construction, rejected credentials and routes, actual
    synthetic header receipt, and refusal to forward authentication on redirect.
-2. Wire the provider into the protected PreProd composition, then apply the
-   same policy on GraphQL WebSocket and all PreProd wallet requests.
-3. With the approved signed profile and native secret source, verify the live
-   node runtime, exact genesis, and node/indexer block alignment before
-   enabling wallet activity. Record only public provenance and outcomes.
+2. Install the credential on the complete signed node and indexer cohort.
+   The request boundary applies the same policy to NIGHT, DUST, and shielded
+   subscriptions, tip reads, and node submission and reconciliation.
+3. Wire the native secret provider into mobile startup. With an approved
+   signed profile, verify the live runtime, genesis, and node/indexer block
+   alignment before enabling wallet activity. Record only public provenance and outcomes.
 
 This proposal covers PreProd. Preview and the shared local network retain
 their existing transport configuration.

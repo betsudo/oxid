@@ -37,6 +37,8 @@ use crate::{
     },
 };
 
+use crate::preprod_transport::MidnightTransportRoute;
+
 #[cfg(test)]
 const DUST_ACCOUNT_INDEX: u32 = 0;
 const SIMULATED_TARGET_CURSOR: u64 = 2;
@@ -245,7 +247,7 @@ struct LiveSession {
 trait MidnightDustChainTipSource: Send + Sync {
     fn fetch<'a>(
         &'a self,
-        endpoint: &'a str,
+        route: MidnightTransportRoute<'a>,
     ) -> Pin<Box<dyn Future<Output = Result<ChainTip, WalletTransactionPortError>> + Send + 'a>>;
 }
 
@@ -255,10 +257,10 @@ struct HttpMidnightDustChainTipSource;
 impl MidnightDustChainTipSource for HttpMidnightDustChainTipSource {
     fn fetch<'a>(
         &'a self,
-        endpoint: &'a str,
+        route: MidnightTransportRoute<'a>,
     ) -> Pin<Box<dyn Future<Output = Result<ChainTip, WalletTransactionPortError>> + Send + 'a>>
     {
-        Box::pin(fetch_chain_tip(endpoint))
+        Box::pin(fetch_chain_tip(route))
     }
 }
 
@@ -592,7 +594,7 @@ where
         .build()
         .map_err(|_| WalletTransactionPortError::Unavailable)?;
     runtime.block_on(async {
-        let chain_tip = chain_tips.fetch(config.indexer_http_url()).await?;
+        let chain_tip = chain_tips.fetch(config.indexer_http_route()).await?;
         ensure_submission_active(cancellation)?;
         let checkpoint =
             latest.filter(|checkpoint| checkpoint.state.params == chain_tip.parameters.dust);
@@ -642,7 +644,7 @@ where
                 .map_err(map_dust_to_transaction_error)
         };
         let synchronized = synchronize_dust_with_control(
-            config.indexer().websocket_url(),
+            config.indexer().websocket_route(),
             &secret_key,
             chain_tip.parameters.dust,
             checkpoint,
@@ -1111,7 +1113,7 @@ mod tests {
     impl MidnightDustChainTipSource for FixedChainTipSource {
         fn fetch<'a>(
             &'a self,
-            _: &'a str,
+            _: MidnightTransportRoute<'a>,
         ) -> Pin<Box<dyn Future<Output = Result<ChainTip, WalletTransactionPortError>> + Send + 'a>>
         {
             self.calls.fetch_add(1, Ordering::Relaxed);
@@ -1132,7 +1134,7 @@ mod tests {
     impl MidnightDustChainTipSource for FailingChainTipSource {
         fn fetch<'a>(
             &'a self,
-            _: &'a str,
+            _: MidnightTransportRoute<'a>,
         ) -> Pin<Box<dyn Future<Output = Result<ChainTip, WalletTransactionPortError>> + Send + 'a>>
         {
             self.calls.fetch_add(1, Ordering::Relaxed);

@@ -2,21 +2,30 @@
 
 //! Read-only verification of signed PreProd routes with native Blockfrost authentication.
 
-use std::fmt;
+use std::{fmt, time::Duration};
+
+use tokio_tungstenite::tungstenite::{client::IntoClientRequest, handshake::client::Request};
 
 use reqwest::header::{HeaderMap, HeaderValue};
 use zeroize::Zeroizing;
 
-use super::submission::{
-    MidnightChainIdentityError, authenticate_midnight_chain_identity_with_headers,
-    fetch_chain_tip_with_headers,
+use oxid_adapter_platform_system::connect_json_rpc_websocket_with_headers;
+use subxt::{
+    SubstrateConfig,
+    backend::{legacy::LegacyRpcMethods, rpc::RpcClient},
 };
+use tokio::time::timeout;
 
-const NODE_ROUTE: &str = "wss://rpc.midnight-preprod.blockfrost.io";
-const INDEXER_ROUTE: &str = "https://midnight-preprod.blockfrost.io/api/v0";
+use super::submission::fetch_identified_chain_tip;
+
+const PREFLIGHT_TIMEOUT: Duration = Duration::from_secs(15);
+pub(crate) const NODE_ROUTE: &str = "wss://rpc.midnight-preprod.blockfrost.io";
+pub(crate) const INDEXER_ROUTE: &str = "https://midnight-preprod.blockfrost.io/api/v0";
+pub(crate) const INDEXER_SOCKET_ROUTE: &str = "wss://midnight-preprod.blockfrost.io/api/v0/ws";
 const PROJECT_PREFIX: &str = "nightpreprod";
 
 /// A provider credential supplied to native transport at runtime.
+#[derive(PartialEq, Eq)]
 pub struct MidnightPreprodCredential(Zeroizing<String>);
 
 impl MidnightPreprodCredential {
@@ -47,6 +56,58 @@ impl fmt::Debug for MidnightPreprodCredential {
     }
 }
 
+pub(crate) fn is_preprod_node_route(endpoint: &str) -> bool {
+    [NODE_ROUTE, "wss://rpc.midnight-preprod.blockfrost.io/"].contains(&endpoint)
+}
+
+/// Keeps the public endpoint and optional credential separate until a request is built.
+#[derive(Clone, Copy)]
+pub(crate) struct MidnightTransportRoute<'a> {
+    endpoint: &'a str,
+    credential: Option<&'a MidnightPreprodCredential>,
+}
+
+impl<'a> MidnightTransportRoute<'a> {
+    pub(crate) fn new(
+        endpoint: &'a str,
+        credential: Option<&'a MidnightPreprodCredential>,
+    ) -> Self {
+        Self {
+            endpoint,
+            credential,
+        }
+    }
+
+    pub(crate) fn endpoint(self) -> &'a str {
+        self.endpoint
+    }
+
+    pub(crate) fn headers(self) -> Result<HeaderMap, MidnightPreprodPreflightError> {
+        let preprod = self.endpoint == INDEXER_ROUTE
+            || self.endpoint == INDEXER_SOCKET_ROUTE
+            || is_preprod_node_route(self.endpoint);
+        match (preprod, self.credential) {
+            (true, Some(credential)) => credential.headers(),
+            (true, None) => Err(MidnightPreprodPreflightError::InvalidCredential),
+            (false, Some(_)) => Err(MidnightPreprodPreflightError::InvalidRoute),
+            (false, None) => Ok(HeaderMap::new()),
+        }
+    }
+
+    pub(crate) fn graphql_request(self) -> Result<Request, MidnightPreprodPreflightError> {
+        let mut request = self
+            .endpoint
+            .into_client_request()
+            .map_err(|_| MidnightPreprodPreflightError::InvalidRoute)?;
+        request.headers_mut().extend(self.headers()?);
+        request.headers_mut().insert(
+            "sec-websocket-protocol",
+            HeaderValue::from_static("graphql-transport-ws"),
+        );
+        Ok(request)
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum MidnightPreprodPreflightError {
     InvalidCredential,
@@ -54,6 +115,7 @@ pub enum MidnightPreprodPreflightError {
     NodeUnavailable,
     GenesisMismatch,
     IndexerUnavailable,
+    ChainViewMismatch,
 }
 
 impl fmt::Display for MidnightPreprodPreflightError {
@@ -64,41 +126,59 @@ impl fmt::Display for MidnightPreprodPreflightError {
             Self::NodeUnavailable => "authenticated PreProd node is unavailable",
             Self::GenesisMismatch => "PreProd node genesis differs from the signed profile",
             Self::IndexerUnavailable => "authenticated PreProd indexer is unavailable",
+            Self::ChainViewMismatch => "PreProd node and indexer disagree on the indexed block",
         })
     }
 }
 
 impl std::error::Error for MidnightPreprodPreflightError {}
 
-/// Checks the signed node genesis and reads the indexer tip. The caller
-/// supplies the canonical public routes from a verified deployment profile.
+/// Checks the signed node genesis and compares the indexer tip to the node's
+/// canonical hash. The caller supplies public routes from a verified profile.
 pub async fn preflight_blockfrost_preprod(
     node_url: &str,
     indexer_url: &str,
     genesis_hash: &[u8; 32],
     credential: &MidnightPreprodCredential,
 ) -> Result<u64, MidnightPreprodPreflightError> {
-    if ![NODE_ROUTE, "wss://rpc.midnight-preprod.blockfrost.io/"].contains(&node_url)
-        || indexer_url != INDEXER_ROUTE
-    {
+    if !is_preprod_node_route(node_url) || indexer_url != INDEXER_ROUTE {
         return Err(MidnightPreprodPreflightError::InvalidRoute);
     }
-    authenticate_midnight_chain_identity_with_headers(
-        node_url,
-        genesis_hash,
-        credential.headers()?,
+    let client = timeout(
+        PREFLIGHT_TIMEOUT,
+        connect_json_rpc_websocket_with_headers(node_url, credential.headers()?),
     )
     .await
-    .map_err(|error| match error {
-        MidnightChainIdentityError::GenesisMismatch => {
-            MidnightPreprodPreflightError::GenesisMismatch
-        }
-        _ => MidnightPreprodPreflightError::NodeUnavailable,
-    })?;
-    let tip = fetch_chain_tip_with_headers(indexer_url, credential.headers()?)
-        .await
-        .map_err(|_| MidnightPreprodPreflightError::IndexerUnavailable)?;
-    Ok(tip.height)
+    .map_err(|_| MidnightPreprodPreflightError::NodeUnavailable)?
+    .map_err(|_| MidnightPreprodPreflightError::NodeUnavailable)?;
+    let node = LegacyRpcMethods::<SubstrateConfig>::new(RpcClient::new(client));
+    let genesis = timeout(
+        PREFLIGHT_TIMEOUT,
+        node.chain_get_block_hash(Some(0_u64.into())),
+    )
+    .await
+    .map_err(|_| MidnightPreprodPreflightError::NodeUnavailable)?
+    .map_err(|_| MidnightPreprodPreflightError::NodeUnavailable)?
+    .ok_or(MidnightPreprodPreflightError::NodeUnavailable)?;
+    if genesis.0 != *genesis_hash {
+        return Err(MidnightPreprodPreflightError::GenesisMismatch);
+    }
+    let (height, indexed_hash) =
+        fetch_identified_chain_tip(MidnightTransportRoute::new(indexer_url, Some(credential)))
+            .await
+            .map_err(|_| MidnightPreprodPreflightError::IndexerUnavailable)?;
+    let node_hash = timeout(
+        PREFLIGHT_TIMEOUT,
+        node.chain_get_block_hash(Some(height.into())),
+    )
+    .await
+    .map_err(|_| MidnightPreprodPreflightError::NodeUnavailable)?
+    .map_err(|_| MidnightPreprodPreflightError::NodeUnavailable)?
+    .map(|hash| hash.0);
+    if node_hash != Some(indexed_hash) {
+        return Err(MidnightPreprodPreflightError::ChainViewMismatch);
+    }
+    Ok(height)
 }
 
 #[cfg(test)]
@@ -132,6 +212,40 @@ mod tests {
                 MidnightPreprodPreflightError::InvalidCredential
             );
         }
+    }
+
+    #[test]
+    fn exact_graphql_upgrade_carries_a_sensitive_header_and_public_uri() {
+        let credential = credential();
+        let route = MidnightTransportRoute::new(INDEXER_SOCKET_ROUTE, Some(&credential));
+        let request = route.graphql_request().unwrap();
+        assert_eq!(request.uri().to_string(), INDEXER_SOCKET_ROUTE);
+        assert_eq!(
+            request.headers()["sec-websocket-protocol"],
+            "graphql-transport-ws"
+        );
+        assert!(request.headers()["project_id"].is_sensitive());
+        assert!(!format!("{request:?}").contains(PROJECT_PREFIX));
+
+        let without = MidnightTransportRoute::new(INDEXER_SOCKET_ROUTE, None);
+        assert_eq!(
+            without.graphql_request().unwrap_err(),
+            MidnightPreprodPreflightError::InvalidCredential
+        );
+        let unrelated =
+            MidnightTransportRoute::new("wss://example.test/api/v0/ws", Some(&credential));
+        assert_eq!(
+            unrelated.graphql_request().unwrap_err(),
+            MidnightPreprodPreflightError::InvalidRoute
+        );
+        let local = MidnightTransportRoute::new("ws://127.0.0.1:10", None);
+        assert!(
+            !local
+                .graphql_request()
+                .unwrap()
+                .headers()
+                .contains_key("project_id")
+        );
     }
 
     #[test]

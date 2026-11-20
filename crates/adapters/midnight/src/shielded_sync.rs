@@ -857,7 +857,7 @@ where
                 )
             };
             synchronize_shielded_with_control(
-                config.websocket_url(),
+                config.websocket_route(),
                 &zswap_keys,
                 latest.clone(),
                 cancellation,
@@ -882,7 +882,7 @@ where
                     )
                 };
                 synchronize_shielded_with_control(
-                    config.websocket_url(),
+                    config.websocket_route(),
                     &zswap_keys,
                     None,
                     cancellation,

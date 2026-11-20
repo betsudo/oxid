@@ -15,9 +15,7 @@ use oxid_adapter_platform_system::websocket_connector_for;
 use serde_json::{Value, json};
 use sha2::{Digest as _, Sha256};
 use tokio::time::timeout;
-use tokio_tungstenite::tungstenite::{
-    Message, client::IntoClientRequest as _, protocol::WebSocketConfig,
-};
+use tokio_tungstenite::tungstenite::{Message, protocol::WebSocketConfig};
 use url::Url;
 
 use crate::{
@@ -26,6 +24,8 @@ use crate::{
     },
     shielded_checkpoint::StoredShieldedCheckpoint,
 };
+
+use crate::preprod_transport::MidnightTransportRoute;
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
 const ACK_TIMEOUT: Duration = Duration::from_secs(15);
@@ -86,7 +86,7 @@ pub(crate) fn source_fingerprint(endpoint: &str) -> [u8; 32] {
 }
 
 pub(crate) async fn synchronize_shielded_with_control(
-    endpoint: &str,
+    route: MidnightTransportRoute<'_>,
     keys: &SecretKeys,
     checkpoint: Option<StoredShieldedCheckpoint>,
     cancellation: &AtomicBool,
@@ -120,20 +120,14 @@ pub(crate) async fn synchronize_shielded_with_control(
             };
             let starting_id =
                 i64::try_from(starting_id).map_err(|_| ShieldedTransportError::InvalidData)?;
-            let mut request = endpoint
-                .into_client_request()
+            let request = route
+                .graphql_request()
                 .map_err(|_| ShieldedTransportError::Unavailable)?;
-            request.headers_mut().insert(
-                "Sec-WebSocket-Protocol",
-                "graphql-transport-ws"
-                    .parse()
-                    .map_err(|_| ShieldedTransportError::InvalidData)?,
-            );
             let mut websocket_config = WebSocketConfig::default();
             websocket_config.max_message_size = Some(MAX_MESSAGE_BYTES);
             websocket_config.max_frame_size = Some(MAX_FRAME_BYTES);
             let endpoint_url =
-                Url::parse(endpoint).map_err(|_| ShieldedTransportError::Unavailable)?;
+                Url::parse(route.endpoint()).map_err(|_| ShieldedTransportError::Unavailable)?;
             let connector = websocket_connector_for(&endpoint_url)
                 .map_err(|_| ShieldedTransportError::Unavailable)?;
             let connected = timeout(
@@ -775,7 +769,7 @@ mod tests {
             .expect("runtime builds");
         let synchronized = runtime
             .block_on(synchronize_shielded_with_control(
-                &endpoint,
+                MidnightTransportRoute::new(&endpoint, None),
                 &keys,
                 None,
                 &cancellation,
@@ -834,7 +828,7 @@ mod tests {
         let mut observed = Vec::new();
         let synchronized = runtime
             .block_on(synchronize_shielded_with_control(
-                &endpoint,
+                MidnightTransportRoute::new(&endpoint, None),
                 &keys,
                 None,
                 &cancellation,
@@ -915,7 +909,7 @@ mod tests {
             .expect("runtime builds");
         let mut observations = 0_usize;
         let result = runtime.block_on(synchronize_shielded_with_control(
-            &endpoint,
+            MidnightTransportRoute::new(&endpoint, None),
             &keys,
             None,
             &cancellation,
@@ -947,7 +941,7 @@ mod tests {
             .expect("runtime builds");
         let mut observations = 0_usize;
         let result = runtime.block_on(synchronize_shielded_with_control(
-            &endpoint,
+            MidnightTransportRoute::new(&endpoint, None),
             &keys,
             Some(checkpoint),
             &cancellation,
@@ -990,7 +984,7 @@ mod tests {
             assert_eq!(
                 runtime
                     .block_on(synchronize_shielded_with_control(
-                        &endpoint,
+                        MidnightTransportRoute::new(&endpoint, None),
                         &keys,
                         None,
                         &cancellation,
@@ -1020,7 +1014,7 @@ mod tests {
         );
         let first = runtime
             .block_on(synchronize_shielded_with_control(
-                &first_endpoint,
+                MidnightTransportRoute::new(&first_endpoint, None),
                 &keys,
                 None,
                 &cancellation,
@@ -1039,7 +1033,7 @@ mod tests {
         let mut observations = 0;
         let resumed = runtime
             .block_on(synchronize_shielded_with_control(
-                &resume_endpoint,
+                MidnightTransportRoute::new(&resume_endpoint, None),
                 &keys,
                 Some(checkpoint),
                 &cancellation,
@@ -1089,7 +1083,7 @@ mod tests {
         assert_eq!(
             runtime
                 .block_on(synchronize_shielded_with_control(
-                    "ws://127.0.0.1:1",
+                    MidnightTransportRoute::new("ws://127.0.0.1:1", None),
                     &keys,
                     None,
                     &cancellation,
