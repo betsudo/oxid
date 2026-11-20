@@ -565,7 +565,8 @@ if cargo check -p oxid-app --no-default-features \
   echo "standalone-portal compiled for a non-mobile host" >&2
   exit 1
 fi
-if ! rg -q 'standalone-portal is available only on iOS and Android' "$failure_log"; then
+# Either the app or its required composition dependency can reject this target first.
+if ! rg -q '(standalone|mobile)-portal is available only on iOS and Android' "$failure_log"; then
   echo "standalone-portal host rejection failed for an unexpected reason" >&2
   sed -n '1,120p' "$failure_log" >&2
   exit 1
