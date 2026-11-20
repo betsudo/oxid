@@ -342,13 +342,6 @@ if [ "$operation" != "deploy" ]; then
     exit 1
   fi
   python3 "$repository_root/scripts/package-mobile-icons.py" ios "$app_bundle"
-  if [ "$portal_profile" = "preprod" ]; then
-    # Dioxus produces a linker-signed simulator binary without a Keychain
-    # identity. Sign the completed simulator bundle before hashing its receipt.
-    entitlements="$repository_root/apps/oxid/ios/PreprodSimulator.entitlements"
-    /usr/bin/codesign --force --sign - --timestamp=none --entitlements "$entitlements" "$app_bundle"
-    /usr/bin/codesign --verify --strict "$app_bundle"
-  fi
   if [ "$mobile_presentation_proving" = "artifacts" ]; then
     packaged_bytes="$(find "$app_bundle" -type f -exec /usr/bin/stat -f '%z' {} + | awk '{ total += $1 } END { print total + 0 }')"
     echo "Authenticated Compact artifact measurement bundle: $packaged_bytes uncompressed bytes."

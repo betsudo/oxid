@@ -46,6 +46,9 @@ fn main() {
         PathBuf::from(env::var_os("OUT_DIR").expect("Cargo must provide OUT_DIR"));
     if let Some(network) = public_portal_network() {
         authorize_public_portal_build(network);
+        if network == "preprod" {
+            embed_preprod_simulator_keychain_identity(&manifest_directory);
+        }
     }
     authorize_portal_profile();
     let brand = oxid_brand_build::load_brand_pack(&brand_directory)
@@ -178,6 +181,27 @@ fn authorize_public_portal_build(network: &str) {
             .any(|feature| env::var_os(format!("CARGO_FEATURE_{feature}")).is_some()),
         "the selected public Portal profile requires the isolated protected mobile profile"
     );
+}
+
+fn embed_preprod_simulator_keychain_identity(manifest_directory: &std::path::Path) {
+    if !env::var("TARGET").is_ok_and(|target| {
+        matches!(
+            target.as_str(),
+            "aarch64-apple-ios-sim" | "x86_64-apple-ios"
+        )
+    }) {
+        return;
+    }
+    // Like Xcode, attach Simulator entitlements to the Mach-O rather than
+    // putting iOS entitlements in a host ad-hoc signature.
+    let path = manifest_directory.join("ios/PreprodSimulator.entitlements");
+    println!("cargo:rerun-if-changed={}", path.display());
+    for argument in ["-sectcreate", "__TEXT", "__entitlements"] {
+        println!("cargo:rustc-link-arg-bin=oxid-app=-Xlinker");
+        println!("cargo:rustc-link-arg-bin=oxid-app={argument}");
+    }
+    println!("cargo:rustc-link-arg-bin=oxid-app=-Xlinker");
+    println!("cargo:rustc-link-arg-bin=oxid-app={}", path.display());
 }
 
 fn embed_portal_manifests(output_directory: &std::path::Path) {
