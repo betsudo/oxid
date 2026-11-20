@@ -29,7 +29,7 @@ const EXPECTED_COMMANDS = Object.freeze([
     "--exclude", "oxid-ui-dioxus",
     "--exclude", "oxid-app",
     "--exclude", "oxid-headless",
-    "--features", "oxid-adapter-deployment-profile/readiness,oxid-adapter-did-midnight/tailnet-test-did-publication,oxid-adapter-storage-dev/development-fixture,oxid-composition/preprod-observation,oxid-composition/proof-benchmark,oxid-composition/standalone-development",
+    "--features", "oxid-adapter-deployment-profile/readiness,oxid-adapter-did-midnight/tailnet-test-did-publication,oxid-adapter-storage-dev/development-fixture,oxid-composition/preprod-observation,oxid-composition/proof-benchmark,oxid-composition/public-portal,oxid-composition/standalone-development",
     "--json", "--fail-under-lines", "70",
   ],
   [
@@ -142,6 +142,7 @@ function scopeMetadata(scope) {
         "oxid-adapter-storage-dev/development-fixture",
         "oxid-composition/preprod-observation",
         "oxid-composition/proof-benchmark",
+        "oxid-composition/public-portal",
         "oxid-composition/standalone-development",
       ],
       profile: "test",

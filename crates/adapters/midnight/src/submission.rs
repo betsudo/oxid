@@ -20,7 +20,6 @@ use midnight_base_crypto::time::Timestamp;
 use midnight_coin_structure::coin::TokenType;
 use midnight_ledger::{
     dust::{DustActions, DustLocalState, DustOutput, DustParameters, DustPublicKey, DustSecretKey},
-    events::Event,
     structure::{
         Intent, LedgerParameters, ProofPreimageMarker, ProofPreimageVersioned, ProofVersioned,
         Signature, StandardTransaction, Transaction,
@@ -40,7 +39,8 @@ use midnight_transient_crypto::{
     },
 };
 use oxid_adapter_platform_system::{
-    connect_json_rpc_websocket, http_client_builder_for, websocket_connector_for,
+    NativeRequestAuthentication, TransportTrustError, connect_json_rpc_websocket_with_headers,
+    http_client_builder_for, websocket_connector_for,
 };
 use oxid_platform_ports::ClockPort;
 use oxid_wallet_application::WalletTransactionPortError;
@@ -50,16 +50,16 @@ use reqwest::{Method, StatusCode, Url, header::CONTENT_TYPE};
 use serde_json::{Value, json};
 use subxt::{OnlineClient, SubstrateConfig, backend::rpc::RpcClient, dynamic};
 use tokio::time::timeout;
-use tokio_tungstenite::tungstenite::{
-    Message, client::IntoClientRequest, protocol::WebSocketConfig,
-};
+use tokio_tungstenite::tungstenite::{Message, protocol::WebSocketConfig};
 
 use crate::{
     MidnightIndexerConfig, MidnightIndexerConfigError, MidnightLocalProvingConfig,
     dust_checkpoint::{
         MidnightDustCheckpointStore, StoredDustCheckpoint, UnavailableMidnightDustCheckpointStore,
     },
+    dust_replay::{DustReplayKeys, DustReplayState, replay_dust_batch},
     local_proving,
+    replay_era::{LedgerEra, ReplayEvent, ReplayWindow, replay_era},
     submission_journal::{StoredSubmissionJournalEntry, StoredSubmissionState},
     transaction::{
         MidnightCompletionOutcome, MidnightCompletionRequest, MidnightRegistrationContext,
@@ -69,8 +69,14 @@ use crate::{
 };
 
 const DUST_QUERY: &str = include_str!("../queries/dust_ledger_events.graphql");
+const MIXED_DUST_QUERY: &str = include_str!("../queries/mixed_dust_ledger_events.graphql");
 const CHAIN_TIP_QUERY: &str = include_str!("../queries/chain_tip.graphql");
 const DUST_BALANCE_SEGMENT: u16 = 0xFEED;
+use crate::preprod_transport::{
+    INDEXER_ROUTE, INDEXER_SOCKET_ROUTE, MidnightPreprodCredential, MidnightPreprodPreflightError,
+    MidnightTransportRoute, is_preprod_node_route, preflight_blockfrost_preprod,
+};
+
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
 const ACK_TIMEOUT: Duration = Duration::from_secs(15);
 const IDLE_TIMEOUT: Duration = Duration::from_secs(5);
@@ -148,8 +154,15 @@ pub struct MidnightStandaloneConfig {
 pub enum MidnightProvingMode {
     /// Keep proof witnesses on-device and use an authenticated bounded cache.
     Local(MidnightLocalProvingConfig),
-    /// Development-only remote proof service using loopback HTTP or HTTPS.
+    /// Explicit remote proof service using loopback HTTP or authenticated HTTPS.
     Remote { proof_server_url: String },
+}
+
+/// Payload-free failures when checking the private public-network prover.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MidnightProofServerVersionError {
+    Unavailable,
+    IncompatibleVersion,
 }
 
 impl MidnightStandaloneConfig {
@@ -236,6 +249,76 @@ impl MidnightStandaloneConfig {
         })
     }
 
+    /// Installs one PreProd credential atomically for the exact configured node and indexer cohort.
+    pub fn with_preprod_credential(
+        mut self,
+        credential: MidnightPreprodCredential,
+    ) -> Result<Self, MidnightStandaloneConfigError> {
+        if self.indexer.network_id().as_str() != "preprod"
+            || self.indexer_http_url != INDEXER_ROUTE
+            || self.indexer.websocket_url() != INDEXER_SOCKET_ROUTE
+            || !is_preprod_node_route(&self.node_websocket_url)
+        {
+            return Err(MidnightStandaloneConfigError::InvalidPreprodRoutes);
+        }
+        self.indexer.preprod_credential = Some(Arc::new(credential));
+        Ok(self)
+    }
+
+    /// Executes a read-only genesis and indexer check using the configured routes.
+    pub async fn verify_preprod_chain(
+        &self,
+        genesis_hash: &[u8; 32],
+    ) -> Result<u64, MidnightPreprodPreflightError> {
+        let credential = self
+            .indexer
+            .preprod_credential
+            .as_deref()
+            .ok_or(MidnightPreprodPreflightError::InvalidCredential)?;
+        preflight_blockfrost_preprod(
+            self.node_websocket_url(),
+            self.indexer_http_url(),
+            self.indexer().websocket_url(),
+            genesis_hash,
+            credential,
+        )
+        .await
+    }
+
+    /// Verify the exact prover paired with this app's Ledger 9 dependency.
+    /// This sends only an unauthenticated version request, without witnesses.
+    pub async fn verify_public_proof_server(&self) -> Result<(), MidnightProofServerVersionError> {
+        let MidnightProvingMode::Remote { proof_server_url } = &self.proving else {
+            return Err(MidnightProofServerVersionError::Unavailable);
+        };
+        let endpoint = Url::parse(proof_server_url)
+            .map_err(|_| MidnightProofServerVersionError::Unavailable)?;
+        if endpoint.scheme() != "https" {
+            return Err(MidnightProofServerVersionError::Unavailable);
+        }
+        verify_ledger9_proof_server_version(&endpoint).await
+    }
+
+    /// Supplies only the two authenticated read routes needed by contract-state readers.
+    pub fn contract_state_authentication(&self) -> Option<Arc<dyn NativeRequestAuthentication>> {
+        self.indexer.preprod_credential.as_ref()?;
+        Some(Arc::new(self.clone()))
+    }
+
+    pub(crate) fn indexer_http_route(&self) -> MidnightTransportRoute<'_> {
+        MidnightTransportRoute::new(
+            &self.indexer_http_url,
+            self.indexer.preprod_credential.as_deref(),
+        )
+    }
+
+    fn node_route(&self) -> MidnightTransportRoute<'_> {
+        MidnightTransportRoute::new(
+            &self.node_websocket_url,
+            self.indexer.preprod_credential.as_deref(),
+        )
+    }
+
     #[must_use]
     pub const fn indexer(&self) -> &MidnightIndexerConfig {
         &self.indexer
@@ -257,6 +340,26 @@ impl MidnightStandaloneConfig {
     }
 }
 
+impl NativeRequestAuthentication for MidnightStandaloneConfig {
+    fn headers_for(
+        &self,
+        endpoint: &str,
+    ) -> Result<reqwest::header::HeaderMap, TransportTrustError> {
+        let route = if endpoint == self.indexer_http_url() {
+            self.indexer_http_route()
+        } else if endpoint == self.node_websocket_url()
+            || (is_preprod_node_route(endpoint) && is_preprod_node_route(self.node_websocket_url()))
+        {
+            self.node_route()
+        } else {
+            return Err(TransportTrustError::InvalidEndpoint);
+        };
+        route
+            .headers()
+            .map_err(|_| TransportTrustError::ConnectionUnavailable)
+    }
+}
+
 /// Safe standalone route validation errors. Endpoint values are never rendered.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum MidnightStandaloneConfigError {
@@ -264,6 +367,7 @@ pub enum MidnightStandaloneConfigError {
     InvalidIndexerHttpEndpoint,
     InvalidNodeEndpoint,
     InvalidProofEndpoint,
+    InvalidPreprodRoutes,
 }
 
 impl fmt::Display for MidnightStandaloneConfigError {
@@ -275,6 +379,9 @@ impl fmt::Display for MidnightStandaloneConfigError {
             }
             Self::InvalidNodeEndpoint => {
                 formatter.write_str("Midnight node WebSocket endpoint is invalid")
+            }
+            Self::InvalidPreprodRoutes => {
+                formatter.write_str("Midnight PreProd routes are invalid")
             }
             Self::InvalidProofEndpoint => formatter.write_str(
                 "Midnight proof endpoint must use loopback HTTP or HTTPS without credentials",
@@ -317,10 +424,13 @@ pub async fn authenticate_midnight_chain_identity(
 ) -> Result<(), MidnightChainIdentityError> {
     super::indexer::validate_websocket_url(node_websocket_url)
         .map_err(|_| MidnightChainIdentityError::InvalidNodeEndpoint)?;
-    let client = timeout(CONNECT_TIMEOUT, connect_midnight_node(node_websocket_url))
-        .await
-        .map_err(|_| MidnightChainIdentityError::NodeUnavailable)?
-        .map_err(|_| MidnightChainIdentityError::NodeUnavailable)?;
+    let client = timeout(
+        CONNECT_TIMEOUT,
+        connect_midnight_node(MidnightTransportRoute::new(node_websocket_url, None)),
+    )
+    .await
+    .map_err(|_| MidnightChainIdentityError::NodeUnavailable)?
+    .map_err(|_| MidnightChainIdentityError::NodeUnavailable)?;
     let genesis_hash = client.genesis_hash();
     let observed: &[u8] = genesis_hash.as_ref();
     if observed == expected_genesis_hash {
@@ -330,14 +440,25 @@ pub async fn authenticate_midnight_chain_identity(
     }
 }
 
-async fn connect_midnight_node(endpoint: &str) -> Result<OnlineClient<SubstrateConfig>, ()> {
+async fn connect_midnight_node(
+    route: MidnightTransportRoute<'_>,
+) -> Result<OnlineClient<SubstrateConfig>, ()> {
+    connect_midnight_node_with_headers(route.endpoint(), route.headers().map_err(|_| ())?).await
+}
+
+async fn connect_midnight_node_with_headers(
+    endpoint: &str,
+    headers: reqwest::header::HeaderMap,
+) -> Result<OnlineClient<SubstrateConfig>, ()> {
     let url = Url::parse(endpoint).map_err(|_| ())?;
-    if url.scheme() == "ws" && url.query().is_none() {
+    if url.scheme() == "ws" && url.query().is_none() && headers.is_empty() {
         return OnlineClient::from_insecure_url(endpoint)
             .await
             .map_err(|_| ());
     }
-    let client = connect_json_rpc_websocket(endpoint).await.map_err(|_| ())?;
+    let client = connect_json_rpc_websocket_with_headers(endpoint, headers)
+        .await
+        .map_err(|_| ())?;
     OnlineClient::from_rpc_client(RpcClient::new(client))
         .await
         .map_err(|_| ())
@@ -439,13 +560,10 @@ async fn reconcile_live_submission(
     config: &MidnightStandaloneConfig,
     entry: &StoredSubmissionJournalEntry,
 ) -> Result<MidnightSubmissionReconciliation, WalletTransactionPortError> {
-    let client = timeout(
-        CONNECT_TIMEOUT,
-        connect_midnight_node(config.node_websocket_url()),
-    )
-    .await
-    .map_err(|_| WalletTransactionPortError::Timeout)?
-    .map_err(|_| WalletTransactionPortError::Unavailable)?;
+    let client = timeout(CONNECT_TIMEOUT, connect_midnight_node(config.node_route()))
+        .await
+        .map_err(|_| WalletTransactionPortError::Timeout)?
+        .map_err(|_| WalletTransactionPortError::Unavailable)?;
     let mut block = timeout(CONNECT_TIMEOUT, client.blocks().at_latest())
         .await
         .map_err(|_| WalletTransactionPortError::Timeout)?
@@ -500,7 +618,7 @@ async fn reconcile_live_submission(
     if !reached_anchor {
         return Ok(MidnightSubmissionReconciliation::Unresolved);
     }
-    let chain_tip = fetch_chain_tip(config.indexer_http_url()).await?;
+    let chain_tip = fetch_chain_tip(config.indexer_http_route()).await?;
     if Timestamp::from_secs(entry.expires_at.value() / 1_000) <= chain_tip.timestamp {
         Ok(MidnightSubmissionReconciliation::Expired)
     } else {
@@ -514,7 +632,7 @@ where
 {
     fn registration_context(&self) -> MidnightRegistrationContextFuture<'_> {
         Box::pin(async move {
-            let chain_tip = fetch_chain_tip(self.config.indexer_http_url()).await?;
+            let chain_tip = fetch_chain_tip(self.config.indexer_http_route()).await?;
             Ok(MidnightRegistrationContext {
                 timestamp: chain_tip.timestamp,
                 parameters: chain_tip.parameters,
@@ -538,11 +656,13 @@ where
                 None
             };
         let dust_key = DustSecretKey::derive_secret_key(dust_seed);
+        let route = self.config.indexer.websocket_route();
+        let keys = DustReplayKeys::new(&dust_key, route.mixed_eras().then_some(dust_seed));
         run_isolated_midnight_runtime(move || async move {
             complete_live(
                 &self.config,
                 request,
-                &dust_key,
+                &keys,
                 self.dust_checkpoints.as_ref(),
                 self.clock.as_ref(),
                 self.remote_proving_material.as_ref(),
@@ -555,7 +675,7 @@ where
 async fn complete_live<C>(
     config: &MidnightStandaloneConfig,
     request: MidnightCompletionRequest,
-    dust_key: &DustSecretKey,
+    keys: &DustReplayKeys<'_>,
     checkpoints: &dyn MidnightDustCheckpointStore,
     clock: &C,
     remote_proving_material: Option<&Arc<dyn MidnightRemoteProvingMaterialSource>>,
@@ -565,17 +685,21 @@ where
 {
     let cancellation = request.cancellation_token();
     ensure_submission_active(&cancellation)?;
-    let chain_tip = fetch_chain_tip(config.indexer_http_url()).await?;
+    let chain_tip = fetch_chain_tip(config.indexer_http_route()).await?;
     ensure_submission_active(&cancellation)?;
-    let dust_public_key = DustPublicKey::from(dust_key.clone());
-    let checkpoint = checkpoints
-        .load(
+    let dust_public_key = DustPublicKey::from(keys.current.clone());
+    let route = config.indexer.websocket_route();
+    let checkpoint = if route.mixed_eras() {
+        checkpoints.load_latest(config.indexer.network_id(), &dust_public_key)
+    } else {
+        checkpoints.load(
             config.indexer.network_id(),
             &dust_public_key,
             chain_tip.parameters.dust,
         )
-        .ok()
-        .flatten();
+    }
+    .ok()
+    .flatten();
     let mut persist_progress = |progress: &DustSyncProgress<'_>| {
         if let Ok(updated_at) = clock.now() {
             let _ = checkpoints.save_state(
@@ -590,8 +714,8 @@ where
         Ok(())
     };
     let synchronized = synchronize_dust_with_control(
-        config.indexer.websocket_url(),
-        dust_key,
+        route,
+        keys,
         chain_tip.parameters.dust,
         checkpoint,
         &cancellation,
@@ -603,16 +727,7 @@ where
     if dust_state.params != chain_tip.parameters.dust {
         return Err(WalletTransactionPortError::InvalidChainState);
     }
-    if let Ok(updated_at) = clock.now() {
-        let _ = checkpoints.save_state(
-            config.indexer.network_id(),
-            &dust_public_key,
-            synchronized.current_cursor,
-            synchronized.target_cursor,
-            updated_at,
-            &dust_state,
-        );
-    }
+
     let current_time = if chain_tip.timestamp > dust_state.sync_time {
         chain_tip.timestamp
     } else {
@@ -638,7 +753,7 @@ where
         let (balanced, funded_fee) = balance_dust(
             original_transaction.clone(),
             &mut candidate_dust_state,
-            dust_key,
+            keys.current,
             &chain_tip.parameters,
             current_time,
             ttl,
@@ -679,13 +794,8 @@ where
         return Err(WalletTransactionPortError::InvalidData);
     }
     ensure_submission_active(&cancellation)?;
-    let (transaction_hash, block_hash, block_height) = submit_unsigned(
-        config.node_websocket_url(),
-        transaction_bytes,
-        &request,
-        fee_specks,
-    )
-    .await?;
+    let (transaction_hash, block_hash, block_height) =
+        submit_unsigned(config.node_route(), transaction_bytes, &request, fee_specks).await?;
     Ok(MidnightCompletionOutcome {
         fee_specks,
         transaction_hash,
@@ -724,21 +834,70 @@ pub(crate) struct ChainTip {
 }
 
 pub(crate) async fn fetch_chain_tip(
-    endpoint: &str,
+    route: MidnightTransportRoute<'_>,
 ) -> Result<ChainTip, WalletTransactionPortError> {
+    let headers = route
+        .headers()
+        .map_err(|_| WalletTransactionPortError::Unavailable)?;
+    fetch_chain_tip_with_headers(route.endpoint(), headers).await
+}
+
+pub(super) async fn fetch_chain_tip_with_headers(
+    endpoint: &str,
+    headers: reqwest::header::HeaderMap,
+) -> Result<ChainTip, WalletTransactionPortError> {
+    let body = fetch_chain_tip_body(endpoint, headers).await?;
+    decode_chain_tip_body(&body)
+}
+
+/// Returns the Ledger 9 tip height, block hash, and runtime for node comparison.
+pub(super) async fn fetch_identified_chain_tip(
+    route: MidnightTransportRoute<'_>,
+) -> Result<(u64, [u8; 32], u32), WalletTransactionPortError> {
+    let headers = route
+        .headers()
+        .map_err(|_| WalletTransactionPortError::Unavailable)?;
+    let body = fetch_chain_tip_body(route.endpoint(), headers).await?;
+    decode_identified_chain_tip(&body)
+}
+
+fn decode_identified_chain_tip(
+    body: &[u8],
+) -> Result<(u64, [u8; 32], u32), WalletTransactionPortError> {
+    let root = parse_chain_tip_body(body)?;
+    let tip = decode_chain_tip(&root)?;
+    let hash = root
+        .pointer("/data/block/hash")
+        .and_then(Value::as_str)
+        .ok_or(WalletTransactionPortError::InvalidChainState)?;
+    let mut bytes = [0; 32];
+    hex::decode_to_slice(hash.strip_prefix("0x").unwrap_or(hash), &mut bytes)
+        .map_err(|_| WalletTransactionPortError::InvalidChainState)?;
+    let runtime = root
+        .pointer("/data/block/protocolVersion")
+        .and_then(Value::as_u64)
+        .and_then(|version| u32::try_from(version).ok())
+        .ok_or(WalletTransactionPortError::InvalidChainState)?;
+    Ok((tip.height, bytes, runtime))
+}
+
+async fn fetch_chain_tip_body(
+    endpoint: &str,
+    headers: reqwest::header::HeaderMap,
+) -> Result<Vec<u8>, WalletTransactionPortError> {
     ensure_tls_provider()?;
     let endpoint = Url::parse(endpoint).map_err(|_| WalletTransactionPortError::Unavailable)?;
     let client = chain_tip_client(&endpoint)?;
-    let request = chain_tip_request(endpoint.as_str())?;
+    let mut request = chain_tip_request(endpoint.as_str())?;
+    request.headers_mut().extend(headers);
     let response = client
         .execute(request)
         .await
         .map_err(|_| WalletTransactionPortError::Unavailable)?;
     validate_chain_tip_status(response.status())?;
-    let body = bounded_response(response, MAX_CHAIN_TIP_BYTES)
+    bounded_response(response, MAX_CHAIN_TIP_BYTES)
         .await
-        .map_err(|_| WalletTransactionPortError::InvalidChainState)?;
-    decode_chain_tip_body(&body)
+        .map_err(|_| WalletTransactionPortError::InvalidChainState)
 }
 
 fn chain_tip_request(endpoint: &str) -> Result<reqwest::Request, WalletTransactionPortError> {
@@ -760,6 +919,7 @@ fn chain_tip_client(endpoint: &Url) -> Result<reqwest::Client, WalletTransaction
         // Standalone wallet routes are explicit trust-boundary configuration. Do not let
         // ambient proxy variables silently redirect them.
         .no_proxy()
+        .redirect(reqwest::redirect::Policy::none())
         .connect_timeout(CONNECT_TIMEOUT)
         .timeout(CONNECT_TIMEOUT)
         .build()
@@ -774,12 +934,14 @@ fn validate_chain_tip_status(status: StatusCode) -> Result<(), WalletTransaction
 }
 
 fn decode_chain_tip_body(body: &[u8]) -> Result<ChainTip, WalletTransactionPortError> {
+    decode_chain_tip(&parse_chain_tip_body(body)?)
+}
+
+fn parse_chain_tip_body(body: &[u8]) -> Result<Value, WalletTransactionPortError> {
     if body.len() > MAX_CHAIN_TIP_BYTES {
         return Err(WalletTransactionPortError::InvalidChainState);
     }
-    let root: Value =
-        serde_json::from_slice(body).map_err(|_| WalletTransactionPortError::InvalidChainState)?;
-    decode_chain_tip(&root)
+    serde_json::from_slice(body).map_err(|_| WalletTransactionPortError::InvalidChainState)
 }
 
 fn decode_chain_tip(root: &Value) -> Result<ChainTip, WalletTransactionPortError> {
@@ -830,8 +992,8 @@ async fn synchronize_dust(
     let cancellation = AtomicBool::new(false);
     let mut ignore_progress = |_: &DustSyncProgress<'_>| Ok(());
     synchronize_dust_controlled(
-        endpoint,
-        dust_key,
+        MidnightTransportRoute::new(endpoint, None),
+        &DustReplayKeys::new(dust_key, None),
         parameters,
         checkpoint,
         &cancellation,
@@ -841,25 +1003,51 @@ async fn synchronize_dust(
 }
 
 pub(crate) async fn synchronize_dust_controlled(
-    endpoint: &str,
-    dust_key: &DustSecretKey,
+    route: MidnightTransportRoute<'_>,
+    keys: &DustReplayKeys<'_>,
     parameters: DustParameters,
     checkpoint: Option<StoredDustCheckpoint>,
     cancellation: &AtomicBool,
     observe: &mut dyn FnMut(&DustSyncProgress<'_>) -> Result<(), WalletTransactionPortError>,
 ) -> Result<DustSynchronization, WalletTransactionPortError> {
+    synchronize_dust_controlled_with_limits(
+        route,
+        keys,
+        parameters,
+        checkpoint,
+        cancellation,
+        observe,
+        (MAX_DUST_EVENTS, MAX_DUST_TOTAL_BYTES),
+    )
+    .await
+}
+
+async fn synchronize_dust_controlled_with_limits(
+    route: MidnightTransportRoute<'_>,
+    keys: &DustReplayKeys<'_>,
+    parameters: DustParameters,
+    checkpoint: Option<StoredDustCheckpoint>,
+    cancellation: &AtomicBool,
+    observe: &mut dyn FnMut(&DustSyncProgress<'_>) -> Result<(), WalletTransactionPortError>,
+    limits: (usize, usize),
+) -> Result<DustSynchronization, WalletTransactionPortError> {
     ensure_submission_active(cancellation)?;
     let (mut state, starting_cursor, starting_target) = checkpoint.map_or_else(
-        || (DustLocalState::new(parameters), None, None),
+        || (None, None, None),
         |checkpoint| {
             (
-                checkpoint.state,
+                Some(checkpoint.state),
                 Some(checkpoint.current_cursor),
                 Some(checkpoint.target_cursor),
             )
         },
     );
-    if state.params != parameters {
+    if !route.mixed_eras()
+        && state
+            .as_ref()
+            .and_then(DustReplayState::current)
+            .is_some_and(|state| state.params != parameters)
+    {
         return Err(WalletTransactionPortError::InvalidChainState);
     }
     ensure_tls_provider()?;
@@ -868,33 +1056,31 @@ pub(crate) async fn synchronize_dust_controlled(
     let synchronization = timeout(SNAPSHOT_TIMEOUT, async {
         let mut durable_cursor = starting_cursor;
         let mut target_id = starting_target;
-        let mut total_bytes = 0_usize;
-        let mut event_count = 0_usize;
+        let mut window = ReplayWindow::new(limits, route.mixed_eras(), starting_cursor);
         let mut replayed_events = 0_usize;
         loop {
             ensure_dust_sync_active(cancellation, started_at)?;
-            let starting_id = match durable_cursor {
-                Some(cursor) => cursor
+            // Public streams include the requested event. Reconfirm a
+            // checkpoint that looked complete using that event's live watermark.
+            let mut anchor =
+                durable_cursor.filter(|cursor| route.mixed_eras() && Some(*cursor) == target_id);
+            let starting_id = match (anchor, durable_cursor) {
+                (Some(cursor), _) => cursor,
+                (None, Some(cursor)) => cursor
                     .checked_add(1)
                     .ok_or(WalletTransactionPortError::InvalidChainState)?,
-                None => 0,
+                (None, None) => 0,
             };
             let starting_id = i64::try_from(starting_id)
                 .map_err(|_| WalletTransactionPortError::InvalidChainState)?;
-            let mut request = endpoint
-                .into_client_request()
+            let request = route
+                .graphql_request()
                 .map_err(|_| WalletTransactionPortError::Unavailable)?;
-            request.headers_mut().insert(
-                "Sec-WebSocket-Protocol",
-                "graphql-transport-ws"
-                    .parse()
-                    .map_err(|_| WalletTransactionPortError::InvalidChainState)?,
-            );
             let mut websocket_config = WebSocketConfig::default();
             websocket_config.max_message_size = Some(MAX_MESSAGE_BYTES);
             websocket_config.max_frame_size = Some(MAX_FRAME_BYTES);
-            let endpoint_url =
-                Url::parse(endpoint).map_err(|_| WalletTransactionPortError::Unavailable)?;
+            let endpoint_url = Url::parse(route.endpoint())
+                .map_err(|_| WalletTransactionPortError::Unavailable)?;
             let connector = websocket_connector_for(&endpoint_url)
                 .map_err(|_| WalletTransactionPortError::Unavailable)?;
             let connected = timeout(
@@ -929,12 +1115,17 @@ pub(crate) async fn synchronize_dust_controlled(
             let acknowledged = wait_for_ack(&mut socket).await;
             ensure_dust_sync_active(cancellation, started_at)?;
             acknowledged?;
+            let query = if route.mixed_eras() {
+                MIXED_DUST_QUERY
+            } else {
+                DUST_QUERY
+            };
             let subscribed = send_websocket_json(
                 &mut socket,
                 json!({
                     "type": "subscribe",
                     "id": "oxid-dust",
-                    "payload": { "query": DUST_QUERY, "variables": { "id": starting_id } }
+                    "payload": { "query": query, "variables": { "id": starting_id } }
                 }),
             )
             .await;
@@ -977,7 +1168,24 @@ pub(crate) async fn synchronize_dust_controlled(
                                 let data = value
                                     .pointer("/payload/data/dustLedgerEvents")
                                     .ok_or(WalletTransactionPortError::InvalidChainState)?;
-                                let decoded = decode_dust_event(data)?;
+                                let decoded =
+                                    decode_dust_event_for_route(data, route.mixed_eras())?;
+                                if let Some(saved) = anchor.take() {
+                                    let matches_era = state.as_ref().is_some_and(|state| {
+                                        state.current().is_some()
+                                            == (decoded.event.era() == LedgerEra::V9)
+                                    });
+                                    if decoded.id != saved || decoded.max_id < saved || !matches_era
+                                    {
+                                        return Err(WalletTransactionPortError::InvalidChainState);
+                                    }
+                                    target_id = Some(decoded.max_id);
+                                    if decoded.max_id == saved {
+                                        break DustReceiveOutcome::TargetReached;
+                                    }
+                                    // The anchor was already applied. Replay only the new events.
+                                    continue;
+                                }
                                 let sequence_valid = match received_cursor {
                                     // DUST IDs are sparse global indexer cursors:
                                     // unrelated ledger activity can create gaps.
@@ -1000,16 +1208,8 @@ pub(crate) async fn synchronize_dust_controlled(
                                 {
                                     break DustReceiveOutcome::Saturated;
                                 }
-                                event_count = event_count
-                                    .checked_add(1)
-                                    .ok_or(WalletTransactionPortError::InvalidChainState)?;
-                                total_bytes = total_bytes
-                                    .checked_add(decoded.raw_bytes)
-                                    .ok_or(WalletTransactionPortError::InvalidChainState)?;
-                                if total_bytes > MAX_DUST_TOTAL_BYTES
-                                    || event_count > MAX_DUST_EVENTS
-                                {
-                                    return Err(WalletTransactionPortError::InvalidChainState);
+                                if !window.accept(decoded.raw_bytes) {
+                                    break DustReceiveOutcome::BudgetExhausted;
                                 }
                                 segment_bytes = next_segment_bytes;
                                 received_cursor = Some(decoded.id);
@@ -1065,6 +1265,15 @@ pub(crate) async fn synchronize_dust_controlled(
             drop(socket);
 
             if segment.is_empty() {
+                if outcome == DustReceiveOutcome::BudgetExhausted {
+                    if window.renew(durable_cursor) {
+                        continue;
+                    }
+                    return Err(WalletTransactionPortError::Timeout);
+                }
+                if route.mixed_eras() && outcome != DustReceiveOutcome::TargetReached {
+                    return Err(WalletTransactionPortError::Timeout);
+                }
                 let current_cursor =
                     durable_cursor.ok_or(WalletTransactionPortError::InvalidChainState)?;
                 let target_cursor =
@@ -1076,6 +1285,7 @@ pub(crate) async fn synchronize_dust_controlled(
                         WalletTransactionPortError::InvalidChainState
                     });
                 }
+                let state = state.ok_or(WalletTransactionPortError::InvalidChainState)?;
                 observe(&DustSyncProgress {
                     state: &state,
                     current_cursor,
@@ -1085,7 +1295,7 @@ pub(crate) async fn synchronize_dust_controlled(
                 })?;
                 ensure_dust_sync_active(cancellation, started_at)?;
                 return Ok(DustSynchronization {
-                    state,
+                    state: state.into_current()?,
                     current_cursor,
                     target_cursor,
                     events_processed: replayed_events,
@@ -1095,79 +1305,47 @@ pub(crate) async fn synchronize_dust_controlled(
             let target_cursor = target_id.ok_or(WalletTransactionPortError::InvalidChainState)?;
             let segment_cursor =
                 received_cursor.ok_or(WalletTransactionPortError::InvalidChainState)?;
-            let mut batch = Vec::<Event<DefaultDB>>::with_capacity(DUST_REPLAY_BATCH_EVENTS);
-            let mut batch_bytes = 0_usize;
-            let mut batch_last_id = None;
-            for decoded in segment {
-                let next_batch_bytes = batch_bytes
-                    .checked_add(decoded.raw_bytes)
-                    .ok_or(WalletTransactionPortError::InvalidChainState)?;
-                if !batch.is_empty() && next_batch_bytes > MAX_DUST_REPLAY_BATCH_BYTES {
-                    ensure_dust_sync_active(cancellation, started_at)?;
-                    state = state
-                        .replay_events(dust_key, batch.iter())
-                        .map_err(|_| WalletTransactionPortError::InvalidChainState)?;
-                    replayed_events = replayed_events
-                        .checked_add(batch.len())
+            let mut events = segment.into_iter().peekable();
+            let mut batch = Vec::with_capacity(DUST_REPLAY_BATCH_EVENTS);
+            while let Some(first) = events.next() {
+                let era = first.event.era();
+                let mut batch_bytes = first.raw_bytes;
+                let mut current_cursor = first.id;
+                batch.push(first.event);
+                while batch.len() < DUST_REPLAY_BATCH_EVENTS
+                    && events.peek().is_some_and(|next| {
+                        next.event.era() == era
+                            && batch_bytes + next.raw_bytes <= MAX_DUST_REPLAY_BATCH_BYTES
+                    })
+                {
+                    let next = events
+                        .next()
                         .ok_or(WalletTransactionPortError::InvalidChainState)?;
-                    batch.clear();
-                    batch_bytes = 0;
-                    let current_cursor =
-                        batch_last_id.ok_or(WalletTransactionPortError::InvalidChainState)?;
-                    observe(&DustSyncProgress {
-                        state: &state,
-                        current_cursor,
-                        target_cursor,
-                        events_processed: replayed_events,
-                        segment_complete: current_cursor == segment_cursor,
-                    })?;
-                    durable_cursor = Some(current_cursor);
+                    batch_bytes += next.raw_bytes;
+                    current_cursor = next.id;
+                    batch.push(next.event);
                 }
-                batch_bytes = batch_bytes
-                    .checked_add(decoded.raw_bytes)
-                    .ok_or(WalletTransactionPortError::InvalidChainState)?;
-                batch_last_id = Some(decoded.id);
-                batch.push(decoded.event);
-                if batch.len() == DUST_REPLAY_BATCH_EVENTS {
-                    ensure_dust_sync_active(cancellation, started_at)?;
-                    state = state
-                        .replay_events(dust_key, batch.iter())
-                        .map_err(|_| WalletTransactionPortError::InvalidChainState)?;
-                    replayed_events = replayed_events
-                        .checked_add(batch.len())
-                        .ok_or(WalletTransactionPortError::InvalidChainState)?;
-                    batch.clear();
-                    batch_bytes = 0;
-                    let current_cursor =
-                        batch_last_id.ok_or(WalletTransactionPortError::InvalidChainState)?;
-                    observe(&DustSyncProgress {
-                        state: &state,
-                        current_cursor,
-                        target_cursor,
-                        events_processed: replayed_events,
-                        segment_complete: current_cursor == segment_cursor,
-                    })?;
-                    durable_cursor = Some(current_cursor);
-                }
-            }
-            if !batch.is_empty() {
                 ensure_dust_sync_active(cancellation, started_at)?;
-                state = state
-                    .replay_events(dust_key, batch.iter())
-                    .map_err(|_| WalletTransactionPortError::InvalidChainState)?;
+                let replayed = replay_dust_batch(state.as_ref(), keys, parameters, &batch)?;
                 replayed_events = replayed_events
                     .checked_add(batch.len())
                     .ok_or(WalletTransactionPortError::InvalidChainState)?;
-                let current_cursor =
-                    batch_last_id.ok_or(WalletTransactionPortError::InvalidChainState)?;
                 observe(&DustSyncProgress {
-                    state: &state,
+                    state: &replayed,
                     current_cursor,
                     target_cursor,
                     events_processed: replayed_events,
-                    segment_complete: true,
+                    segment_complete: current_cursor == segment_cursor,
                 })?;
+                state = Some(replayed);
                 durable_cursor = Some(current_cursor);
+                batch.clear();
+            }
+            if outcome == DustReceiveOutcome::BudgetExhausted {
+                if window.renew(durable_cursor) {
+                    continue;
+                }
+                return Err(WalletTransactionPortError::Timeout);
             }
             if durable_cursor != Some(segment_cursor) {
                 return Err(WalletTransactionPortError::InvalidChainState);
@@ -1178,7 +1356,9 @@ pub(crate) async fn synchronize_dust_controlled(
                     return Err(WalletTransactionPortError::InvalidChainState);
                 }
                 return Ok(DustSynchronization {
-                    state,
+                    state: state
+                        .ok_or(WalletTransactionPortError::InvalidChainState)?
+                        .into_current()?,
                     current_cursor: segment_cursor,
                     target_cursor,
                     events_processed: replayed_events,
@@ -1201,8 +1381,8 @@ async fn synchronize_dust_with_fallback(
     let cancellation = AtomicBool::new(false);
     let mut ignore_progress = |_: &DustSyncProgress<'_>| Ok(());
     synchronize_dust_with_control(
-        endpoint,
-        dust_key,
+        MidnightTransportRoute::new(endpoint, None),
+        &DustReplayKeys::new(dust_key, None),
         parameters,
         checkpoint,
         &cancellation,
@@ -1212,8 +1392,8 @@ async fn synchronize_dust_with_fallback(
 }
 
 pub(crate) async fn synchronize_dust_with_control(
-    endpoint: &str,
-    dust_key: &DustSecretKey,
+    route: MidnightTransportRoute<'_>,
+    keys: &DustReplayKeys<'_>,
     parameters: DustParameters,
     checkpoint: Option<StoredDustCheckpoint>,
     cancellation: &AtomicBool,
@@ -1233,8 +1413,8 @@ pub(crate) async fn synchronize_dust_with_control(
             result
         };
         synchronize_dust_controlled(
-            endpoint,
-            dust_key,
+            route,
+            keys,
             parameters,
             checkpoint,
             cancellation,
@@ -1244,10 +1424,9 @@ pub(crate) async fn synchronize_dust_with_control(
     };
     match result {
         Err(WalletTransactionPortError::InvalidChainState)
-            if had_checkpoint && !emitted_progress && !observer_failed =>
+            if had_checkpoint && !route.mixed_eras() && !emitted_progress && !observer_failed =>
         {
-            synchronize_dust_controlled(endpoint, dust_key, parameters, None, cancellation, observe)
-                .await
+            synchronize_dust_controlled(route, keys, parameters, None, cancellation, observe).await
         }
         result => result,
     }
@@ -1261,7 +1440,7 @@ pub(crate) struct DustSynchronization {
 }
 
 pub(crate) struct DustSyncProgress<'state> {
-    pub(crate) state: &'state DustLocalState<DefaultDB>,
+    pub(crate) state: &'state DustReplayState,
     pub(crate) current_cursor: u64,
     pub(crate) target_cursor: u64,
     pub(crate) events_processed: usize,
@@ -1274,18 +1453,27 @@ struct DecodedDustEvent {
     id: u64,
     max_id: u64,
     raw_bytes: usize,
-    event: Event<DefaultDB>,
+    event: ReplayEvent,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum DustReceiveOutcome {
     Saturated,
+    BudgetExhausted,
     TargetReached,
     EmptyCheckpoint,
     IdleCheckpoint,
 }
 
+#[cfg(test)]
 fn decode_dust_event(value: &Value) -> Result<DecodedDustEvent, WalletTransactionPortError> {
+    decode_dust_event_for_route(value, false)
+}
+
+fn decode_dust_event_for_route(
+    value: &Value,
+    mixed_eras: bool,
+) -> Result<DecodedDustEvent, WalletTransactionPortError> {
     let id = value
         .get("id")
         .and_then(Value::as_i64)
@@ -1302,8 +1490,9 @@ fn decode_dust_event(value: &Value) -> Result<DecodedDustEvent, WalletTransactio
         .ok_or(WalletTransactionPortError::InvalidChainState)?;
     let bytes = decode_bounded_hex(raw, MAX_DUST_EVENT_BYTES)?;
     let raw_bytes = bytes.len();
-    let event = midnight_serialize::tagged_deserialize(&bytes[..])
-        .map_err(|_| WalletTransactionPortError::InvalidChainState)?;
+    let era = replay_era(value, mixed_eras).ok_or(WalletTransactionPortError::InvalidChainState)?;
+    let event =
+        ReplayEvent::decode(era, &bytes).ok_or(WalletTransactionPortError::InvalidChainState)?;
     Ok(DecodedDustEvent {
         id,
         max_id,
@@ -1532,6 +1721,34 @@ impl HttpDustProvingProvider {
     }
 }
 
+async fn verify_ledger9_proof_server_version(
+    endpoint: &Url,
+) -> Result<(), MidnightProofServerVersionError> {
+    use MidnightProofServerVersionError::{IncompatibleVersion, Unavailable};
+
+    // Paired with the Ledger 9.1.0.2 dependency and its proof wire format.
+    const PROOF_SERVER_VERSION: &[u8] = b"9.0.2";
+    let response = chain_tip_client(endpoint)
+        .map_err(|_| Unavailable)?
+        .get(format!(
+            "{}/version",
+            endpoint.as_str().trim_end_matches('/')
+        ))
+        .send()
+        .await
+        .map_err(|_| Unavailable)?;
+    if !response.status().is_success() {
+        return Err(Unavailable);
+    }
+    let body = bounded_response(response, 64)
+        .await
+        .map_err(|_| Unavailable)?;
+    if body != PROOF_SERVER_VERSION {
+        return Err(IncompatibleVersion);
+    }
+    Ok(())
+}
+
 async fn prove_via_http(
     transaction: UnprovenTransaction,
     endpoint: &str,
@@ -1553,6 +1770,7 @@ async fn prove_via_http(
         // Keep proof material on the explicitly configured route rather than an ambient
         // process proxy. This also preserves loopback proving inside pure Nix builds.
         .no_proxy()
+        .redirect(reqwest::redirect::Policy::none())
         .connect_timeout(CONNECT_TIMEOUT)
         .timeout(PROOF_TIMEOUT)
         .build()
@@ -1573,12 +1791,12 @@ async fn prove_via_http(
 }
 
 async fn submit_unsigned(
-    endpoint: &str,
+    route: MidnightTransportRoute<'_>,
     transaction: Vec<u8>,
     request: &MidnightCompletionRequest,
     fee_specks: u128,
 ) -> Result<([u8; 32], [u8; 32], u64), WalletTransactionPortError> {
-    let client = timeout(CONNECT_TIMEOUT, connect_midnight_node(endpoint))
+    let client = timeout(CONNECT_TIMEOUT, connect_midnight_node(route))
         .await
         .map_err(|_| WalletTransactionPortError::Timeout)?
         .map_err(|_| WalletTransactionPortError::Unavailable)?;
@@ -1827,10 +2045,15 @@ fn websocket_message_type(value: &Value) -> Result<&str, WalletTransactionPortEr
 
 #[cfg(test)]
 mod tests {
-    use std::{net::TcpListener, sync::Condvar, thread};
+    use std::{
+        io::{BufRead, BufReader, ErrorKind, Write},
+        net::TcpListener,
+        sync::Condvar,
+        thread,
+    };
 
     use midnight_ledger::{
-        events::{EventDetails, EventSource},
+        events::{Event, EventDetails, EventSource},
         structure::{INITIAL_PARAMETERS, TransactionHash},
     };
     use oxid_foundation::UnixTimestampMillis;
@@ -1896,6 +2119,57 @@ mod tests {
     }
 
     #[test]
+    fn blockfrost_credential_can_only_be_installed_on_complete_preprod_route_cohort() {
+        fn config(network: &str, ws: &str) -> MidnightStandaloneConfig {
+            MidnightStandaloneConfig::new_without_unshielded_address(
+                network,
+                ws,
+                INDEXER_ROUTE,
+                crate::preprod_transport::NODE_ROUTE,
+                "https://proof.example.test",
+            )
+            .unwrap()
+        }
+        fn credential() -> MidnightPreprodCredential {
+            MidnightPreprodCredential::new(format!("nightpreprod{}", "X".repeat(32))).unwrap()
+        }
+
+        let config_before = config("preprod", INDEXER_SOCKET_ROUTE);
+        assert!(config_before.indexer_http_route().headers().is_err());
+        assert!(config_before.node_route().headers().is_err());
+        let configured = config_before.with_preprod_credential(credential()).unwrap();
+        assert_eq!(configured.indexer_http_url(), INDEXER_ROUTE);
+        assert_eq!(configured.indexer().websocket_url(), INDEXER_SOCKET_ROUTE);
+        assert!(configured.node_route().headers().unwrap()["project_id"].is_sensitive());
+        assert!(configured.indexer_http_route().headers().unwrap()["project_id"].is_sensitive());
+        assert!(!format!("{configured:?}").contains("nightpreprodXXXX"));
+        let authentication = configured.contract_state_authentication().unwrap();
+        for endpoint in [
+            configured.indexer_http_url(),
+            configured.node_websocket_url(),
+        ] {
+            assert!(authentication.headers_for(endpoint).unwrap()["project_id"].is_sensitive());
+        }
+        let canonical_node = format!("{}/", configured.node_websocket_url());
+        assert!(authentication.headers_for(&canonical_node).unwrap()["project_id"].is_sensitive());
+        for endpoint in [INDEXER_SOCKET_ROUTE, "https://proof.example.test"] {
+            assert_eq!(
+                authentication.headers_for(endpoint),
+                Err(TransportTrustError::InvalidEndpoint),
+            );
+        }
+        for (network, ws) in [
+            ("preview", INDEXER_SOCKET_ROUTE),
+            ("preprod", "wss://other.example.test/api/v0/ws"),
+        ] {
+            assert_eq!(
+                config(network, ws).with_preprod_credential(credential()),
+                Err(MidnightStandaloneConfigError::InvalidPreprodRoutes),
+            );
+        }
+    }
+
+    #[test]
     fn transaction_submission_connection_failure_does_not_create_a_broadcast_record() {
         let entry = submission_entry(StoredSubmissionState::Broadcasting);
         let journal: Arc<dyn MidnightSubmissionJournalStore> =
@@ -1936,7 +2210,12 @@ mod tests {
                 drop(connection);
             };
             let (result, ()) = tokio::join!(
-                submit_unsigned(&endpoint, vec![0], &request, entry.fee_specks),
+                submit_unsigned(
+                    MidnightTransportRoute::new(&endpoint, None),
+                    vec![0],
+                    &request,
+                    entry.fee_specks
+                ),
                 disconnect,
             );
             result
@@ -2096,6 +2375,14 @@ mod tests {
     fn serve_dust_subscriptions(
         scenarios: Vec<DustSubscriptionScenario>,
     ) -> (String, thread::JoinHandle<()>) {
+        serve_dust_subscriptions_for_eras(scenarios, false)
+    }
+
+    #[allow(clippy::result_large_err)]
+    fn serve_dust_subscriptions_for_eras(
+        scenarios: Vec<DustSubscriptionScenario>,
+        mixed_eras: bool,
+    ) -> (String, thread::JoinHandle<()>) {
         let listener = TcpListener::bind("127.0.0.1:0").expect("test listener binds");
         listener
             .set_nonblocking(true)
@@ -2143,6 +2430,14 @@ mod tests {
                             .and_then(Value::as_u64),
                         Some(expected_start)
                     );
+                    assert_eq!(
+                        request["payload"]["query"],
+                        if mixed_eras {
+                            MIXED_DUST_QUERY
+                        } else {
+                            DUST_QUERY
+                        }
+                    );
                     if events.is_empty() {
                         socket
                             .send(Message::Text(
@@ -2154,20 +2449,23 @@ mod tests {
                             .expect("completion sends");
                     } else {
                         for (id, max_id, raw) in events {
+                            let (raw, legacy) = raw
+                                .strip_prefix("legacy:")
+                                .map_or((raw.as_str(), false), |raw| (raw, true));
+                            let mut event = json!({"id": id, "maxId": max_id, "raw": raw});
+                            if mixed_eras {
+                                event["protocolVersion"] = if legacy {
+                                    json!(1_000_000)
+                                } else {
+                                    json!(2_001_100)
+                                };
+                            }
                             socket
                                 .send(Message::Text(
                                     json!({
                                         "type": "next",
                                         "id": "oxid-dust",
-                                        "payload": {
-                                            "data": {
-                                                "dustLedgerEvents": {
-                                                    "id": id,
-                                                    "maxId": max_id,
-                                                    "raw": raw
-                                                }
-                                            }
-                                        }
+                                        "payload": {"data": {"dustLedgerEvents": event}}
                                     })
                                     .to_string()
                                     .into(),
@@ -2525,6 +2823,128 @@ mod tests {
     }
 
     #[test]
+    fn preprod_identified_tip_requires_a_full_hash_and_ledger9_parameters() {
+        let mut parameters = Vec::new();
+        midnight_serialize::tagged_serialize(&INITIAL_PARAMETERS, &mut parameters).unwrap();
+        let mut tip = json!({
+            "data": { "block": {
+                "height": 42,
+                "timestamp": 1_750_000_000_000_u64,
+                "hash": "42".repeat(32),
+                "protocolVersion": 2_001_100_u32,
+                "ledgerParameters": hex::encode(parameters),
+            }}
+        });
+        assert_eq!(
+            decode_identified_chain_tip(&serde_json::to_vec(&tip).unwrap()).unwrap(),
+            (42, [0x42; 32], 2_001_100),
+        );
+        tip["data"]["block"]["hash"] = json!("1234");
+        assert!(decode_identified_chain_tip(&serde_json::to_vec(&tip).unwrap()).is_err());
+    }
+
+    #[test]
+    fn public_proof_server_version_probe_uses_the_prover_path_and_rejects_old_releases() {
+        use std::io::{BufRead as _, BufReader, Write as _};
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        for (version, expected) in [
+            ("9.0.2", Ok(())),
+            (
+                "9.0.1",
+                Err(MidnightProofServerVersionError::IncompatibleVersion),
+            ),
+        ] {
+            let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+            let endpoint =
+                Url::parse(&format!("http://{}/prover", listener.local_addr().unwrap())).unwrap();
+            let server = std::thread::spawn(move || {
+                let (mut stream, _) = listener.accept().unwrap();
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(5)))
+                    .unwrap();
+                let mut request = BufReader::new(&mut stream);
+                let mut line = String::new();
+                request.read_line(&mut line).unwrap();
+                assert_eq!(line.trim_end(), "GET /prover/version HTTP/1.1");
+                loop {
+                    line.clear();
+                    if request.read_line(&mut line).unwrap() == 0 || line == "\r\n" {
+                        break;
+                    }
+                    assert!(!line.to_ascii_lowercase().starts_with("project_id:"));
+                }
+                write!(
+                    stream,
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{version}",
+                    version.len()
+                )
+                .unwrap();
+            });
+            assert_eq!(
+                runtime.block_on(verify_ledger9_proof_server_version(&endpoint)),
+                expected
+            );
+            server.join().unwrap();
+        }
+    }
+
+    #[test]
+    fn chain_tip_authenticates_one_request_and_refuses_redirects() {
+        const PROJECT_ID: &str = "fixture-indexer-credential";
+        let redirect_target = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        redirect_target.set_nonblocking(true).unwrap();
+        let destination = redirect_target.local_addr().unwrap();
+        let server = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let route = format!("http://{}/api/v0", server.local_addr().unwrap());
+        let fixture = thread::spawn(move || {
+            let (mut stream, _) = server.accept().unwrap();
+            stream.set_read_timeout(Some(CONNECT_TIMEOUT)).unwrap();
+            let mut request = BufReader::new(&mut stream);
+            let mut request_line = String::new();
+            request.read_line(&mut request_line).unwrap();
+            assert_eq!(request_line, "POST /api/v0 HTTP/1.1\r\n");
+            let mut project_id_received = false;
+            loop {
+                let mut line = String::new();
+                assert_ne!(request.read_line(&mut line).unwrap(), 0);
+                if line == "\r\n" {
+                    break;
+                }
+                if let Some((name, value)) = line.split_once(':')
+                    && name.eq_ignore_ascii_case("project_id")
+                {
+                    project_id_received = value.trim() == PROJECT_ID;
+                }
+            }
+            assert!(project_id_received);
+            write!(
+                stream,
+                "HTTP/1.1 307 Temporary Redirect\r\nLocation: http://{destination}/unexpected\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+            )
+            .unwrap();
+        });
+
+        let mut headers = reqwest::header::HeaderMap::new();
+        let mut project_id = reqwest::header::HeaderValue::from_static(PROJECT_ID);
+        project_id.set_sensitive(true);
+        headers.insert("project_id", project_id);
+        let result = runtime().block_on(fetch_chain_tip_with_headers(&route, headers));
+        assert!(matches!(
+            result,
+            Err(WalletTransactionPortError::InvalidChainState)
+        ));
+        fixture.join().unwrap();
+        assert_eq!(
+            redirect_target.accept().unwrap_err().kind(),
+            ErrorKind::WouldBlock,
+        );
+    }
+
+    #[test]
     fn chain_tip_http_response_rejects_http_and_graphql_failures() {
         assert_eq!(
             validate_chain_tip_status(StatusCode::SERVICE_UNAVAILABLE).err(),
@@ -2629,7 +3049,7 @@ mod tests {
             current_cursor: 42,
             target_cursor: 42,
             updated_at: UnixTimestampMillis::new(1_700_000_000_000),
-            state: DustLocalState::new(INITIAL_PARAMETERS.dust),
+            state: DustReplayState::Current(DustLocalState::new(INITIAL_PARAMETERS.dust)),
         };
         let synchronized = runtime()
             .block_on(synchronize_dust(
@@ -2653,13 +3073,261 @@ mod tests {
                     current_cursor: 43,
                     target_cursor: 43,
                     updated_at: UnixTimestampMillis::new(1_700_000_000_001),
-                    state: synchronized.state,
+                    state: DustReplayState::Current(synchronized.state),
                 }),
             ))
             .expect("live empty delta confirms an up-to-date checkpoint");
         worker.join().expect("WebSocket worker completes");
         assert_eq!(caught_up.current_cursor, 43);
         assert_eq!(caught_up.target_cursor, 43);
+    }
+
+    #[cfg(feature = "mixed-era-replay")]
+    #[test]
+    fn dust_replay_resumes_across_the_upgrade_and_rejects_era_rollback() {
+        use crate::MidnightDustCheckpointConfig;
+        use crate::dust_checkpoint::BinaryMidnightDustCheckpointStore;
+        use midnight_legacy_ledger::{
+            events::{Event as OldEvent, EventDetails as OldDetails, EventSource as OldSource},
+            structure::INITIAL_PARAMETERS as OLD_PARAMETERS,
+        };
+        use midnight_legacy_storage::{DefaultDB as OldDb, arena::Sp as OldSp};
+        use oxid_wallet_domain::ChainNetworkId;
+
+        let fixture = OldEvent::<OldDb> {
+            source: OldSource {
+                transaction_hash: Default::default(),
+                logical_segment: 0,
+                physical_segment: 0,
+            },
+            content: OldDetails::ParamChange(OldSp::new(OLD_PARAMETERS)),
+        };
+        let mut bytes = Vec::new();
+        midnight_legacy_serialize::tagged_serialize(&fixture, &mut bytes).unwrap();
+        let legacy = format!("legacy:{}", hex::encode(bytes));
+        let current = parameter_change_event_hex();
+        let (endpoint, worker) = serve_dust_subscriptions_for_eras(
+            vec![
+                (0, vec![(1, 8, legacy.clone()), (8, 8, current.clone())]),
+                (0, vec![(1, 8, legacy.clone()), (8, 8, current.clone())]),
+                (2, vec![(8, 8, current.clone())]),
+                (8, vec![]),
+                (8, vec![(8, 8, current.clone())]),
+                (8, vec![(8, 12, current.clone()), (12, 12, current)]),
+                (8, vec![(8, 8, legacy)]),
+            ],
+            true,
+        );
+        let route = MidnightTransportRoute::new(&endpoint, None).with_mixed_eras(true);
+        let seed = [7; 32];
+        let dust_key = DustSecretKey::derive_secret_key(&seed);
+        let keys = DustReplayKeys::new(&dust_key, Some(&seed));
+        let public_key = DustPublicKey::from(dust_key.clone());
+        let network = ChainNetworkId::parse("preview").unwrap();
+        let directory = crate::legacy_replay_tests::private_checkpoint_directory();
+        let config = MidnightDustCheckpointConfig::new(directory.path().join("dust.bin")).unwrap();
+        let parameters = INITIAL_PARAMETERS.dust;
+        let cancel = AtomicBool::new(false);
+        let uninterrupted = runtime()
+            .block_on(synchronize_dust_with_control(
+                route,
+                &keys,
+                parameters,
+                None,
+                &cancel,
+                &mut |_| Ok(()),
+            ))
+            .unwrap();
+        assert_eq!(uninterrupted.events_processed, 2);
+        let interrupted = runtime().block_on(synchronize_dust_with_control(
+            route,
+            &keys,
+            parameters,
+            None,
+            &cancel,
+            &mut |progress| {
+                assert!(progress.state.current().is_none());
+                assert_eq!(progress.current_cursor, 1);
+                BinaryMidnightDustCheckpointStore::new(config.clone())
+                    .save_state(
+                        &network,
+                        &public_key,
+                        progress.current_cursor,
+                        progress.target_cursor,
+                        UnixTimestampMillis::new(1),
+                        progress.state,
+                    )
+                    .unwrap();
+                cancel.store(true, Ordering::Release);
+                Ok(())
+            },
+        ));
+        assert_eq!(
+            interrupted.err(),
+            Some(WalletTransactionPortError::SubmissionCancelled)
+        );
+        let store = BinaryMidnightDustCheckpointStore::new(config);
+        let legacy_checkpoint = store
+            .load(&network, &public_key, parameters)
+            .unwrap()
+            .unwrap();
+        assert!(legacy_checkpoint.state.current().is_none());
+        cancel.store(false, Ordering::Release);
+        let synchronized = runtime()
+            .block_on(synchronize_dust_with_control(
+                route,
+                &keys,
+                parameters,
+                Some(legacy_checkpoint),
+                &cancel,
+                &mut |progress| {
+                    store
+                        .save_state(
+                            &network,
+                            &public_key,
+                            progress.current_cursor,
+                            progress.target_cursor,
+                            UnixTimestampMillis::new(2),
+                            progress.state,
+                        )
+                        .unwrap();
+                    Ok(())
+                },
+            ))
+            .unwrap();
+        assert_eq!(synchronized.current_cursor, 8);
+        assert_eq!(synchronized.events_processed, 1);
+        assert_eq!(
+            synchronized
+                .state
+                .wallet_balance(synchronized.state.sync_time),
+            0
+        );
+        let post_upgrade = store
+            .load(&network, &public_key, parameters)
+            .unwrap()
+            .unwrap();
+        assert!(post_upgrade.state.current().is_some());
+        assert_eq!(
+            runtime()
+                .block_on(synchronize_dust_with_control(
+                    route,
+                    &keys,
+                    parameters,
+                    Some(post_upgrade),
+                    &cancel,
+                    &mut |_| panic!("a public checkpoint needs a live watermark"),
+                ))
+                .err(),
+            Some(WalletTransactionPortError::Timeout)
+        );
+        let post_upgrade = store
+            .load(&network, &public_key, parameters)
+            .unwrap()
+            .unwrap();
+        let resumed = runtime()
+            .block_on(synchronize_dust_with_control(
+                route,
+                &keys,
+                parameters,
+                Some(post_upgrade),
+                &cancel,
+                &mut |_| Ok(()),
+            ))
+            .unwrap();
+        assert_eq!(resumed.events_processed, 0);
+        assert_eq!(
+            (resumed.current_cursor, resumed.target_cursor),
+            (uninterrupted.current_cursor, uninterrupted.target_cursor)
+        );
+        let mut uninterrupted_bytes = Vec::new();
+        let mut resumed_bytes = Vec::new();
+        midnight_serialize::tagged_serialize(&uninterrupted.state, &mut uninterrupted_bytes)
+            .unwrap();
+        midnight_serialize::tagged_serialize(&resumed.state, &mut resumed_bytes).unwrap();
+        assert!(
+            resumed_bytes == uninterrupted_bytes,
+            "DUST checkpoint changed native state"
+        );
+        let post_upgrade = store
+            .load(&network, &public_key, parameters)
+            .unwrap()
+            .unwrap();
+        let advanced = runtime()
+            .block_on(synchronize_dust_with_control(
+                route,
+                &keys,
+                parameters,
+                Some(post_upgrade),
+                &cancel,
+                &mut |progress| {
+                    assert_eq!((progress.current_cursor, progress.target_cursor), (12, 12));
+                    Ok(())
+                },
+            ))
+            .unwrap();
+        assert_eq!((advanced.current_cursor, advanced.target_cursor), (12, 12));
+        assert_eq!(advanced.events_processed, 1);
+        let post_upgrade = store
+            .load(&network, &public_key, parameters)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            runtime()
+                .block_on(synchronize_dust_with_control(
+                    route,
+                    &keys,
+                    parameters,
+                    Some(post_upgrade),
+                    &cancel,
+                    &mut |_| panic!("a backward era must not be persisted"),
+                ))
+                .err(),
+            Some(WalletTransactionPortError::InvalidChainState)
+        );
+        worker.join().unwrap();
+    }
+
+    #[test]
+    fn public_dust_continues_at_the_durable_cursor_after_a_full_window() {
+        let raw = parameter_change_event_hex();
+        let (endpoint, worker) = serve_dust_subscriptions_for_eras(
+            vec![
+                (
+                    0,
+                    vec![
+                        (1, 8, raw.clone()),
+                        (2, 8, raw.clone()),
+                        (8, 8, raw.clone()),
+                    ],
+                ),
+                (3, vec![(8, 8, raw)]),
+            ],
+            true,
+        );
+        let route = MidnightTransportRoute::new(&endpoint, None).with_mixed_eras(true);
+        let secret = DustSecretKey::derive_secret_key(&[7; 32]);
+        let keys = DustReplayKeys::new(&secret, None);
+        let mut observed = Vec::new();
+        let synchronized = runtime()
+            .block_on(synchronize_dust_controlled_with_limits(
+                route,
+                &keys,
+                INITIAL_PARAMETERS.dust,
+                None,
+                &AtomicBool::new(false),
+                &mut |progress| {
+                    observed.push((progress.current_cursor, progress.events_processed));
+                    Ok(())
+                },
+                (2, MAX_DUST_TOTAL_BYTES),
+            ))
+            .unwrap();
+        worker.join().unwrap();
+
+        assert_eq!(observed, [(2, 2), (8, 3)]);
+        assert_eq!(synchronized.current_cursor, synchronized.target_cursor);
+        assert_eq!(synchronized.events_processed, 3);
     }
 
     #[test]
@@ -2694,8 +3362,8 @@ mod tests {
         let mut observed = Vec::new();
         let synchronized = runtime()
             .block_on(synchronize_dust_controlled(
-                &endpoint,
-                &dust_key,
+                MidnightTransportRoute::new(&endpoint, None),
+                &DustReplayKeys::new(&dust_key, None),
                 INITIAL_PARAMETERS.dust,
                 None,
                 &cancellation,
@@ -2791,8 +3459,8 @@ mod tests {
         let cancellation = AtomicBool::new(false);
         let mut observed = Vec::new();
         let result = runtime().block_on(synchronize_dust_controlled(
-            &endpoint,
-            &dust_key,
+            MidnightTransportRoute::new(&endpoint, None),
+            &DustReplayKeys::new(&dust_key, None),
             INITIAL_PARAMETERS.dust,
             None,
             &cancellation,
@@ -2832,7 +3500,7 @@ mod tests {
                     current_cursor: 0,
                     target_cursor: 0,
                     updated_at: UnixTimestampMillis::new(1_700_000_000_000),
-                    state: DustLocalState::new(INITIAL_PARAMETERS.dust),
+                    state: DustReplayState::Current(DustLocalState::new(INITIAL_PARAMETERS.dust)),
                 }),
             ))
             .expect("incompatible delta recovers with one clean replay");
@@ -2851,14 +3519,14 @@ mod tests {
         let cancellation = AtomicBool::new(false);
         let mut observer_calls = 0_usize;
         let result = runtime().block_on(synchronize_dust_with_control(
-            &endpoint,
-            &dust_key,
+            MidnightTransportRoute::new(&endpoint, None),
+            &DustReplayKeys::new(&dust_key, None),
             INITIAL_PARAMETERS.dust,
             Some(StoredDustCheckpoint {
                 current_cursor: 0,
                 target_cursor: 0,
                 updated_at: UnixTimestampMillis::new(1_700_000_000_000),
-                state: DustLocalState::new(INITIAL_PARAMETERS.dust),
+                state: DustReplayState::Current(DustLocalState::new(INITIAL_PARAMETERS.dust)),
             }),
             &cancellation,
             &mut |_| {
@@ -2891,7 +3559,7 @@ mod tests {
                 current_cursor: 7,
                 target_cursor: 7,
                 updated_at: UnixTimestampMillis::new(1_700_000_000_000),
-                state: DustLocalState::new(INITIAL_PARAMETERS.dust),
+                state: DustReplayState::Current(DustLocalState::new(INITIAL_PARAMETERS.dust)),
             }),
         ));
         assert_eq!(result.err(), Some(WalletTransactionPortError::Unavailable));

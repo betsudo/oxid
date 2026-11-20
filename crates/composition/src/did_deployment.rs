@@ -94,6 +94,10 @@ fn load_native_did_artifacts() -> Option<MidnightDidCompactArtifacts> {
     }
 }
 
+#[cfg(any(
+    feature = "mobile-portal",
+    not(any(target_os = "ios", target_os = "android"))
+))]
 pub(super) fn with_native_did_deployment<K, M>(
     mut services: super::services::ApplicationServices,
     config: &MidnightStandaloneConfig,
@@ -107,24 +111,45 @@ where
         + MidnightContractCallSubmissionPort
         + 'static,
 {
-    let Some(artifacts) = load_native_did_artifacts() else {
-        return services;
-    };
+    if let Some(deployment) = native_did_deployment(
+        config,
+        security,
+        midnight,
+        Arc::clone(&services.did_resolution_port),
+        super::identity::headless_did_deployment_repository(),
+    ) {
+        services.deploy_did = deployment;
+    }
+    services
+}
+
+pub(super) fn native_did_deployment<K, M>(
+    config: &MidnightStandaloneConfig,
+    security: Arc<K>,
+    midnight: Arc<M>,
+    resolver: Arc<dyn DidResolutionPort>,
+    operations: Arc<dyn DidDeploymentOperationRepository>,
+) -> Option<Arc<dyn DeployDidUseCase>>
+where
+    K: WalletDerivedSecretUsePort + WalletKeyOperationPort + 'static,
+    M: MidnightPublicCallContextSource
+        + MidnightContractCallFundingPort
+        + MidnightContractCallSubmissionPort
+        + 'static,
+{
+    let artifacts = load_native_did_artifacts()?;
     let wallet: Arc<dyn MidnightPublicCallContextSource> = midnight.clone();
-    let contexts = match NodeAnchoredDidDeploymentContextSource::new(config, wallet) {
-        Ok(contexts) => Arc::new(contexts) as Arc<dyn DidDeploymentContextSource>,
-        Err(_) => return services,
-    };
+    let contexts = Arc::new(NodeAnchoredDidDeploymentContextSource::new(config, wallet).ok()?);
     let custody: Arc<dyn WalletDerivedSecretUsePort> = security.clone();
     let keys: Arc<dyn WalletKeyOperationPort> = security;
     let calls = Arc::new(NativeMidnightDidCallComposer::new(
         Arc::clone(&custody),
         keys,
         artifacts,
-    )) as Arc<dyn MidnightDidCallCompositionPort>;
+    ));
     let funding: Arc<dyn MidnightContractCallFundingPort> = midnight.clone();
     let submission: Arc<dyn MidnightContractCallSubmissionPort> = midnight;
-    services.deploy_did = Arc::new(NativeDidDeploymentService::new(
+    Some(Arc::new(NativeDidDeploymentService::new(
         Arc::new(NativeMidnightDidDeploymentComposer::new(Arc::clone(
             &custody,
         ))),
@@ -133,12 +158,11 @@ where
         contexts,
         funding,
         submission,
-        Arc::clone(&services.did_resolution_port),
-        super::identity::headless_did_deployment_repository(),
+        resolver,
+        operations,
         Arc::new(oxid_adapter_platform_system::SystemClock),
         Arc::new(oxid_adapter_platform_system::OsRandom),
-    ));
-    services
+    )))
 }
 
 pub(super) struct NativeDidDeploymentService {
@@ -193,9 +217,10 @@ impl NodeAnchoredDidDeploymentContextSource {
         config: &MidnightStandaloneConfig,
         wallet: Arc<dyn MidnightPublicCallContextSource>,
     ) -> Result<Self, NativeDidDeploymentError> {
-        let chain = NodeAnchoredPassportVaultStateSource::new(
+        let chain = NodeAnchoredPassportVaultStateSource::new_with_authentication(
             config.indexer_http_url(),
             config.node_websocket_url(),
+            config.contract_state_authentication(),
         )
         .map_err(|_| NativeDidDeploymentError::Unavailable)?;
         Ok(Self {

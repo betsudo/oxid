@@ -439,36 +439,10 @@ impl WalletOperationalUiServices {
     }
 }
 
-pub type WalletDustSettlementProjection =
-    oxid_wallet_application::WalletDustRegistrationSettlementProjection;
-pub type WalletDustSettlementSubscription =
-    tokio::sync::watch::Receiver<WalletDustSettlementProjection>;
-
-/// Adapter boundary for the composition-owned DUST settlement coordinator.
-///
-/// The UI can only observe the composition-owned projection. Registration,
-/// reconciliation, and retries remain application/composition concerns.
-pub trait WalletDustSettlementUiPort: Send + Sync {
-    fn projection(&self) -> Result<WalletDustSettlementProjection, String>;
-
-    fn subscribe(&self) -> WalletDustSettlementSubscription;
-}
-
-#[derive(Clone)]
-pub struct WalletDustSettlementUiServices {
-    port: Arc<dyn WalletDustSettlementUiPort>,
-}
-
-impl WalletDustSettlementUiServices {
-    #[must_use]
-    pub const fn new(port: Arc<dyn WalletDustSettlementUiPort>) -> Self {
-        Self { port }
-    }
-
-    fn port(&self) -> Arc<dyn WalletDustSettlementUiPort> {
-        Arc::clone(&self.port)
-    }
-}
+pub use selected_realm_sync::dust_authorization::{
+    WalletDustProtectedReview, WalletDustSettlementProjection, WalletDustSettlementSubscription,
+    WalletDustSettlementUiPort, WalletDustSettlementUiServices,
+};
 
 /// DID inventory and resolution use cases consumed by the DIDs page.
 pub struct DidUiServices {

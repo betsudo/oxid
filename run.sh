@@ -152,6 +152,7 @@ run_unit() {
     --exclude oxid-app \
     --exclude oxid-adapter-storage-dev \
     --exclude oxid-composition \
+    --features oxid-adapter-midnight/mixed-era-replay \
     --lib \
     --bins
   # Exercise the opt-in fixture code in ordinary non-live CI without running

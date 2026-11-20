@@ -2,7 +2,8 @@
 
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
-import { chmod, copyFile, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { createHash } from "node:crypto";
+import { chmod, copyFile, mkdir, mkdtemp, readFile, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import test from "node:test";
@@ -22,6 +23,7 @@ const rustOverrides = [
 function cleanEnvironment(overrides = {}) {
   const environment = { ...process.env };
   for (const variable of rustOverrides) delete environment[variable];
+  delete environment.OXID_MOBILE_PORTAL_PROFILE;
   return { ...environment, ...overrides };
 }
 
@@ -48,7 +50,8 @@ test("release-candidate build is arm64-only, statically verified, and device-fre
   );
   assert.match(script, /--release/);
   assert.match(script, /--target aarch64-linux-android/);
-  assert.match(script, /target\/android-release-candidate\/oxid-app-arm64-v8a-release\.apk/);
+  assert.match(script, /candidate_directory="\$repository_root\/target\/android-release-candidate"/);
+  assert.match(script, /artifact="\$artifact_directory\/oxid-app-arm64-v8a-release.apk"/);
   assert.match(script, /node scripts\/android-verify-16k\.mjs "\$artifact"/);
   assert.match(nativePluginGradle, /compileSdk = 35/);
   assert.match(script, /application_compile_sdk="34"/);
@@ -122,7 +125,7 @@ test("release-candidate source and artifact guards are statically fail-closed", 
   const verify = script.indexOf('node scripts/android-verify-16k.mjs "$artifact"');
   const hash = script.indexOf('artifact_sha256="$(shasum -a 256 "$artifact"');
   const postGuard = script.indexOf('source worktree changed during build; refusing to publish receipt');
-  const receipt = script.indexOf('jq -n \\\n  --arg head');
+  const receipt = script.indexOf('jq -n \\\n  --arg schema');
 
   assert.ok(preGuard >= 0 && preGuard < capture && capture < lock && lock < invalidate && invalidate < build);
   assert.ok(build < snapshot && snapshot < verify && verify < hash);
@@ -132,6 +135,111 @@ test("release-candidate source and artifact guards are statically fail-closed", 
   assert.match(script, />"\$receipt\.tmp"/);
   assert.match(script, /mv "\$receipt\.tmp" "\$receipt"/);
   assert.doesNotMatch(script, /\[\[\s+-v\s+/, "macOS Bash 3.2 does not support [[ -v VAR ]]");
+});
+
+test("Preview candidate requires three exact pinned inputs and keeps its output isolated", async (t) => {
+  const temporaryRoot = await mkdtemp(path.join(tmpdir(), "oxid-android-preview-"));
+  t.after(() => rm(temporaryRoot, { recursive: true, force: true }));
+  const scriptsDirectory = path.join(temporaryRoot, "scripts");
+  const scriptPath = path.join(scriptsDirectory, "build-android-release-candidate.sh");
+  await mkdir(path.join(scriptsDirectory, "lib"), { recursive: true });
+  await copyFile(path.join(root, "scripts", "build-android-release-candidate.sh"), scriptPath);
+  await copyFile(path.join(root, "scripts", "lib", "android-java.sh"), path.join(scriptsDirectory, "lib", "android-java.sh"));
+  await run("git", ["init", "-q"], temporaryRoot);
+  // Valid digests reach the dirty source guard without using an SDK or device.
+  const payload = "synthetic reviewed bytes\n";
+  const digest = createHash("sha256").update(payload).digest("hex");
+  const input = path.join(temporaryRoot, "input.json");
+  const link = path.join(temporaryRoot, "link.json");
+  await writeFile(input, payload);
+  await symlink(input, link);
+  const bindings = {
+    OXID_BUILD_PREVIEW_TRUST_ROOT_PATH: input,
+    OXID_BUILD_PREVIEW_TRUST_ROOT_SHA256: digest,
+    OXID_BUILD_PREVIEW_SIGNED_PROFILE_PATH: input,
+    OXID_BUILD_PREVIEW_SIGNED_PROFILE_SHA256: digest,
+    OXID_BUILD_PORTAL_DEPLOYMENT_MANIFEST_PATH: input,
+    OXID_BUILD_PORTAL_DEPLOYMENT_MANIFEST_SHA256: digest,
+  };
+  const execute = (overrides = {}) => run("bash", [scriptPath], temporaryRoot, cleanEnvironment({
+    OXID_MOBILE_PORTAL_PROFILE: "preview", ...bindings, ...overrides,
+  }), false);
+
+  for (const [variable, diagnostic] of [
+    ["OXID_BUILD_PREVIEW_TRUST_ROOT_SHA256", /Preview trust root path or digest is invalid/],
+    ["OXID_BUILD_PREVIEW_SIGNED_PROFILE_SHA256", /Preview signed profile path or digest is invalid/],
+    ["OXID_BUILD_PORTAL_DEPLOYMENT_MANIFEST_SHA256", /Preview Portal manifest path or digest is invalid/],
+  ]) {
+    const result = await execute({ [variable]: "0".repeat(64) });
+    assert.equal(result.code, 1);
+    assert.match(result.stderr, diagnostic);
+  }
+  const symlinkInput = await execute({ OXID_BUILD_PREVIEW_TRUST_ROOT_PATH: link });
+  assert.equal(symlinkInput.code, 1);
+  assert.match(symlinkInput.stderr, /Preview trust root path or digest is invalid/);
+  const unsupported = await execute({ OXID_MOBILE_PORTAL_PROFILE: "preprod" });
+  assert.equal(unsupported.code, 1);
+  assert.match(unsupported.stderr, /must be 'unavailable' or 'preview'/);
+  const matches = await execute();
+  assert.equal(matches.code, 1);
+  assert.match(matches.stderr, /source worktree is not clean/);
+
+  const source = await readFile(scriptPath, "utf8");
+  assert.match(source, /mobile_features="preview-portal"/);
+  assert.match(source, /artifact_directory="\$candidate_directory\/preview"/);
+  assert.match(source, /lock_directory="\$candidate_directory\/\.build\.lock"/);
+  assert.match(source, /receipt_schema="oxid-android-preview-candidate-receipt-v1"/);
+  assert.match(source, /"\$apksigner" verify --print-certs "\$artifact"/);
+  assert.match(source, /if \$preview == null then \. else \. \+ \{preview:\$preview\} end/);
+});
+
+test("Preview handoff rejects a wrong source or profile even for the exact APK", async (t) => {
+  const directory = await mkdtemp(path.join(tmpdir(), "oxid-android-preview-handoff-"));
+  t.after(() => rm(directory, { recursive: true, force: true }));
+  const guide = await readFile(path.join(root, "docs", "factory", "ledger9-public-issuance.md"), "utf8");
+  const snippet = [...guide.matchAll(/^```bash\n([\s\S]*?)^```/gm)]
+    .map((match) => match[1])
+    .find((block) => block.includes("Android Preview source head mismatch"));
+  assert.ok(snippet);
+  await run("git", ["init", "-q"], directory);
+  await run("git", ["-c", "user.name=Test", "-c", "user.email=test@example.invalid",
+    "commit", "--allow-empty", "--no-gpg-sign", "-qm", "fixture"], directory);
+  const head = (await run("git", ["rev-parse", "HEAD"], directory)).stdout.trim();
+  const candidate = path.join(directory, "target", "android-release-candidate", "preview");
+  await mkdir(candidate, { recursive: true });
+  const apk = "fixture APK bytes";
+  await writeFile(path.join(candidate, "oxid-app-arm64-v8a-release.apk"), apk);
+  const digest = createHash("sha256").update(apk).digest("hex");
+  const profile = "1".repeat(64);
+  const trust = "2".repeat(64);
+  const manifest = "3".repeat(64);
+  const env = cleanEnvironment({
+    OXID_BUILD_PREVIEW_SIGNED_PROFILE_SHA256: profile,
+    OXID_BUILD_PREVIEW_TRUST_ROOT_SHA256: trust,
+    OXID_BUILD_PORTAL_DEPLOYMENT_MANIFEST_SHA256: manifest,
+  });
+  const receipt = {
+    schema: "oxid-android-preview-candidate-receipt-v1",
+    source: { head },
+    preview: {
+      network: "preview", features: "preview-portal",
+      signedProfileSha256: profile, trustRootSha256: trust, portalManifestSha256: manifest,
+    },
+    artifact: { sha256: digest },
+  };
+  const check = async (value) => {
+    await writeFile(path.join(candidate, "receipt.json"), JSON.stringify(value));
+    return run("bash", ["-c", snippet], directory, env, false);
+  };
+  assert.equal((await check(receipt)).code, 0);
+  const wrongHead = await check({ ...receipt, source: { head: "0".repeat(40) } });
+  assert.equal(wrongHead.code, 1);
+  assert.match(wrongHead.stderr, /source head mismatch/);
+  const wrongProfile = await check({
+    ...receipt, preview: { ...receipt.preview, signedProfileSha256: "0".repeat(64) },
+  });
+  assert.equal(wrongProfile.code, 1);
+  assert.match(wrongProfile.stderr, /signed profile mismatch/);
 });
 
 test("release-candidate build rejects ambient Rust overrides without disclosing their values", async (t) => {

@@ -3,3 +3,5 @@ fixtures/laceid-portal/76e8edf394a4cb37ca822037272d543c68f25f71/openid4vci-final
 docs/site/src/quality-baseline-2026-08-26.md:generic-api-key:271
 docs/migration/midnight-ledger-prototype.md:generic-api-key:386
 scripts/git-hooks/check-github-web-flow-key.mjs:generic-api-key:8
+crates/composition/tests/fixtures/preprod-portal/trust-root.json:generic-api-key:2
+crates/composition/tests/fixtures/preview-portal/trust-root.json:generic-api-key:2

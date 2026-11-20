@@ -11,7 +11,7 @@ mod passport_vault;
 #[cfg(not(target_arch = "wasm32"))]
 #[cfg(any(
     not(any(target_os = "ios", target_os = "android")),
-    feature = "mobile-portal"
+    any(feature = "mobile-portal", feature = "public-portal")
 ))]
 mod portal;
 mod profile_environment;

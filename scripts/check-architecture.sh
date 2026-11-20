@@ -212,7 +212,7 @@ check_workspace_dependencies oxid-composition \
   oxid-wallet-application
 check_workspace_dependencies oxid-mcp
 check_workspace_dependencies oxid-app \
-  oxid-adapter-identity-ingress oxid-brand-build oxid-composition oxid-ui-dioxus
+  oxid-adapter-deployment-profile oxid-adapter-identity-ingress oxid-brand-build oxid-composition oxid-ui-dioxus
 check_workspace_dependencies oxid-headless \
   oxid-capabilities-application oxid-composition oxid-credential-application \
   oxid-diagnostics-application oxid-identity-application oxid-identity-domain \

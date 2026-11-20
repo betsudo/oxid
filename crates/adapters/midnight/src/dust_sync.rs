@@ -31,11 +31,14 @@ use oxid_wallet_domain::{
 use crate::{
     BIP44_PURPOSE, DUST_INDEX, DUST_ROLE, MIDNIGHT_COIN_TYPE, SPECKS_PER_DUST,
     dust_checkpoint::{DustCheckpointStoreError, MidnightDustCheckpointStore},
+    dust_replay::DustReplayKeys,
     submission::{
         ChainTip, DustSyncProgress, MidnightStandaloneConfig, ensure_submission_active,
         fetch_chain_tip, synchronize_dust_with_control,
     },
 };
+
+use crate::preprod_transport::MidnightTransportRoute;
 
 #[cfg(test)]
 const DUST_ACCOUNT_INDEX: u32 = 0;
@@ -245,7 +248,7 @@ struct LiveSession {
 trait MidnightDustChainTipSource: Send + Sync {
     fn fetch<'a>(
         &'a self,
-        endpoint: &'a str,
+        route: MidnightTransportRoute<'a>,
     ) -> Pin<Box<dyn Future<Output = Result<ChainTip, WalletTransactionPortError>> + Send + 'a>>;
 }
 
@@ -255,10 +258,10 @@ struct HttpMidnightDustChainTipSource;
 impl MidnightDustChainTipSource for HttpMidnightDustChainTipSource {
     fn fetch<'a>(
         &'a self,
-        endpoint: &'a str,
+        route: MidnightTransportRoute<'a>,
     ) -> Pin<Box<dyn Future<Output = Result<ChainTip, WalletTransactionPortError>> + Send + 'a>>
     {
-        Box::pin(fetch_chain_tip(endpoint))
+        Box::pin(fetch_chain_tip(route))
     }
 }
 
@@ -579,7 +582,10 @@ where
             checkpoint.current_cursor,
             checkpoint.target_cursor,
             0,
-            checkpoint.state.wallet_balance(checkpoint.state.sync_time),
+            checkpoint
+                .state
+                .current()
+                .map(|state| state.wallet_balance(state.sync_time)),
             checkpoint.updated_at,
             None,
         )?;
@@ -592,10 +598,16 @@ where
         .build()
         .map_err(|_| WalletTransactionPortError::Unavailable)?;
     runtime.block_on(async {
-        let chain_tip = chain_tips.fetch(config.indexer_http_url()).await?;
+        let chain_tip = chain_tips.fetch(config.indexer_http_route()).await?;
         ensure_submission_active(cancellation)?;
-        let checkpoint =
-            latest.filter(|checkpoint| checkpoint.state.params == chain_tip.parameters.dust);
+        let route = config.indexer().websocket_route();
+        let checkpoint = latest.filter(|checkpoint| {
+            route.mixed_eras()
+                || checkpoint
+                    .state
+                    .current()
+                    .is_some_and(|state| state.params == chain_tip.parameters.dust)
+        });
         let current_time = |state_time: Timestamp| {
             if chain_tip.timestamp > state_time {
                 chain_tip.timestamp
@@ -617,11 +629,10 @@ where
                 )
                 .map_err(map_checkpoint_error)?;
             let balance = if progress.segment_complete {
-                Some(
-                    progress
-                        .state
-                        .wallet_balance(current_time(progress.state.sync_time)),
-                )
+                progress
+                    .state
+                    .current()
+                    .map(|state| state.wallet_balance(current_time(state.sync_time)))
             } else {
                 running_balance(sessions, key, cancellation)
                     .map_err(map_dust_to_transaction_error)?
@@ -641,9 +652,10 @@ where
             update_running_snapshot(sessions, key, cancellation, status)
                 .map_err(map_dust_to_transaction_error)
         };
+        let keys = DustReplayKeys::new(&secret_key, route.mixed_eras().then_some(seed));
         let synchronized = synchronize_dust_with_control(
-            config.indexer().websocket_url(),
-            &secret_key,
+            route,
+            &keys,
             chain_tip.parameters.dust,
             checkpoint,
             cancellation,
@@ -651,6 +663,9 @@ where
         )
         .await?;
         ensure_submission_active(cancellation)?;
+        if route.mixed_eras() && synchronized.state.params != chain_tip.parameters.dust {
+            return Err(WalletTransactionPortError::InvalidChainState);
+        }
         let updated_at = now(clock).map_err(map_dust_to_transaction_error)?;
         let balance = synchronized
             .state
@@ -662,7 +677,7 @@ where
             synchronized.target_cursor,
             u64::try_from(synchronized.events_processed)
                 .map_err(|_| WalletTransactionPortError::InvalidData)?,
-            balance,
+            Some(balance),
             updated_at,
             None,
         )
@@ -797,7 +812,7 @@ fn progress_snapshot(
     current_cursor: u64,
     target_cursor: u64,
     events_processed: u64,
-    balance_atomic_units: u128,
+    balance_atomic_units: Option<u128>,
     updated_at: oxid_foundation::UnixTimestampMillis,
     failure: Option<WalletDustSyncFailure>,
 ) -> Result<WalletDustSyncSnapshot, WalletTransactionPortError> {
@@ -807,7 +822,7 @@ fn progress_snapshot(
         Some(current_cursor),
         Some(target_cursor),
         events_processed,
-        Some(balance_atomic_units),
+        balance_atomic_units,
         Some(updated_at),
         failure,
     )
@@ -966,9 +981,7 @@ mod tests {
     use futures::{SinkExt as _, StreamExt as _};
     use midnight_base_crypto::{hash::HashOutput, time::Timestamp};
     use midnight_ledger::{
-        dust::{
-            DustGenerationInfo, DustLocalState, InitialNonce, QualifiedDustOutput, dust_first_nonce,
-        },
+        dust::{DustGenerationInfo, InitialNonce, QualifiedDustOutput, dust_first_nonce},
         events::{Event, EventDetails, EventSource},
         structure::{INITIAL_PARAMETERS, STARS_PER_NIGHT, TransactionHash},
     };
@@ -1075,9 +1088,12 @@ mod tests {
                 .lock()
                 .map_err(|_| DustCheckpointStoreError::Unavailable)
                 .map(|checkpoint| {
-                    checkpoint
-                        .clone()
-                        .filter(|checkpoint| checkpoint.state.params == parameters)
+                    checkpoint.clone().filter(|checkpoint| {
+                        checkpoint
+                            .state
+                            .current()
+                            .is_none_or(|state| state.params == parameters)
+                    })
                 })
         }
 
@@ -1088,7 +1104,7 @@ mod tests {
             current_cursor: u64,
             target_cursor: u64,
             updated_at: UnixTimestampMillis,
-            state: &DustLocalState<DefaultDB>,
+            state: &crate::dust_replay::DustReplayState,
         ) -> Result<(), DustCheckpointStoreError> {
             *self
                 .checkpoint
@@ -1111,7 +1127,7 @@ mod tests {
     impl MidnightDustChainTipSource for FixedChainTipSource {
         fn fetch<'a>(
             &'a self,
-            _: &'a str,
+            _: MidnightTransportRoute<'a>,
         ) -> Pin<Box<dyn Future<Output = Result<ChainTip, WalletTransactionPortError>> + Send + 'a>>
         {
             self.calls.fetch_add(1, Ordering::Relaxed);
@@ -1132,7 +1148,7 @@ mod tests {
     impl MidnightDustChainTipSource for FailingChainTipSource {
         fn fetch<'a>(
             &'a self,
-            _: &'a str,
+            _: MidnightTransportRoute<'a>,
         ) -> Pin<Box<dyn Future<Output = Result<ChainTip, WalletTransactionPortError>> + Send + 'a>>
         {
             self.calls.fetch_add(1, Ordering::Relaxed);

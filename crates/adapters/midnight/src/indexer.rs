@@ -62,6 +62,8 @@ const ACK_TIMEOUT: Duration = Duration::from_secs(15);
 // retaining the five-minute whole-snapshot deadline.
 const IDLE_TIMEOUT: Duration = Duration::from_secs(15);
 const SNAPSHOT_TIMEOUT: Duration = Duration::from_secs(5 * 60);
+use crate::preprod_transport::{MidnightPreprodCredential, MidnightTransportRoute};
+
 const MAX_ENDPOINT_CHARACTERS: usize = 2_048;
 const MAX_MESSAGE_BYTES: usize = 1024 * 1024;
 const MAX_FRAME_BYTES: usize = 256 * 1024;
@@ -76,6 +78,7 @@ pub struct MidnightIndexerConfig {
     network_id: ChainNetworkId,
     websocket_url: String,
     http_url: Option<String>,
+    pub(crate) preprod_credential: Option<std::sync::Arc<MidnightPreprodCredential>>,
 }
 
 impl MidnightIndexerConfig {
@@ -101,6 +104,7 @@ impl MidnightIndexerConfig {
             network_id,
             websocket_url,
             http_url: None,
+            preprod_credential: None,
         })
     }
 
@@ -121,6 +125,7 @@ impl MidnightIndexerConfig {
             network_id,
             websocket_url: validate_websocket_url(websocket_url.as_ref())?,
             http_url: None,
+            preprod_credential: None,
         })
     }
 
@@ -137,6 +142,13 @@ impl MidnightIndexerConfig {
     #[must_use]
     pub fn websocket_url(&self) -> &str {
         &self.websocket_url
+    }
+
+    pub(crate) fn websocket_route(&self) -> MidnightTransportRoute<'_> {
+        MidnightTransportRoute::new(self.websocket_url(), self.preprod_credential.as_deref())
+            .with_mixed_eras(crate::replay_era::has_mixed_history(
+                self.network_id.as_str(),
+            ))
     }
 
     #[cfg(test)]
@@ -320,10 +332,7 @@ pub struct LiveMidnightAccountSource<C> {
 
 impl<C> LiveMidnightAccountSource<C> {
     pub(crate) fn new(config: MidnightIndexerConfig, clock: std::sync::Arc<C>) -> Self {
-        let transport = std::sync::Arc::new(WebSocketMidnightIndexerTransport::new(
-            config.websocket_url,
-            config.http_url,
-        ));
+        let transport = std::sync::Arc::new(WebSocketMidnightIndexerTransport(config.clone()));
         Self::with_transport_and_checkpoints(
             config.network_id,
             clock,
@@ -337,10 +346,7 @@ impl<C> LiveMidnightAccountSource<C> {
         checkpoints: MidnightAccountCheckpointConfig,
         clock: std::sync::Arc<C>,
     ) -> Self {
-        let transport = std::sync::Arc::new(WebSocketMidnightIndexerTransport::new(
-            config.websocket_url,
-            config.http_url,
-        ));
+        let transport = std::sync::Arc::new(WebSocketMidnightIndexerTransport(config.clone()));
         Self::with_transport_and_checkpoints(
             config.network_id,
             clock,
@@ -760,19 +766,7 @@ trait MidnightIndexerTransport: Send + Sync {
     ) -> BoxFuture<'a, Result<IndexerSnapshot, IndexerTransportError>>;
 }
 
-struct WebSocketMidnightIndexerTransport {
-    endpoint: String,
-    chain_tip_endpoint: Option<String>,
-}
-
-impl WebSocketMidnightIndexerTransport {
-    fn new(endpoint: String, chain_tip_endpoint: Option<String>) -> Self {
-        Self {
-            endpoint,
-            chain_tip_endpoint,
-        }
-    }
-}
+struct WebSocketMidnightIndexerTransport(MidnightIndexerConfig);
 
 impl MidnightIndexerTransport for WebSocketMidnightIndexerTransport {
     fn snapshot<'a>(
@@ -780,8 +774,7 @@ impl MidnightIndexerTransport for WebSocketMidnightIndexerTransport {
         address: &'a str,
         checkpoint: Option<IndexerSnapshot>,
     ) -> BoxFuture<'a, Result<IndexerSnapshot, IndexerTransportError>> {
-        let endpoint = self.endpoint.clone();
-        let chain_tip_endpoint = self.chain_tip_endpoint.clone();
+        let config = self.0.clone();
         let address = address.to_owned();
         Box::pin(async move {
             let (sender, receiver) = oneshot::channel();
@@ -795,10 +788,18 @@ impl MidnightIndexerTransport for WebSocketMidnightIndexerTransport {
                         .map_err(|_| IndexerTransportError::Runtime)
                         .and_then(|runtime| {
                             runtime.block_on(async {
-                                let mut snapshot =
-                                    indexer_snapshot(&endpoint, &address, checkpoint).await?;
-                                if let Some(endpoint) = chain_tip_endpoint {
-                                    let tip = super::submission::fetch_chain_tip(&endpoint)
+                                let mut snapshot = indexer_snapshot(
+                                    config.websocket_route(),
+                                    &address,
+                                    checkpoint,
+                                )
+                                .await?;
+                                if let Some(endpoint) = &config.http_url {
+                                    let route = MidnightTransportRoute::new(
+                                        endpoint,
+                                        config.preprod_credential.as_deref(),
+                                    );
+                                    let tip = super::submission::fetch_chain_tip(route)
                                         .await
                                         .map_err(map_chain_tip_error)?;
                                     snapshot =
@@ -854,7 +855,7 @@ impl IndexerTransportError {
 }
 
 async fn indexer_snapshot(
-    endpoint: &str,
+    route: MidnightTransportRoute<'_>,
     address: &str,
     checkpoint: Option<IndexerSnapshot>,
 ) -> Result<IndexerSnapshot, IndexerTransportError> {
@@ -865,47 +866,7 @@ async fn indexer_snapshot(
             .and_then(|cursor| i64::try_from(cursor).ok())
             .ok_or(IndexerTransportError::InvalidData)
     })?;
-    ensure_tls_provider()?;
-    let mut request = endpoint
-        .into_client_request()
-        .map_err(|_| IndexerTransportError::Connect)?;
-    request.headers_mut().insert(
-        "Sec-WebSocket-Protocol",
-        "graphql-transport-ws"
-            .parse()
-            .map_err(|_| IndexerTransportError::Protocol)?,
-    );
-    let mut config = WebSocketConfig::default();
-    config.max_message_size = Some(MAX_MESSAGE_BYTES);
-    config.max_frame_size = Some(MAX_FRAME_BYTES);
-    let endpoint_url = Url::parse(endpoint).map_err(|_| IndexerTransportError::Connect)?;
-    let connector =
-        websocket_connector_for(&endpoint_url).map_err(|_| IndexerTransportError::Connect)?;
-    let (mut socket, response) = timeout(
-        CONNECT_TIMEOUT,
-        tokio_tungstenite::connect_async_tls_with_config(request, Some(config), false, connector),
-    )
-    .await
-    .map_err(|_| IndexerTransportError::Timeout)?
-    .map_err(|_| IndexerTransportError::Connect)?;
-    if response
-        .headers()
-        .get("Sec-WebSocket-Protocol")
-        .and_then(|value| value.to_str().ok())
-        != Some("graphql-transport-ws")
-    {
-        return Err(IndexerTransportError::Protocol);
-    }
-
-    socket
-        .send(Message::Text(
-            json!({ "type": "connection_init", "payload": {} })
-                .to_string()
-                .into(),
-        ))
-        .await
-        .map_err(|_| IndexerTransportError::Protocol)?;
-    wait_for_ack(&mut socket).await?;
+    let mut socket = connect_graphql_indexer(route).await?;
 
     socket
         .send(Message::Text(
@@ -987,6 +948,58 @@ async fn indexer_snapshot(
         .await;
     let _ = socket.close(None).await;
     accumulator.finish()
+}
+
+type GraphqlIndexerSocket =
+    tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
+
+async fn connect_graphql_indexer(
+    route: MidnightTransportRoute<'_>,
+) -> Result<GraphqlIndexerSocket, IndexerTransportError> {
+    ensure_tls_provider()?;
+    let request = route
+        .graphql_request()
+        .map_err(|_| IndexerTransportError::Connect)?;
+    let mut config = WebSocketConfig::default();
+    config.max_message_size = Some(MAX_MESSAGE_BYTES);
+    config.max_frame_size = Some(MAX_FRAME_BYTES);
+    let endpoint_url = Url::parse(route.endpoint()).map_err(|_| IndexerTransportError::Connect)?;
+    let connector =
+        websocket_connector_for(&endpoint_url).map_err(|_| IndexerTransportError::Connect)?;
+    let (mut socket, response) = timeout(
+        CONNECT_TIMEOUT,
+        tokio_tungstenite::connect_async_tls_with_config(request, Some(config), false, connector),
+    )
+    .await
+    .map_err(|_| IndexerTransportError::Timeout)?
+    .map_err(|_| IndexerTransportError::Connect)?;
+    if response
+        .headers()
+        .get("Sec-WebSocket-Protocol")
+        .and_then(|value| value.to_str().ok())
+        != Some("graphql-transport-ws")
+    {
+        return Err(IndexerTransportError::Protocol);
+    }
+
+    socket
+        .send(Message::Text(
+            json!({ "type": "connection_init", "payload": {} })
+                .to_string()
+                .into(),
+        ))
+        .await
+        .map_err(|_| IndexerTransportError::Protocol)?;
+    wait_for_ack(&mut socket).await?;
+    Ok(socket)
+}
+
+pub(crate) async fn verify_graphql_transport(
+    route: MidnightTransportRoute<'_>,
+) -> Result<(), IndexerTransportError> {
+    let mut socket = connect_graphql_indexer(route).await?;
+    let _ = timeout(CONNECT_TIMEOUT, socket.close(None)).await;
+    Ok(())
 }
 
 fn ensure_tls_provider() -> Result<(), IndexerTransportError> {

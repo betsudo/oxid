@@ -70,6 +70,7 @@ pub const PORTAL_INTEGRATION_TREE: &str = "2d845d2293603dfd8adce5362c8a9941e6ba7
 pub const PORTAL_PROFILE_SOURCE_COMMIT: &str = "76e8edf394a4cb37ca822037272d543c68f25f71";
 pub const PORTAL_PROVENANCE_SHA256: &str =
     "63d2dd182f1a315d8fe7677ae6481aecebd2fd9cff709cc438b6c0261a3cf4c7";
+const ISSUER_METADATA_PATH: &str = "/.well-known/openid-credential-issuer";
 const PORTAL_CONFIGURATION_ID: &str = "digital_passport_v1";
 const PORTAL_FORMAT: &str = "midnight_cbor_phase1";
 const PORTAL_FAMILY: &str = "digital-passport";
@@ -184,7 +185,21 @@ pub struct PortalDeploymentManifest {
     provenance_sha256: String,
     schema: String,
     #[serde(skip)]
-    tailnet_origin: Option<String>,
+    routes: PortalManifestRoutes,
+}
+
+// Only the canonical wire fields are signed. Admission policy is supplied by
+// the caller that authenticated the containing deployment profile.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+enum PortalManifestRoutes {
+    #[default]
+    Local,
+    Tailnet(String),
+    Public {
+        network: MidnightNetwork,
+        issuer_metadata_url: String,
+        resolver_url: String,
+    },
 }
 
 impl PortalDeploymentManifest {
@@ -231,7 +246,7 @@ impl PortalDeploymentManifest {
         bytes: &[u8],
         expected_sha256: &str,
     ) -> Result<Self, PortalDeploymentManifestError> {
-        Self::parse(bytes, expected_sha256, None)
+        Self::parse(bytes, expected_sha256, PortalManifestRoutes::Local)
     }
 
     /// The caller supplies the origin bound to the authenticated app build.
@@ -240,13 +255,40 @@ impl PortalDeploymentManifest {
         expected_sha256: &str,
         public_origin: &str,
     ) -> Result<Self, PortalDeploymentManifestError> {
-        Self::parse(bytes, expected_sha256, Some(public_origin))
+        Self::parse(
+            bytes,
+            expected_sha256,
+            PortalManifestRoutes::Tailnet(public_origin.to_owned()),
+        )
+    }
+
+    /// Admits Ledger 9 Portal bytes against the digest, network, and exact
+    /// HTTPS routes from an already-authenticated deployment profile.
+    pub fn from_public_bytes(
+        bytes: &[u8],
+        expected_sha256: &str,
+        network: MidnightNetwork,
+        issuer_metadata_url: &str,
+        resolver_url: &str,
+    ) -> Result<Self, PortalDeploymentManifestError> {
+        if !matches!(network, MidnightNetwork::Preview | MidnightNetwork::Preprod) {
+            return Err(PortalDeploymentManifestError::InvalidIssuer);
+        }
+        Self::parse(
+            bytes,
+            expected_sha256,
+            PortalManifestRoutes::Public {
+                network,
+                issuer_metadata_url: issuer_metadata_url.to_owned(),
+                resolver_url: resolver_url.to_owned(),
+            },
+        )
     }
 
     fn parse(
         bytes: &[u8],
         expected_sha256: &str,
-        tailnet_origin: Option<&str>,
+        routes: PortalManifestRoutes,
     ) -> Result<Self, PortalDeploymentManifestError> {
         validate_sha256(expected_sha256)?;
         if bytes.is_empty() || bytes.len() > MAX_DEPLOYMENT_MANIFEST_BYTES {
@@ -266,7 +308,7 @@ impl PortalDeploymentManifest {
         if canonical != bytes {
             return Err(PortalDeploymentManifestError::InvalidManifest);
         }
-        manifest.tailnet_origin = tailnet_origin.map(str::to_owned);
+        manifest.routes = routes;
         manifest.validate()?;
         Ok(manifest)
     }
@@ -275,23 +317,40 @@ impl PortalDeploymentManifest {
         if self.schema != "oxid-portal-deployment-v3" {
             return Err(PortalDeploymentManifestError::SourceLockMismatch);
         }
-        let source = if BUNDLED_SOURCE.matches(self) {
+        let source = if BUNDLED_SOURCE.matches(self)
+            && !matches!(self.routes, PortalManifestRoutes::Public { .. })
+        {
             &BUNDLED_SOURCE
         } else if LEDGER9_SOURCE.matches(self) {
-            let routes_match = match self.tailnet_origin.as_deref() {
-                None => {
+            let routes_match = match &self.routes {
+                PortalManifestRoutes::Local => {
                     self.issuer_origin == "http://127.0.0.1:8090"
                         && self.issuer_resolver_origin == "http://127.0.0.1:9092"
                 }
-                Some(origin) => {
+                PortalManifestRoutes::Tailnet(origin) => {
                     let url = validate_transport_base(origin)?;
                     url.scheme() == "https"
                         && url.host_str().is_some_and(|host| host.ends_with(".ts.net"))
                         && url
                             .port()
                             .is_some_and(|port| port >= 1024 && !matches!(port, 8443 | 10_000))
-                        && self.issuer_origin == origin
+                        && self.issuer_origin == *origin
                         && self.issuer_resolver_origin == format!("{origin}/issuer-resolver")
+                }
+                PortalManifestRoutes::Public {
+                    network,
+                    issuer_metadata_url,
+                    resolver_url,
+                } => {
+                    let issuer = MidnightDid::parse(self.issuer_did.as_str())
+                        .map_err(|_| PortalDeploymentManifestError::InvalidIssuer)?;
+                    if issuer.network() != *network {
+                        return Err(PortalDeploymentManifestError::InvalidIssuer);
+                    }
+                    validate_public_https_route(&self.issuer_origin)?;
+                    validate_public_https_route(&self.issuer_resolver_origin)?;
+                    *issuer_metadata_url == format!("{}{ISSUER_METADATA_PATH}", self.issuer_origin)
+                        && *resolver_url == self.issuer_resolver_origin
                 }
             };
             if !routes_match {
@@ -344,8 +403,13 @@ impl PortalDeploymentManifest {
     }
 
     #[must_use]
+    pub fn is_public_network(&self) -> bool {
+        matches!(self.routes, PortalManifestRoutes::Public { .. })
+    }
+
+    #[must_use]
     pub fn is_ledger9_tailnet(&self) -> bool {
-        self.tailnet_origin.is_some() && self.uses_ledger9_jubjub_jwk()
+        matches!(self.routes, PortalManifestRoutes::Tailnet(_)) && self.uses_ledger9_jubjub_jwk()
     }
 
     #[must_use]
@@ -475,6 +539,21 @@ fn validate_transport_base(value: &str) -> Result<Url, PortalDeploymentManifestE
         return Err(PortalDeploymentManifestError::InvalidOrigin);
     }
     Ok(url)
+}
+
+fn validate_public_https_route(value: &str) -> Result<(), PortalDeploymentManifestError> {
+    let url = validate_transport_base(value)?;
+    let public_host = matches!(
+        url.host(),
+        Some(url::Host::Domain(host)) if {
+            let host = host.trim_end_matches('.');
+            host != "localhost" && !host.ends_with(".localhost")
+        }
+    );
+    if url.scheme() != "https" || !public_host {
+        return Err(PortalDeploymentManifestError::InvalidOrigin);
+    }
+    Ok(())
 }
 
 fn validate_issuer_did(value: &str) -> Result<(), PortalDeploymentManifestError> {
@@ -716,7 +795,7 @@ impl PortalOid4vciClient {
         request: PrepareIssuanceRequest,
     ) -> Result<PreparedCredentialOffer, IssuanceProtocolError> {
         let offer = parse_portal_offer(&request.offer, self.deployment.issuer_origin())?;
-        let issuer_url = self.endpoint("/.well-known/openid-credential-issuer")?;
+        let issuer_url = self.endpoint(ISSUER_METADATA_PATH)?;
         let issuer_bytes = get_json(&self.client, issuer_url, MAX_METADATA_BYTES).await?;
         let issuer_metadata =
             parse_issuer_metadata(&issuer_bytes, EndpointPolicy::StandaloneLoopback)?;

@@ -7,7 +7,7 @@ use std::sync::{Arc, Mutex};
     any(
         all(not(target_os = "ios"), not(target_os = "android")),
         all(
-            feature = "mobile-portal",
+            any(feature = "mobile-portal", feature = "public-portal"),
             any(target_os = "ios", target_os = "android")
         )
     )
@@ -731,6 +731,7 @@ where
         security,
         midnight,
         IdentityAdapters {
+            backup_recovery_journal: None,
             did_repository: headless_did_repository(),
             did_resolver,
             did_lifecycle: did_lifecycle_port,
@@ -842,6 +843,7 @@ where
     let get_diagnostic_snapshot: Arc<dyn GetDiagnosticSnapshotUseCase> = diagnostics.clone();
     let clear_diagnostics: Arc<dyn ClearDiagnosticsUseCase> = diagnostics;
     let IdentityAdapters {
+        backup_recovery_journal,
         did_repository,
         did_resolver,
         did_lifecycle,
@@ -915,7 +917,29 @@ where
     };
     #[cfg(not(all(feature = "mobile-portal-tailnet", target_os = "android")))]
     let ledger9_tailnet_issuance = false;
+    #[cfg(all(
+        not(target_arch = "wasm32"),
+        any(
+            not(any(target_os = "ios", target_os = "android")),
+            feature = "mobile-portal",
+            feature = "public-portal"
+        )
+    ))]
+    let public_portal_issuance = matches!(
+        &credential_issuance,
+        CredentialIssuanceComposition::Portal(factory) if factory.deployment().is_public_network()
+    );
+    #[cfg(not(all(
+        not(target_arch = "wasm32"),
+        any(
+            not(any(target_os = "ios", target_os = "android")),
+            feature = "mobile-portal",
+            feature = "public-portal"
+        )
+    )))]
+    let public_portal_issuance = false;
     let standalone_passport_vault = !ledger9_tailnet_issuance
+        && !public_portal_issuance
         && !matches!(
             &credential_issuance,
             CredentialIssuanceComposition::Unavailable
@@ -950,7 +974,7 @@ where
         credential_repository.clone(),
         complete_associations,
         complete_random,
-        complete_wallet_recovery_journal(),
+        backup_recovery_journal.unwrap_or_else(complete_wallet_recovery_journal),
     ));
     let complete_backup = Arc::new(CompleteWalletBackupService::new(complete_backup_adapter));
     let create_wallet_profile = Arc::new(CreateWalletProfileService::new(
@@ -1126,7 +1150,7 @@ where
             any(
                 all(not(target_os = "ios"), not(target_os = "android")),
                 all(
-                    feature = "mobile-portal",
+                    any(feature = "mobile-portal", feature = "public-portal"),
                     any(target_os = "ios", target_os = "android")
                 )
             )
@@ -1392,17 +1416,31 @@ where
     > = dust_registrations.clone();
     let dust_registration_recovery = repository.wallet_dust_registration_recovery_store();
     let wallet_dust_settlement = Arc::new(
-        WalletDustSettlementCapability::with_automatic_development_authority_and_recovery_store(
-            Arc::clone(&get_selected_wallet_realm_sync),
-            Arc::clone(&raw_sync_selected_wallet_realm),
-            Arc::clone(&get_wallet_dust_sync_status),
-            Arc::clone(&prepare_wallet_dust_registration),
-            authorize_development_wallet_dust_registration,
-            submit_development_wallet_dust_registration,
-            Arc::clone(&get_wallet_dust_registration_status),
-            Arc::clone(&reconcile_wallet_dust_registration_submission),
-            dust_registration_recovery,
-        )
+        if public_portal_issuance {
+            WalletDustSettlementCapability::with_recovery_store(
+                Arc::clone(&get_selected_wallet_realm_sync),
+                Arc::clone(&raw_sync_selected_wallet_realm),
+                Arc::clone(&get_wallet_dust_sync_status),
+                Arc::clone(&prepare_wallet_dust_registration),
+                Arc::clone(&authorize_wallet_dust_registration),
+                Arc::clone(&submit_wallet_dust_registration),
+                Arc::clone(&get_wallet_dust_registration_status),
+                Arc::clone(&reconcile_wallet_dust_registration_submission),
+                dust_registration_recovery,
+            )
+        } else {
+            WalletDustSettlementCapability::with_automatic_development_authority_and_recovery_store(
+                Arc::clone(&get_selected_wallet_realm_sync),
+                Arc::clone(&raw_sync_selected_wallet_realm),
+                Arc::clone(&get_wallet_dust_sync_status),
+                Arc::clone(&prepare_wallet_dust_registration),
+                authorize_development_wallet_dust_registration,
+                submit_development_wallet_dust_registration,
+                Arc::clone(&get_wallet_dust_registration_status),
+                Arc::clone(&reconcile_wallet_dust_registration_submission),
+                dust_registration_recovery,
+            )
+        }
         .expect("DUST settlement capability construction is infallible"),
     );
     let automatic_dust_reconciler = Arc::new(AutomaticDustRealmReconciler::new(

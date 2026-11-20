@@ -8,24 +8,26 @@ use std::{
 };
 
 use futures::{SinkExt as _, StreamExt as _};
-use midnight_ledger::events::Event;
 use midnight_storage::DefaultDB;
-use midnight_zswap::{keys::SecretKeys, local::State as ZswapState};
+use midnight_zswap::local::State as ZswapState;
 use oxid_adapter_platform_system::websocket_connector_for;
 use serde_json::{Value, json};
 use sha2::{Digest as _, Sha256};
 use tokio::time::timeout;
-use tokio_tungstenite::tungstenite::{
-    Message, client::IntoClientRequest as _, protocol::WebSocketConfig,
-};
+use tokio_tungstenite::tungstenite::{Message, protocol::WebSocketConfig};
 use url::Url;
 
 use crate::{
+    replay_era::{LedgerEra, ReplayWindow},
     shielded::{
-        DecodedZswapEvent, ZSWAP_LEDGER_EVENTS_QUERY, decode_zswap_event, replay_zswap_events,
+        DecodedZswapEvent, MIXED_ZSWAP_LEDGER_EVENTS_QUERY, ZSWAP_LEDGER_EVENTS_QUERY,
+        decode_zswap_event,
     },
     shielded_checkpoint::StoredShieldedCheckpoint,
+    shielded_replay::{ShieldedReplayKeys, ShieldedReplayState, replay_shielded_batch},
 };
+
+use crate::preprod_transport::MidnightTransportRoute;
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
 const ACK_TIMEOUT: Duration = Duration::from_secs(15);
@@ -46,7 +48,7 @@ const PROTOCOL_IDENTITY: &[u8] = b"graphql-transport-ws\0oxid-shielded-v2\0";
 
 #[derive(Clone)]
 pub(crate) struct ShieldedSyncProgress {
-    pub(crate) state: ZswapState<DefaultDB>,
+    pub(crate) state: ShieldedReplayState,
     pub(crate) current_cursor: u64,
     pub(crate) target_cursor: u64,
     pub(crate) events_processed: usize,
@@ -71,33 +73,61 @@ pub(crate) enum ShieldedTransportError {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ShieldedReceiveOutcome {
     Saturated,
+    BudgetExhausted,
     TargetReached,
     IdleCheckpoint,
     EmptyCheckpoint,
 }
 
-pub(crate) fn source_fingerprint(endpoint: &str) -> [u8; 32] {
+pub(crate) fn source_fingerprint(endpoint: &str, mixed_eras: bool) -> [u8; 32] {
     let mut digest = Sha256::new();
     digest.update(PROTOCOL_IDENTITY);
     digest.update(endpoint.as_bytes());
     digest.update([0]);
-    digest.update(ZSWAP_LEDGER_EVENTS_QUERY.as_bytes());
+    digest.update(shielded_query(mixed_eras).as_bytes());
     digest.finalize().into()
 }
 
+fn shielded_query(mixed_eras: bool) -> &'static str {
+    if mixed_eras {
+        MIXED_ZSWAP_LEDGER_EVENTS_QUERY
+    } else {
+        ZSWAP_LEDGER_EVENTS_QUERY
+    }
+}
+
 pub(crate) async fn synchronize_shielded_with_control(
-    endpoint: &str,
-    keys: &SecretKeys,
+    route: MidnightTransportRoute<'_>,
+    keys: &ShieldedReplayKeys<'_>,
     checkpoint: Option<StoredShieldedCheckpoint>,
     cancellation: &AtomicBool,
     observe: &mut dyn FnMut(&ShieldedSyncProgress) -> Result<(), ShieldedTransportError>,
 ) -> Result<ShieldedSynchronization, ShieldedTransportError> {
+    synchronize_shielded_with_limits(
+        route,
+        keys,
+        checkpoint,
+        cancellation,
+        observe,
+        (MAX_EVENTS, MAX_TOTAL_BYTES),
+    )
+    .await
+}
+
+async fn synchronize_shielded_with_limits(
+    route: MidnightTransportRoute<'_>,
+    keys: &ShieldedReplayKeys<'_>,
+    checkpoint: Option<StoredShieldedCheckpoint>,
+    cancellation: &AtomicBool,
+    observe: &mut dyn FnMut(&ShieldedSyncProgress) -> Result<(), ShieldedTransportError>,
+    limits: (usize, usize),
+) -> Result<ShieldedSynchronization, ShieldedTransportError> {
     ensure_active(cancellation)?;
     let (mut state, starting_cursor, starting_target) = checkpoint.map_or_else(
-        || (ZswapState::new(), None, None),
+        || (None, None, None),
         |checkpoint| {
             (
-                checkpoint.state,
+                Some(checkpoint.state),
                 Some(checkpoint.current_cursor),
                 Some(checkpoint.target_cursor),
             )
@@ -107,33 +137,31 @@ pub(crate) async fn synchronize_shielded_with_control(
     let synchronization = timeout(SYNCHRONIZATION_TIMEOUT, async {
         let mut durable_cursor = starting_cursor;
         let mut target_cursor = starting_target;
-        let mut total_bytes = 0_usize;
-        let mut event_count = 0_usize;
+        let mut window = ReplayWindow::new(limits, route.mixed_eras(), starting_cursor);
         let mut replayed_events = 0_usize;
         loop {
             ensure_active(cancellation)?;
-            let starting_id = match durable_cursor {
-                Some(cursor) => cursor
+            // Public streams include the requested event. Reconfirm a
+            // checkpoint that looked complete using that event's live watermark.
+            let mut anchor = durable_cursor
+                .filter(|cursor| route.mixed_eras() && Some(*cursor) == target_cursor);
+            let starting_id = match (anchor, durable_cursor) {
+                (Some(cursor), _) => cursor,
+                (None, Some(cursor)) => cursor
                     .checked_add(1)
                     .ok_or(ShieldedTransportError::InvalidData)?,
-                None => 0,
+                (None, None) => 0,
             };
             let starting_id =
                 i64::try_from(starting_id).map_err(|_| ShieldedTransportError::InvalidData)?;
-            let mut request = endpoint
-                .into_client_request()
+            let request = route
+                .graphql_request()
                 .map_err(|_| ShieldedTransportError::Unavailable)?;
-            request.headers_mut().insert(
-                "Sec-WebSocket-Protocol",
-                "graphql-transport-ws"
-                    .parse()
-                    .map_err(|_| ShieldedTransportError::InvalidData)?,
-            );
             let mut websocket_config = WebSocketConfig::default();
             websocket_config.max_message_size = Some(MAX_MESSAGE_BYTES);
             websocket_config.max_frame_size = Some(MAX_FRAME_BYTES);
             let endpoint_url =
-                Url::parse(endpoint).map_err(|_| ShieldedTransportError::Unavailable)?;
+                Url::parse(route.endpoint()).map_err(|_| ShieldedTransportError::Unavailable)?;
             let connector = websocket_connector_for(&endpoint_url)
                 .map_err(|_| ShieldedTransportError::Unavailable)?;
             let connected = timeout(
@@ -172,7 +200,7 @@ pub(crate) async fn synchronize_shielded_with_control(
                     "type": "subscribe",
                     "id": SUBSCRIPTION_ID,
                     "payload": {
-                        "query": ZSWAP_LEDGER_EVENTS_QUERY,
+                        "query": shielded_query(route.mixed_eras()),
                         "variables": { "id": starting_id }
                     }
                 }),
@@ -226,8 +254,26 @@ pub(crate) async fn synchronize_shielded_with_control(
                                 let data = payload
                                     .get("data")
                                     .ok_or(ShieldedTransportError::InvalidData)?;
-                                let decoded = decode_zswap_event(data)
+                                let decoded = decode_zswap_event(data, route.mixed_eras())
                                     .map_err(|_| ShieldedTransportError::InvalidData)?;
+                                if let Some(saved) = anchor.take() {
+                                    let matches_era = state.as_ref().is_some_and(|state| {
+                                        state.current().is_some()
+                                            == (decoded.event.era() == LedgerEra::V9)
+                                    });
+                                    if decoded.cursor != saved
+                                        || decoded.target_cursor < saved
+                                        || !matches_era
+                                    {
+                                        return Err(ShieldedTransportError::InvalidData);
+                                    }
+                                    target_cursor = Some(decoded.target_cursor);
+                                    if decoded.target_cursor == saved {
+                                        break ShieldedReceiveOutcome::TargetReached;
+                                    }
+                                    // The anchor was already applied. Replay only the new events.
+                                    continue;
+                                }
                                 let sequence_valid = match received_cursor {
                                     // Zswap IDs are sparse global indexer cursors:
                                     // unrelated ledger activity can create gaps.
@@ -251,14 +297,8 @@ pub(crate) async fn synchronize_shielded_with_control(
                                 {
                                     break ShieldedReceiveOutcome::Saturated;
                                 }
-                                event_count = event_count
-                                    .checked_add(1)
-                                    .ok_or(ShieldedTransportError::InvalidData)?;
-                                total_bytes = total_bytes
-                                    .checked_add(decoded.raw_bytes)
-                                    .ok_or(ShieldedTransportError::InvalidData)?;
-                                if event_count > MAX_EVENTS || total_bytes > MAX_TOTAL_BYTES {
-                                    return Err(ShieldedTransportError::InvalidData);
+                                if !window.accept(decoded.raw_bytes) {
+                                    break ShieldedReceiveOutcome::BudgetExhausted;
                                 }
                                 segment_bytes = next_segment_bytes;
                                 received_cursor = Some(decoded.cursor);
@@ -313,6 +353,15 @@ pub(crate) async fn synchronize_shielded_with_control(
             drop(socket);
 
             if segment.is_empty() {
+                if outcome == ShieldedReceiveOutcome::BudgetExhausted {
+                    if window.renew(durable_cursor) {
+                        continue;
+                    }
+                    return Err(ShieldedTransportError::Timeout);
+                }
+                if route.mixed_eras() && outcome != ShieldedReceiveOutcome::TargetReached {
+                    return Err(ShieldedTransportError::Timeout);
+                }
                 let current_cursor = durable_cursor.ok_or(ShieldedTransportError::InvalidData)?;
                 let target_cursor = target_cursor.ok_or(ShieldedTransportError::InvalidData)?;
                 if current_cursor != target_cursor {
@@ -322,6 +371,7 @@ pub(crate) async fn synchronize_shielded_with_control(
                         ShieldedTransportError::InvalidData
                     });
                 }
+                let state = state.ok_or(ShieldedTransportError::InvalidData)?;
                 observe(&ShieldedSyncProgress {
                     state: state.clone(),
                     current_cursor,
@@ -330,7 +380,9 @@ pub(crate) async fn synchronize_shielded_with_control(
                 })?;
                 ensure_active(cancellation)?;
                 return Ok(ShieldedSynchronization {
-                    state,
+                    state: state
+                        .into_current()
+                        .ok_or(ShieldedTransportError::Timeout)?,
                     current_cursor,
                     target_cursor,
                     events_processed: replayed_events,
@@ -339,64 +391,45 @@ pub(crate) async fn synchronize_shielded_with_control(
 
             let target = target_cursor.ok_or(ShieldedTransportError::InvalidData)?;
             let segment_cursor = received_cursor.ok_or(ShieldedTransportError::InvalidData)?;
-            let mut batch = Vec::<Event<DefaultDB>>::with_capacity(MAX_REPLAY_BATCH_EVENTS);
-            let mut batch_bytes = 0_usize;
-            let mut batch_last_cursor = None;
-            for decoded in segment {
-                let next_batch_bytes = batch_bytes
-                    .checked_add(decoded.raw_bytes)
-                    .ok_or(ShieldedTransportError::InvalidData)?;
-                if !batch.is_empty() && next_batch_bytes > MAX_REPLAY_BATCH_BYTES {
-                    let batch_cursor =
-                        batch_last_cursor.ok_or(ShieldedTransportError::InvalidData)?;
-                    flush_batch(
-                        keys,
-                        cancellation,
-                        &mut state,
-                        &mut batch,
-                        batch_cursor,
-                        target,
-                        &mut replayed_events,
-                        observe,
-                    )?;
-                    durable_cursor = Some(batch_cursor);
-                    batch_bytes = 0;
+            let mut events = segment.into_iter().peekable();
+            let mut batch = Vec::with_capacity(MAX_REPLAY_BATCH_EVENTS);
+            while let Some(first) = events.next() {
+                let era = first.event.era();
+                let mut batch_bytes = first.raw_bytes;
+                let mut current_cursor = first.cursor;
+                batch.push(first.event);
+                while batch.len() < MAX_REPLAY_BATCH_EVENTS
+                    && events.peek().is_some_and(|next| {
+                        next.event.era() == era
+                            && batch_bytes + next.raw_bytes <= MAX_REPLAY_BATCH_BYTES
+                    })
+                {
+                    let next = events.next().ok_or(ShieldedTransportError::InvalidData)?;
+                    batch_bytes += next.raw_bytes;
+                    current_cursor = next.cursor;
+                    batch.push(next.event);
                 }
-                batch_bytes = batch_bytes
-                    .checked_add(decoded.raw_bytes)
+                ensure_active(cancellation)?;
+                let replayed = replay_shielded_batch(state.take(), keys, &batch)
+                    .map_err(|_| ShieldedTransportError::InvalidData)?;
+                replayed_events = replayed_events
+                    .checked_add(batch.len())
                     .ok_or(ShieldedTransportError::InvalidData)?;
-                batch_last_cursor = Some(decoded.cursor);
-                batch.push(decoded.event);
-                if batch.len() == MAX_REPLAY_BATCH_EVENTS {
-                    let batch_cursor =
-                        batch_last_cursor.ok_or(ShieldedTransportError::InvalidData)?;
-                    flush_batch(
-                        keys,
-                        cancellation,
-                        &mut state,
-                        &mut batch,
-                        batch_cursor,
-                        target,
-                        &mut replayed_events,
-                        observe,
-                    )?;
-                    durable_cursor = Some(batch_cursor);
-                    batch_bytes = 0;
-                }
+                observe(&ShieldedSyncProgress {
+                    state: replayed.clone(),
+                    current_cursor,
+                    target_cursor: target,
+                    events_processed: replayed_events,
+                })?;
+                state = Some(replayed);
+                durable_cursor = Some(current_cursor);
+                batch.clear();
             }
-            if !batch.is_empty() {
-                let batch_cursor = batch_last_cursor.ok_or(ShieldedTransportError::InvalidData)?;
-                flush_batch(
-                    keys,
-                    cancellation,
-                    &mut state,
-                    &mut batch,
-                    batch_cursor,
-                    target,
-                    &mut replayed_events,
-                    observe,
-                )?;
-                durable_cursor = Some(batch_cursor);
+            if outcome == ShieldedReceiveOutcome::BudgetExhausted {
+                if window.renew(durable_cursor) {
+                    continue;
+                }
+                return Err(ShieldedTransportError::Timeout);
             }
             if durable_cursor != Some(segment_cursor) {
                 return Err(ShieldedTransportError::InvalidData);
@@ -407,7 +440,9 @@ pub(crate) async fn synchronize_shielded_with_control(
                     return Err(ShieldedTransportError::InvalidData);
                 }
                 return Ok(ShieldedSynchronization {
-                    state,
+                    state: state
+                        .and_then(ShieldedReplayState::into_current)
+                        .ok_or(ShieldedTransportError::Timeout)?,
                     current_cursor: segment_cursor,
                     target_cursor: target,
                     events_processed: replayed_events,
@@ -418,32 +453,6 @@ pub(crate) async fn synchronize_shielded_with_control(
     .await
     .map_err(|_| ShieldedTransportError::Timeout)??;
     Ok(synchronization)
-}
-
-#[allow(clippy::too_many_arguments)]
-fn flush_batch(
-    keys: &SecretKeys,
-    cancellation: &AtomicBool,
-    state: &mut ZswapState<DefaultDB>,
-    batch: &mut Vec<Event<DefaultDB>>,
-    current_cursor: u64,
-    target_cursor: u64,
-    replayed_events: &mut usize,
-    observe: &mut dyn FnMut(&ShieldedSyncProgress) -> Result<(), ShieldedTransportError>,
-) -> Result<(), ShieldedTransportError> {
-    ensure_active(cancellation)?;
-    *state = replay_zswap_events(keys, state.clone(), batch.iter())
-        .map_err(|_| ShieldedTransportError::InvalidData)?;
-    *replayed_events = replayed_events
-        .checked_add(batch.len())
-        .ok_or(ShieldedTransportError::InvalidData)?;
-    batch.clear();
-    observe(&ShieldedSyncProgress {
-        state: state.clone(),
-        current_cursor,
-        target_cursor,
-        events_processed: *replayed_events,
-    })
 }
 
 fn ensure_active(cancellation: &AtomicBool) -> Result<(), ShieldedTransportError> {
@@ -538,10 +547,10 @@ mod tests {
         transfer::Recipient,
     };
     use midnight_ledger::{
-        events::{EventDetails, EventSource, ZswapPreimageEvidence},
+        events::{Event, EventDetails, EventSource, ZswapPreimageEvidence},
         structure::TransactionHash,
     };
-    use midnight_zswap::keys::Seed;
+    use midnight_zswap::keys::{SecretKeys, Seed};
     use rand::{Rng as _, SeedableRng as _, rngs::StdRng};
     use tokio_tungstenite::{
         accept_hdr_async,
@@ -599,6 +608,25 @@ mod tests {
     // Tungstenite fixes the handshake callback's error to a large HTTP response.
     #[allow(clippy::result_large_err)]
     fn server(expected_start: i64, events: Vec<Value>) -> (String, thread::JoinHandle<()>) {
+        server_for_eras(expected_start, events, false)
+    }
+
+    #[allow(clippy::result_large_err)]
+    fn server_for_eras(
+        expected_start: i64,
+        events: Vec<Value>,
+        mixed_eras: bool,
+    ) -> (String, thread::JoinHandle<()>) {
+        server_for_eras_with_completion(expected_start, events, mixed_eras, true)
+    }
+
+    #[allow(clippy::result_large_err)]
+    fn server_for_eras_with_completion(
+        expected_start: i64,
+        events: Vec<Value>,
+        mixed_eras: bool,
+        send_completion: bool,
+    ) -> (String, thread::JoinHandle<()>) {
         let listener = TcpListener::bind("127.0.0.1:0").expect("loopback binds");
         listener
             .set_nonblocking(true)
@@ -654,7 +682,7 @@ mod tests {
                 let subscribe: Value =
                     serde_json::from_str(subscribe.into_text().expect("text").as_str())
                         .expect("subscribe JSON");
-                assert_eq!(subscribe["payload"]["query"], ZSWAP_LEDGER_EVENTS_QUERY);
+                assert_eq!(subscribe["payload"]["query"], shielded_query(mixed_eras));
                 assert_eq!(subscribe["payload"]["variables"]["id"], expected_start);
                 for event in events {
                     socket
@@ -662,14 +690,16 @@ mod tests {
                         .await
                         .expect("event sends");
                 }
-                socket
-                    .send(Message::Text(
-                        json!({ "type": "complete", "id": SUBSCRIPTION_ID })
-                            .to_string()
-                            .into(),
-                    ))
-                    .await
-                    .expect("completion sends");
+                if send_completion {
+                    socket
+                        .send(Message::Text(
+                            json!({ "type": "complete", "id": SUBSCRIPTION_ID })
+                                .to_string()
+                                .into(),
+                        ))
+                        .await
+                        .expect("completion sends");
+                }
                 let _ = socket.next().await;
             });
         });
@@ -758,6 +788,54 @@ mod tests {
     }
 
     #[test]
+    fn public_shielded_reopens_from_the_checkpoint_after_a_full_window() {
+        let keys = SecretKeys::from(Seed::from([7; 32]));
+        let message = |value, index, cursor| {
+            let mut message = event_value(&output(&keys, value, index), cursor, 8);
+            message["payload"]["data"]["zswapLedgerEvents"]["protocolVersion"] = json!(2_001_100);
+            message
+        };
+        let closed = Arc::new((Mutex::new(false), Condvar::new()));
+        let (endpoint, worker) = segmented_server(
+            vec![
+                (
+                    0,
+                    vec![message(1, 0, 1), message(2, 1, 2), message(3, 2, 8)],
+                ),
+                (3, vec![message(3, 2, 8)]),
+            ],
+            Arc::clone(&closed),
+        );
+        let route = MidnightTransportRoute::new(&endpoint, None).with_mixed_eras(true);
+        let replay_keys = ShieldedReplayKeys::new(&keys, None);
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let mut observed = Vec::new();
+        let synchronized = runtime
+            .block_on(synchronize_shielded_with_limits(
+                route,
+                &replay_keys,
+                None,
+                &AtomicBool::new(false),
+                &mut |progress| {
+                    observed.push((progress.current_cursor, progress.events_processed));
+                    Ok(())
+                },
+                (2, MAX_TOTAL_BYTES),
+            ))
+            .unwrap();
+        worker.join().unwrap();
+
+        assert_eq!(observed, [(2, 2), (8, 3)]);
+        assert_eq!(synchronized.current_cursor, synchronized.target_cursor);
+        let projection = project_zswap_state(&synchronized.state).unwrap();
+        assert_eq!(projection.owned_note_count, 3);
+        assert_eq!(projection.balances[0].atomic_units, 6);
+    }
+
+    #[test]
     fn bounded_transport_accepts_sparse_cursors_and_observes_consistent_batches() {
         let keys = SecretKeys::from(Seed::from([7; 32]));
         let (endpoint, server) = server(
@@ -775,8 +853,8 @@ mod tests {
             .expect("runtime builds");
         let synchronized = runtime
             .block_on(synchronize_shielded_with_control(
-                &endpoint,
-                &keys,
+                MidnightTransportRoute::new(&endpoint, None),
+                &ShieldedReplayKeys::new(&keys, None),
                 None,
                 &cancellation,
                 &mut |progress| {
@@ -834,8 +912,8 @@ mod tests {
         let mut observed = Vec::new();
         let synchronized = runtime
             .block_on(synchronize_shielded_with_control(
-                &endpoint,
-                &keys,
+                MidnightTransportRoute::new(&endpoint, None),
+                &ShieldedReplayKeys::new(&keys, None),
                 None,
                 &cancellation,
                 &mut |progress| {
@@ -915,8 +993,8 @@ mod tests {
             .expect("runtime builds");
         let mut observations = 0_usize;
         let result = runtime.block_on(synchronize_shielded_with_control(
-            &endpoint,
-            &keys,
+            MidnightTransportRoute::new(&endpoint, None),
+            &ShieldedReplayKeys::new(&keys, None),
             None,
             &cancellation,
             &mut |_| {
@@ -937,7 +1015,7 @@ mod tests {
             current_cursor: 0,
             target_cursor: 0,
             updated_at: oxid_foundation::UnixTimestampMillis::new(12),
-            state: ZswapState::new(),
+            state: ShieldedReplayState::Current(ZswapState::new()),
         };
         let (endpoint, server) = server(1, vec![event_value(&output(&keys, 1, 0), 1, 1)]);
         let cancellation = AtomicBool::new(false);
@@ -947,8 +1025,8 @@ mod tests {
             .expect("runtime builds");
         let mut observations = 0_usize;
         let result = runtime.block_on(synchronize_shielded_with_control(
-            &endpoint,
-            &keys,
+            MidnightTransportRoute::new(&endpoint, None),
+            &ShieldedReplayKeys::new(&keys, None),
             Some(checkpoint),
             &cancellation,
             &mut |_| {
@@ -990,8 +1068,8 @@ mod tests {
             assert_eq!(
                 runtime
                     .block_on(synchronize_shielded_with_control(
-                        &endpoint,
-                        &keys,
+                        MidnightTransportRoute::new(&endpoint, None),
+                        &ShieldedReplayKeys::new(&keys, None),
                         None,
                         &cancellation,
                         &mut |_| Ok(()),
@@ -1020,8 +1098,8 @@ mod tests {
         );
         let first = runtime
             .block_on(synchronize_shielded_with_control(
-                &first_endpoint,
-                &keys,
+                MidnightTransportRoute::new(&first_endpoint, None),
+                &ShieldedReplayKeys::new(&keys, None),
                 None,
                 &cancellation,
                 &mut |_| Ok(()),
@@ -1033,14 +1111,14 @@ mod tests {
             current_cursor: first.current_cursor,
             target_cursor: first.target_cursor,
             updated_at: oxid_foundation::UnixTimestampMillis::new(12),
-            state: first.state,
+            state: ShieldedReplayState::Current(first.state),
         };
         let (resume_endpoint, resume_server) = server(2, Vec::new());
         let mut observations = 0;
         let resumed = runtime
             .block_on(synchronize_shielded_with_control(
-                &resume_endpoint,
-                &keys,
+                MidnightTransportRoute::new(&resume_endpoint, None),
+                &ShieldedReplayKeys::new(&keys, None),
                 Some(checkpoint),
                 &cancellation,
                 &mut |_| {
@@ -1060,15 +1138,221 @@ mod tests {
         assert_eq!(projection.balances[0].atomic_units, 12);
     }
 
+    #[cfg(feature = "mixed-era-replay")]
+    #[test]
+    fn shielded_replay_carries_owned_notes_across_the_upgrade_after_restart() {
+        use crate::MidnightShieldedCheckpointConfig;
+        use crate::shielded_checkpoint::{
+            BinaryMidnightShieldedCheckpointStore, MidnightShieldedCheckpointStore,
+        };
+        use midnight_legacy_coin_structure::coin::{Info, Nonce, ShieldedTokenType};
+        use midnight_legacy_coin_structure::transfer::Recipient;
+        use midnight_legacy_ledger::events::{
+            Event as OldEvent, EventDetails as OldDetails, EventSource as OldSource,
+            ZswapPreimageEvidence as OldEvidence,
+        };
+        use midnight_legacy_zswap::keys::{SecretKeys as OldKeys, Seed as OldSeed};
+        use oxid_foundation::UnixTimestampMillis;
+        use oxid_wallet_domain::ChainNetworkId;
+
+        let seed = [0x27; 32];
+        let legacy_keys = OldKeys::from(OldSeed::from(seed));
+        let keys = SecretKeys::from(Seed::from(seed));
+        let replay_keys = ShieldedReplayKeys::new(&keys, Some(&seed));
+        let coin = Info {
+            nonce: Nonce(Default::default()),
+            type_: ShieldedTokenType::default(),
+            value: 37,
+        };
+        let legacy = OldEvent::<midnight_legacy_storage::DefaultDB> {
+            source: OldSource {
+                transaction_hash: Default::default(),
+                logical_segment: 0,
+                physical_segment: 0,
+            },
+            content: OldDetails::ZswapOutput {
+                commitment: coin.commitment(&Recipient::User(legacy_keys.coin_public_key())),
+                preimage_evidence: OldEvidence::PublicPreimage {
+                    coin,
+                    recipient: Recipient::User(legacy_keys.coin_public_key()),
+                },
+                contract: None,
+                mt_index: 0,
+            },
+        };
+        let mut bytes = Vec::new();
+        midnight_legacy_serialize::tagged_serialize(&legacy, &mut bytes).unwrap();
+        let old_message = json!({
+            "type": "next", "id": SUBSCRIPTION_ID, "payload": {"data": {"zswapLedgerEvents": {
+                "__typename": "ZswapLedgerEvent", "id": 2, "maxId": 10,
+                "protocolVersion": 1_000_000, "raw": hex::encode(bytes)
+            }}}
+        });
+        let mut current_message = event_value(&output(&keys, 89, 1), 10, 10);
+        current_message["payload"]["data"]["zswapLedgerEvents"]["protocolVersion"] =
+            json!(2_001_100);
+        let network = ChainNetworkId::parse("preview").unwrap();
+        let directory = crate::legacy_replay_tests::private_checkpoint_directory();
+        let config =
+            MidnightShieldedCheckpointConfig::new(directory.path().join("shielded.bin")).unwrap();
+        let source = source_fingerprint("wss://fixture.example", true);
+        let cancel = AtomicBool::new(false);
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let (endpoint, server) =
+            server_for_eras(0, vec![old_message.clone(), current_message.clone()], true);
+        let uninterrupted = runtime
+            .block_on(synchronize_shielded_with_control(
+                MidnightTransportRoute::new(&endpoint, None).with_mixed_eras(true),
+                &replay_keys,
+                None,
+                &cancel,
+                &mut |_| Ok(()),
+            ))
+            .unwrap();
+        server.join().unwrap();
+        assert_eq!(uninterrupted.events_processed, 2);
+
+        let (endpoint, server) =
+            server_for_eras(0, vec![old_message.clone(), current_message.clone()], true);
+        let interrupted = runtime.block_on(synchronize_shielded_with_control(
+            MidnightTransportRoute::new(&endpoint, None).with_mixed_eras(true),
+            &replay_keys,
+            None,
+            &cancel,
+            &mut |progress| {
+                assert!(progress.state.current().is_none());
+                assert_eq!(progress.current_cursor, 2);
+                BinaryMidnightShieldedCheckpointStore::new(config.clone())
+                    .save(
+                        &network,
+                        &keys,
+                        &source,
+                        &StoredShieldedCheckpoint {
+                            current_cursor: progress.current_cursor,
+                            target_cursor: progress.target_cursor,
+                            updated_at: UnixTimestampMillis::new(1),
+                            state: progress.state.clone(),
+                        },
+                    )
+                    .unwrap();
+                cancel.store(true, Ordering::Release);
+                Ok(())
+            },
+        ));
+        assert_eq!(interrupted.err(), Some(ShieldedTransportError::Cancelled));
+        server.join().unwrap();
+
+        let store = BinaryMidnightShieldedCheckpointStore::new(config);
+        let checkpoint = store.load(&network, &keys, &source).unwrap().unwrap();
+        assert!(checkpoint.state.current().is_none());
+        cancel.store(false, Ordering::Release);
+        let (endpoint, server) = server_for_eras(3, vec![current_message.clone()], true);
+        let actual = runtime
+            .block_on(synchronize_shielded_with_control(
+                MidnightTransportRoute::new(&endpoint, None).with_mixed_eras(true),
+                &replay_keys,
+                Some(checkpoint),
+                &cancel,
+                &mut |progress| {
+                    store
+                        .save(
+                            &network,
+                            &keys,
+                            &source,
+                            &StoredShieldedCheckpoint {
+                                current_cursor: progress.current_cursor,
+                                target_cursor: progress.target_cursor,
+                                updated_at: UnixTimestampMillis::new(2),
+                                state: progress.state.clone(),
+                            },
+                        )
+                        .unwrap();
+                    Ok(())
+                },
+            ))
+            .unwrap();
+        server.join().unwrap();
+        let projection = project_zswap_state(&actual.state).unwrap();
+        assert_eq!((actual.current_cursor, actual.target_cursor), (10, 10));
+        assert_eq!(actual.events_processed, 1);
+        assert_eq!(projection.owned_note_count, 2);
+        assert_eq!(projection.commitment_count, 2);
+        assert_eq!(projection.balances[0].atomic_units, 126);
+
+        let current_checkpoint = store.load(&network, &keys, &source).unwrap().unwrap();
+        let (endpoint, server) = server_for_eras_with_completion(10, Vec::new(), true, false);
+        assert_eq!(
+            runtime
+                .block_on(synchronize_shielded_with_control(
+                    MidnightTransportRoute::new(&endpoint, None).with_mixed_eras(true),
+                    &replay_keys,
+                    Some(current_checkpoint),
+                    &cancel,
+                    &mut |_| panic!("a public checkpoint needs a live watermark"),
+                ))
+                .err(),
+            Some(ShieldedTransportError::Timeout)
+        );
+        server.join().unwrap();
+        let current_checkpoint = store.load(&network, &keys, &source).unwrap().unwrap();
+        let (endpoint, server) = server_for_eras(10, vec![current_message], true);
+        let resumed = runtime
+            .block_on(synchronize_shielded_with_control(
+                MidnightTransportRoute::new(&endpoint, None).with_mixed_eras(true),
+                &replay_keys,
+                Some(current_checkpoint),
+                &cancel,
+                &mut |_| Ok(()),
+            ))
+            .unwrap();
+        server.join().unwrap();
+        assert_eq!(resumed.events_processed, 0);
+        assert_eq!(
+            (resumed.current_cursor, resumed.target_cursor),
+            (uninterrupted.current_cursor, uninterrupted.target_cursor)
+        );
+        let mut uninterrupted_bytes = Vec::new();
+        let mut resumed_bytes = Vec::new();
+        midnight_serialize::tagged_serialize(&uninterrupted.state, &mut uninterrupted_bytes)
+            .unwrap();
+        midnight_serialize::tagged_serialize(&resumed.state, &mut resumed_bytes).unwrap();
+        assert!(
+            resumed_bytes == uninterrupted_bytes,
+            "shielded checkpoint changed native state"
+        );
+
+        let current_checkpoint = store.load(&network, &keys, &source).unwrap().unwrap();
+        let mut regression = old_message;
+        regression["payload"]["data"]["zswapLedgerEvents"]["id"] = json!(10);
+        regression["payload"]["data"]["zswapLedgerEvents"]["maxId"] = json!(10);
+        let (endpoint, server) = server_for_eras(10, vec![regression], true);
+        assert_eq!(
+            runtime
+                .block_on(synchronize_shielded_with_control(
+                    MidnightTransportRoute::new(&endpoint, None).with_mixed_eras(true),
+                    &replay_keys,
+                    Some(current_checkpoint),
+                    &cancel,
+                    &mut |_| panic!("a backward era must not be persisted"),
+                ))
+                .err(),
+            Some(ShieldedTransportError::InvalidData)
+        );
+        server.join().unwrap();
+    }
+
     #[test]
     fn fingerprint_binds_endpoint_query_and_protocol_and_cancellation_is_preflight() {
         assert_eq!(
-            source_fingerprint("ws://127.0.0.1:1"),
-            source_fingerprint("ws://127.0.0.1:1")
+            source_fingerprint("ws://127.0.0.1:1", false),
+            source_fingerprint("ws://127.0.0.1:1", false)
         );
         assert_ne!(
-            source_fingerprint("ws://127.0.0.1:1"),
-            source_fingerprint("ws://127.0.0.1:2")
+            source_fingerprint("ws://127.0.0.1:1", false),
+            source_fingerprint("ws://127.0.0.1:2", false)
         );
         let mut legacy = Sha256::new();
         legacy.update(b"graphql-transport-ws\0oxid-shielded-v1\0");
@@ -1076,7 +1360,7 @@ mod tests {
         legacy.update([0]);
         legacy.update(ZSWAP_LEDGER_EVENTS_QUERY.as_bytes());
         assert_ne!(
-            source_fingerprint("ws://127.0.0.1:1"),
+            source_fingerprint("ws://127.0.0.1:1", false),
             <[u8; 32]>::from(legacy.finalize()),
             "v1 checkpoints must replay under the corrected envelope and cursor contract"
         );
@@ -1089,8 +1373,8 @@ mod tests {
         assert_eq!(
             runtime
                 .block_on(synchronize_shielded_with_control(
-                    "ws://127.0.0.1:1",
-                    &keys,
+                    MidnightTransportRoute::new("ws://127.0.0.1:1", None),
+                    &ShieldedReplayKeys::new(&keys, None),
                     None,
                     &cancellation,
                     &mut |_| Ok(()),

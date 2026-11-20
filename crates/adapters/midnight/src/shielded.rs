@@ -13,11 +13,23 @@ use midnight_storage::DefaultDB;
 use midnight_zswap::{keys::SecretKeys, local::State as ZswapState};
 use serde_json::Value;
 
+use crate::replay_era::{ReplayEvent, replay_era};
+
 pub(crate) const ZSWAP_LEDGER_EVENTS_QUERY: &str = r#"subscription ZswapLedgerEvents($id: Int) {
   zswapLedgerEvents(id: $id) {
     __typename
     id
     maxId
+    raw
+  }
+}"#;
+
+pub(crate) const MIXED_ZSWAP_LEDGER_EVENTS_QUERY: &str = r#"subscription ZswapLedgerEvents($id: Int) {
+  zswapLedgerEvents(id: $id) {
+    __typename
+    id
+    maxId
+    protocolVersion
     raw
   }
 }"#;
@@ -30,7 +42,7 @@ pub(crate) struct DecodedZswapEvent {
     pub(crate) cursor: u64,
     pub(crate) target_cursor: u64,
     pub(crate) raw_bytes: usize,
-    pub(crate) event: Event<DefaultDB>,
+    pub(crate) event: ReplayEvent,
 }
 
 /// Safe, chain-neutral balance projection over adapter-private Zswap state.
@@ -60,7 +72,10 @@ pub(crate) enum ShieldedReplayError {
 }
 
 /// Decodes one `next.payload.data.zswapLedgerEvents` value.
-pub(crate) fn decode_zswap_event(data: &Value) -> Result<DecodedZswapEvent, ShieldedReplayError> {
+pub(crate) fn decode_zswap_event(
+    data: &Value,
+    mixed_eras: bool,
+) -> Result<DecodedZswapEvent, ShieldedReplayError> {
     let object = data
         .get("zswapLedgerEvents")
         .and_then(Value::as_object)
@@ -86,12 +101,24 @@ pub(crate) fn decode_zswap_event(data: &Value) -> Result<DecodedZswapEvent, Shie
         return Err(ShieldedReplayError::EventTooLarge);
     }
     let bytes = hex::decode(raw).map_err(|_| ShieldedReplayError::InvalidEvent)?;
-    let event: Event<DefaultDB> = midnight_serialize::tagged_deserialize(&bytes[..])
-        .map_err(|_| ShieldedReplayError::InvalidEvent)?;
-    if !matches!(
-        &event.content,
-        EventDetails::ZswapInput { .. } | EventDetails::ZswapOutput { .. }
-    ) {
+    let era = replay_era(&data["zswapLedgerEvents"], mixed_eras)
+        .ok_or(ShieldedReplayError::InvalidEnvelope)?;
+    let event = ReplayEvent::decode(era, &bytes).ok_or(ShieldedReplayError::InvalidEvent)?;
+    let is_zswap = match &event {
+        ReplayEvent::Current(event) => matches!(
+            event.content,
+            EventDetails::ZswapInput { .. } | EventDetails::ZswapOutput { .. }
+        ),
+        #[cfg(feature = "mixed-era-replay")]
+        ReplayEvent::Legacy(event) => {
+            use midnight_legacy_ledger::events::EventDetails;
+            matches!(
+                event.content,
+                EventDetails::ZswapInput { .. } | EventDetails::ZswapOutput { .. }
+            )
+        }
+    };
+    if !is_zswap {
         return Err(ShieldedReplayError::InvalidEvent);
     }
     Ok(DecodedZswapEvent {
@@ -250,44 +277,56 @@ mod tests {
         let mut bytes = Vec::new();
         midnight_serialize::tagged_serialize(&event, &mut bytes)
             .expect("official event serializes");
-        let decoded = decode_zswap_event(&json!({
-            "zswapLedgerEvents": {
-                "__typename": "ZswapLedgerEvent",
-                "id": 4,
-                "maxId": 9,
-                "raw": format!("0x{}", hex::encode(&bytes))
-            }
-        }))
-        .expect("official event decodes");
-        assert_eq!((decoded.cursor, decoded.target_cursor), (4, 9));
-        assert_eq!(decoded.raw_bytes, bytes.len());
-        assert!(matches!(
-            decoded.event.content,
-            EventDetails::ZswapOutput { .. }
-        ));
-
-        assert_eq!(
-            decode_zswap_event(&json!({
+        let decoded = decode_zswap_event(
+            &json!({
                 "zswapLedgerEvents": {
-                    "__typename": "ZswapOutput",
+                    "__typename": "ZswapLedgerEvent",
                     "id": 4,
                     "maxId": 9,
                     "raw": format!("0x{}", hex::encode(&bytes))
                 }
-            }))
+            }),
+            false,
+        )
+        .expect("official event decodes");
+        assert_eq!((decoded.cursor, decoded.target_cursor), (4, 9));
+        assert_eq!(decoded.raw_bytes, bytes.len());
+        assert!(matches!(
+            decoded.event,
+            ReplayEvent::Current(Event {
+                content: EventDetails::ZswapOutput { .. },
+                ..
+            })
+        ));
+
+        assert_eq!(
+            decode_zswap_event(
+                &json!({
+                    "zswapLedgerEvents": {
+                        "__typename": "ZswapOutput",
+                        "id": 4,
+                        "maxId": 9,
+                        "raw": format!("0x{}", hex::encode(&bytes))
+                    }
+                }),
+                false
+            )
             .err(),
             Some(ShieldedReplayError::InvalidEnvelope)
         );
 
         assert_eq!(
-            decode_zswap_event(&json!({
-                "zswapLedgerEvents": {
-                    "__typename": "ZswapLedgerEvent",
-                    "id": 4,
-                    "maxId": 3,
-                    "raw": "00"
-                }
-            }))
+            decode_zswap_event(
+                &json!({
+                    "zswapLedgerEvents": {
+                        "__typename": "ZswapLedgerEvent",
+                        "id": 4,
+                        "maxId": 3,
+                        "raw": "00"
+                    }
+                }),
+                false
+            )
             .err(),
             Some(ShieldedReplayError::InvalidEnvelope)
         );

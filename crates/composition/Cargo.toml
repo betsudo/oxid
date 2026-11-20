@@ -44,6 +44,14 @@ mobile-portal = [
   "oxid-adapter-openid4vci/portal-http-mobile",
   "oxid-adapter-identity-ingress/loopback-test-offer-trigger",
 ]
+# Authenticated live Portal on public Midnight networks. The native path
+# explicitly supplies its signed deployment and uses the real QR/link adapters.
+public-portal = [
+  "mobile-did-compact-artifacts",
+  "oxid-adapter-midnight/mixed-era-replay",
+  "oxid-adapter-openid4vci/portal-http-mobile",
+]
+preprod-portal = ["public-portal", "dep:oxid-adapter-mobile-native"]
 mobile-portal-tailnet = [
   "mobile-portal",
   "oxid-adapter-did-midnight/tailnet-test-did-publication",

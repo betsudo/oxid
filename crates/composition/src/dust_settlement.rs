@@ -371,6 +371,7 @@ pub struct WalletDustSettlementCapability {
     projections: watch::Sender<WalletDustRegistrationSettlementProjection>,
     retry_attempts: Mutex<(Option<WalletDustRegistrationSettlementIdentity>, u8)>,
     authority: DustSettlementAuthority,
+    authorization_gate: tokio::sync::Mutex<()>,
 }
 
 /// Public, presentation-safe facts for the one DUST authorization decision.
@@ -383,6 +384,49 @@ pub struct WalletDustAuthorizationReview {
     pub registered_night: oxid_wallet_application::WalletDustRegistrationAssetView,
     pub input_count: u16,
     pub maximum_fee_allowance: oxid_wallet_application::WalletDustRegistrationAssetView,
+    binding: WalletDustReviewBinding,
+}
+
+#[derive(Clone, PartialEq, Eq)]
+struct WalletDustReviewBinding {
+    identity: WalletDustRegistrationSettlementIdentity,
+    preview: WalletDustRegistrationPreviewView,
+}
+
+impl std::fmt::Debug for WalletDustReviewBinding {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("<protected review>")
+    }
+}
+
+impl WalletDustAuthorizationReview {
+    pub fn confirmation(&self, confirmed: bool) -> SensitiveOperationConfirmation {
+        let preview = &self.binding.preview;
+        SensitiveOperationConfirmation {
+            title: "Authorize DUST registration".to_owned(),
+            summary: format!(
+                "Register {} across {} inputs on {}. Maximum fee: {}.",
+                display_review_asset(&preview.registered_night),
+                preview.input_count,
+                preview.network_id,
+                display_review_asset(&preview.maximum_fee_allowance),
+            ),
+            confirmed,
+        }
+    }
+}
+
+fn display_review_asset(
+    asset: &oxid_wallet_application::WalletDustRegistrationAssetView,
+) -> String {
+    let decimals = usize::from(asset.decimals);
+    let digits = format!("{:0>width$}", asset.atomic_units, width = decimals + 1);
+    let (whole, fractional) = digits.split_at(digits.len() - decimals);
+    let fractional = fractional.trim_end_matches('0');
+    if fractional.is_empty() {
+        return format!("{whole} {}", asset.symbol);
+    }
+    format!("{whole}.{fractional} {}", asset.symbol)
 }
 
 impl WalletDustSettlementCapability {
@@ -593,6 +637,7 @@ impl WalletDustSettlementCapability {
             projections,
             retry_attempts: Mutex::new((initial.identity, 0)),
             authority,
+            authorization_gate: tokio::sync::Mutex::new(()),
         })
     }
 
@@ -667,18 +712,35 @@ impl WalletDustSettlementCapability {
         &self,
         confirmation: SensitiveOperationConfirmation,
     ) -> Result<WalletDustRegistrationSettlementProjection, WalletDustSettlementError> {
-        if self
-            .driver
-            .projection()
-            .map_err(WalletDustSettlementError::Driver)?
-            .state
+        self.authorize_confirmation(confirmation, None).await
+    }
+
+    /// Submits a decision bound to the same preview and wallet the adapter displayed.
+    pub async fn authorize_review(
+        &self,
+        review: WalletDustAuthorizationReview,
+        confirmed: bool,
+    ) -> Result<WalletDustRegistrationSettlementProjection, WalletDustSettlementError> {
+        self.authorize_confirmation(review.confirmation(confirmed), Some(review.binding))
+            .await
+    }
+
+    async fn authorize_confirmation(
+        &self,
+        confirmation: SensitiveOperationConfirmation,
+        binding: Option<WalletDustReviewBinding>,
+    ) -> Result<WalletDustRegistrationSettlementProjection, WalletDustSettlementError> {
+        let _authorization = self.authorization_gate.try_lock().map_err(|_| {
+            WalletDustSettlementError::Driver(WalletDustRegistrationDriverError::Busy)
+        })?;
+        if self.projection()?.state
             != oxid_wallet_application::WalletDustRegistrationSettlementState::AwaitingAuthorization
         {
             return Err(WalletDustSettlementError::Driver(
                 WalletDustRegistrationDriverError::AuthorizationNotPending,
             ));
         }
-        self.executor.stage_confirmation(confirmation)?;
+        self.executor.stage_confirmation(confirmation, binding)?;
         let result = self
             .driver
             .authorize()
@@ -762,14 +824,35 @@ impl WalletDustSettlementCapability {
     pub fn authorization_review(
         &self,
     ) -> Result<WalletDustAuthorizationReview, WalletDustSettlementError> {
-        if self.projection()?.state
-            != oxid_wallet_application::WalletDustRegistrationSettlementState::AwaitingAuthorization
+        let projection = self.projection()?;
+        if self.authority != DustSettlementAuthority::Explicit
+            || projection.state
+                != oxid_wallet_application::WalletDustRegistrationSettlementState::AwaitingAuthorization
         {
             return Err(WalletDustSettlementError::Driver(
                 WalletDustRegistrationDriverError::AuthorizationNotPending,
             ));
         }
-        self.executor.authorization_review()
+        let identity = projection
+            .identity
+            .ok_or(WalletDustSettlementError::StaleReview)?;
+        let registration = projection
+            .registration
+            .ok_or(WalletDustSettlementError::StaleReview)?;
+        self.executor
+            .authorization_review(identity, &registration.draft_id)
+    }
+
+    /// Returns a review only if the selected wallet generation is still current.
+    pub fn authorization_review_for(
+        &self,
+        identity: &WalletDustRegistrationSettlementIdentity,
+    ) -> Result<WalletDustAuthorizationReview, WalletDustSettlementError> {
+        let review = self.authorization_review()?;
+        if &review.binding.identity != identity {
+            return Err(WalletDustSettlementError::StaleReview);
+        }
+        Ok(review)
     }
 
     pub fn projection(
@@ -970,6 +1053,7 @@ pub enum WalletDustSettlementError {
     StaleRealm,
     RetainedStateUnavailable,
     RetryNotAdmitted,
+    StaleReview,
     Driver(WalletDustRegistrationDriverError),
 }
 
@@ -980,6 +1064,7 @@ impl std::fmt::Display for WalletDustSettlementError {
             Self::StaleRealm => "selected wallet realm changed during DUST registration",
             Self::RetainedStateUnavailable => "retained DUST registration state is unavailable",
             Self::RetryNotAdmitted => "DUST registration retry is not currently admitted",
+            Self::StaleReview => "This DUST registration changed. Review the current details.",
             Self::Driver(error) => return error.fmt(formatter),
         })
     }
@@ -991,7 +1076,10 @@ impl std::error::Error for WalletDustSettlementError {}
 struct RetainedSettlement {
     bound: Option<SelectedWalletRealmProjection>,
     preview: Option<WalletDustRegistrationPreviewView>,
-    confirmation: Option<SensitiveOperationConfirmation>,
+    confirmation: Option<(
+        SensitiveOperationConfirmation,
+        Option<WalletDustReviewBinding>,
+    )>,
     finality_observed: bool,
     submission_uncertain: bool,
     operation_revision: u64,
@@ -1001,6 +1089,15 @@ struct RetainedSettlement {
 enum RecoveredSubmission {
     Observed(ChainTransactionId),
     PreBroadcastCancelled,
+}
+
+fn matches_review_identity(
+    bound: &SelectedWalletRealmProjection,
+    identity: &WalletDustRegistrationSettlementIdentity,
+) -> bool {
+    bound.identity.profile == identity.profile
+        && bound.identity.realm == identity.realm
+        && bound.generation == identity.generation
 }
 
 struct ComposedDustRegistrationExecutor {
@@ -1055,11 +1152,22 @@ impl ComposedDustRegistrationExecutor {
     fn stage_confirmation(
         &self,
         confirmation: SensitiveOperationConfirmation,
+        binding: Option<WalletDustReviewBinding>,
     ) -> Result<(), WalletDustSettlementError> {
-        self.retained
+        let mut retained = self
+            .retained
             .lock()
-            .map_err(|_| WalletDustSettlementError::RetainedStateUnavailable)?
-            .confirmation = Some(confirmation);
+            .map_err(|_| WalletDustSettlementError::RetainedStateUnavailable)?;
+        if let Some(binding) = &binding
+            && (!retained
+                .bound
+                .as_ref()
+                .is_some_and(|bound| matches_review_identity(bound, &binding.identity))
+                || retained.preview.as_ref() != Some(&binding.preview))
+        {
+            return Err(WalletDustSettlementError::StaleReview);
+        }
+        retained.confirmation = Some((confirmation, binding));
         Ok(())
     }
 
@@ -1071,19 +1179,33 @@ impl ComposedDustRegistrationExecutor {
 
     fn authorization_review(
         &self,
+        identity: WalletDustRegistrationSettlementIdentity,
+        draft_id: &WalletTransactionDraftId,
     ) -> Result<WalletDustAuthorizationReview, WalletDustSettlementError> {
-        let preview = self
+        let retained = self
             .retained
             .lock()
-            .map_err(|_| WalletDustSettlementError::RetainedStateUnavailable)?
+            .map_err(|_| WalletDustSettlementError::RetainedStateUnavailable)?;
+        if !retained
+            .bound
+            .as_ref()
+            .is_some_and(|bound| matches_review_identity(bound, &identity))
+        {
+            return Err(WalletDustSettlementError::StaleReview);
+        }
+        let preview = retained
             .preview
             .clone()
             .ok_or(WalletDustSettlementError::RetainedStateUnavailable)?;
+        if preview.draft_id != draft_id.as_str() {
+            return Err(WalletDustSettlementError::StaleReview);
+        }
         Ok(WalletDustAuthorizationReview {
-            network_id: preview.network_id,
-            registered_night: preview.registered_night,
+            network_id: preview.network_id.clone(),
+            registered_night: preview.registered_night.clone(),
             input_count: preview.input_count,
-            maximum_fee_allowance: preview.maximum_fee_allowance,
+            maximum_fee_allowance: preview.maximum_fee_allowance.clone(),
+            binding: WalletDustReviewBinding { identity, preview },
         })
     }
 
@@ -1233,8 +1355,13 @@ impl ComposedDustRegistrationExecutor {
         }
         let authorized = match &self.authorize {
             DustRegistrationAuthorization::Explicit(authorize) => {
-                let confirmation =
+                let (confirmation, binding) =
                     confirmation.ok_or(WalletDustRegistrationExecutorFailure::Unavailable)?;
+                if binding.is_some_and(|binding| {
+                    binding.identity != identity || binding.preview != preview
+                }) {
+                    return Err(WalletDustRegistrationExecutorFailure::Degraded);
+                }
                 if !confirmation.confirmed {
                     return Ok(
                         WalletDustRegistrationOperationCompletion::authorization_rejected(

@@ -1,9 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
-//! Native development composition bridge for the authenticated Portal profile.
-//! Desktop/headless uses an absolute manifest file; explicit mobile profiles use
-//! build-embedded bytes. Production, native-custody, and WebAssembly composition
-//! cannot select this module.
+//! Native Portal services shared by controlled development profiles and
+//! authenticated public deployments.
 
 use std::sync::Arc;
 
@@ -15,7 +13,10 @@ use oxid_adapter_did_midnight::PortalTailnetDidPublisher;
 use oxid_adapter_did_midnight::{
     HttpDidResolver, HttpDidResolverConfig, HttpDidResolverConfigError,
 };
-#[cfg(any(target_os = "ios", target_os = "android"))]
+#[cfg(all(
+    feature = "mobile-portal",
+    any(target_os = "ios", target_os = "android")
+))]
 use oxid_adapter_identity_ingress::NativeIdentityLinkIngress;
 use oxid_adapter_openid4vci::{
     PortalCredentialMaterialDecoder, PortalCredentialMaterialError, PortalDeploymentManifest,
@@ -28,13 +29,37 @@ use oxid_adapter_vc_midnight::{
 use oxid_identity_application::{DidPublicationPort, DidResolutionPort};
 use oxid_platform_ports::IdentityLinkIngressPort;
 
-#[cfg(any(test, target_os = "ios", target_os = "android"))]
+#[cfg(any(
+    test,
+    all(
+        feature = "mobile-portal",
+        any(target_os = "ios", target_os = "android")
+    )
+))]
 const MOBILE_PORTAL_ISSUER_ORIGIN: &str = "http://127.0.0.1:18090";
-#[cfg(any(test, target_os = "ios", target_os = "android"))]
+#[cfg(any(
+    test,
+    all(
+        feature = "mobile-portal",
+        any(target_os = "ios", target_os = "android")
+    )
+))]
 const MOBILE_PORTAL_ISSUER_RESOLVER_ORIGIN: &str = "http://127.0.0.1:18093";
-#[cfg(any(test, target_os = "ios", target_os = "android"))]
+#[cfg(any(
+    test,
+    all(
+        feature = "mobile-portal",
+        any(target_os = "ios", target_os = "android")
+    )
+))]
 const SHARED_LEDGER9_PORTAL_ISSUER_ORIGIN: &str = "http://127.0.0.1:8090";
-#[cfg(any(test, target_os = "ios", target_os = "android"))]
+#[cfg(any(
+    test,
+    all(
+        feature = "mobile-portal",
+        any(target_os = "ios", target_os = "android")
+    )
+))]
 const SHARED_LEDGER9_PORTAL_ISSUER_RESOLVER_ORIGIN: &str = "http://127.0.0.1:9092";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -42,9 +67,15 @@ pub(crate) enum PortalIdentityConfigurationError {
     Manifest(PortalDeploymentManifestError),
     Resolver(HttpDidResolverConfigError),
     TrustAnchor(DigitalPassportIssuerTrustAnchorError),
-    #[cfg(any(test, target_os = "ios", target_os = "android"))]
+    #[cfg(any(
+        test,
+        all(
+            feature = "mobile-portal",
+            any(target_os = "ios", target_os = "android")
+        )
+    ))]
     MobileHarnessOriginMismatch,
-    #[cfg(any(target_os = "ios", target_os = "android"))]
+    #[cfg(all(feature = "mobile-portal-tailnet", target_os = "android"))]
     InvalidOfferIngress,
     #[cfg(all(feature = "mobile-portal-tailnet", target_os = "android"))]
     InvalidDidPublisher,
@@ -58,10 +89,16 @@ impl std::fmt::Display for PortalIdentityConfigurationError {
             Self::Manifest(error) => error.fmt(formatter),
             Self::Resolver(error) => error.fmt(formatter),
             Self::TrustAnchor(error) => error.fmt(formatter),
-            #[cfg(any(test, target_os = "ios", target_os = "android"))]
+            #[cfg(any(
+                test,
+                all(
+                    feature = "mobile-portal",
+                    any(target_os = "ios", target_os = "android")
+                )
+            ))]
             Self::MobileHarnessOriginMismatch => formatter
                 .write_str("Portal mobile harness routes do not match the authenticated profile"),
-            #[cfg(any(target_os = "ios", target_os = "android"))]
+            #[cfg(all(feature = "mobile-portal-tailnet", target_os = "android"))]
             Self::InvalidOfferIngress => {
                 formatter.write_str("Portal mobile offer ingress is invalid")
             }
@@ -144,7 +181,7 @@ impl PortalIdentityConfiguration {
         )
     }
 
-    fn new(
+    pub(super) fn new(
         deployment: PortalDeploymentManifest,
         test_ingress: Option<Arc<dyn IdentityLinkIngressPort>>,
         did_publisher: Option<Arc<dyn DidPublicationPort>>,
@@ -178,7 +215,13 @@ impl PortalIdentityConfiguration {
     }
 }
 
-#[cfg(any(test, target_os = "ios", target_os = "android"))]
+#[cfg(any(
+    test,
+    all(
+        feature = "mobile-portal",
+        any(target_os = "ios", target_os = "android")
+    )
+))]
 fn validate_mobile_harness_origins(
     deployment: &PortalDeploymentManifest,
 ) -> Result<(), PortalIdentityConfigurationError> {

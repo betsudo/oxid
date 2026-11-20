@@ -7,7 +7,8 @@ mod transport;
 
 #[cfg(not(target_arch = "wasm32"))]
 pub use transport::{
-    TransportTrustError, TransportTrustPolicy, connect_json_rpc_websocket, http_client_builder_for,
+    NativeRequestAuthentication, TransportTrustError, TransportTrustPolicy,
+    connect_json_rpc_websocket, connect_json_rpc_websocket_with_headers, http_client_builder_for,
     websocket_connector_for,
 };
 

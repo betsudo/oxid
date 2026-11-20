@@ -1,0 +1,7 @@
+{
+  "verifyingKeyHex": "d0f279c68de18fac807030eb1a63abe6fc11afc85e515012b4eca462e8acee1f",
+  "keyId": "preprod-offline-signer",
+  "validFromSeconds": 1700000000,
+  "validUntilSeconds": 2000000000,
+  "minimumProfileSequence": 3
+}

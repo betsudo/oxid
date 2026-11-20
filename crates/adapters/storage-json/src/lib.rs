@@ -182,6 +182,17 @@ impl JsonWalletProfileRepository {
         }
     }
 
+    /// Uses the app's platform-owned data location without an environment
+    /// override. Production compositions can scope sibling stores from here.
+    #[must_use]
+    pub fn at_platform_location() -> Self {
+        Self {
+            path: default_store_path(),
+            access: Mutex::new(()),
+            recovery_access: Arc::new(Mutex::new(())),
+        }
+    }
+
     /// Returns the resolved public-profile store path so the composition root
     /// can colocate other independently bounded public metadata stores.
     #[must_use]

@@ -147,6 +147,7 @@ ADR status and delivery state answer different questions:
 | [0121](0121-adopt-private-docker-sandboxes-as-an-opt-in-pi-deploy-target.md) Adopt private Docker Sandboxes as an opt-in Pi deploy target | Accepted | ADR-0022/0096/0107; issues #198/#227/#655/#763 | Pins an opt-in, fail-closed private Docker Sandbox deploy target for isolated headless work while host-only signing, mobile, Tailnet, and repository mutation remain outside the sandbox |
 | [0122](0122-compose-ledger-backed-midnight-dids-natively.md) Compose ledger-backed Midnight DIDs natively | Accepted | ADR-0015/0017/0037/0046/0118; issue #1137 | Replaces the external JavaScript composer with immutable Ledger8-compatible Rust deployment, maintenance, and generated Compact call composition across headless and mobile targets |
 | [0123](0123-adopt-one-ledger9-ssi-cohort.md) Adopt one Ledger 9 SSI cohort | Accepted | ADR-0015/0118/0122; issues #1191–#1195 | Selects one immutable Ledger 9/Compact/ZK/identity graph, a read-only shared-stack attach contract, and a provider-first headless-to-iOS migration without compatibility shortcuts |
+| [0124](0124-separate-public-midnight-routes-from-transport-authentication.md) Separate public Midnight routes from transport authentication | Proposed | ADR-0098/0118/0123; issue #1200 | Keeps PreProd profiles query-free and applies a runtime credential at exact native transport routes |
 
 ## Current boundaries
 

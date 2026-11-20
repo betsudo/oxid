@@ -21,6 +21,33 @@ pub enum NativeBridgeError {
     Failed,
 }
 
+/// Reads the single device-local PreProd project ID. The result must never
+/// become UI state, a command-line argument, or a diagnostic.
+#[cfg(target_os = "ios")]
+pub fn read_preprod_project_id() -> Result<Option<Zeroizing<String>>, NativeBridgeError> {
+    let plugin = OxidMobilePlugin::new().map_err(|_| NativeBridgeError::Unavailable)?;
+    let value = Zeroizing::new(
+        ios_bridge::readPreprodProjectId(&plugin).map_err(|_| NativeBridgeError::Failed)?,
+    );
+    match value.as_str() {
+        "missing" => Ok(None),
+        "unavailable" => Err(NativeBridgeError::Unavailable),
+        _ => Ok(Some(value)),
+    }
+}
+
+#[cfg(target_os = "ios")]
+pub fn begin_preprod_project_id_setup() -> Result<(), NativeBridgeError> {
+    let plugin = OxidMobilePlugin::new().map_err(|_| NativeBridgeError::Unavailable)?;
+    let status = ios_bridge::beginPreprodProjectIdSetup(&plugin)
+        .map_err(|_| NativeBridgeError::Unavailable)?;
+    if status == "presented" {
+        Ok(())
+    } else {
+        Err(NativeBridgeError::Unavailable)
+    }
+}
+
 #[cfg(target_os = "ios")]
 pub fn start_scan_json() -> Result<String, NativeBridgeError> {
     let plugin = OxidMobilePlugin::new().map_err(|_| NativeBridgeError::Unavailable)?;
@@ -894,6 +921,8 @@ mod ios_bridge {
     extern "Swift" {
         pub type OxidMobilePlugin;
         pub fn startScanJson(this: &OxidMobilePlugin) -> String;
+        pub fn readPreprodProjectId(this: &OxidMobilePlugin) -> String;
+        pub fn beginPreprodProjectIdSetup(this: &OxidMobilePlugin) -> String;
         pub fn takeScanResultJson(this: &OxidMobilePlugin) -> String;
         pub fn timeoutScanJson(this: &OxidMobilePlugin) -> String;
         pub fn copyPublicReceiveAddress(this: &OxidMobilePlugin, value: String) -> String;

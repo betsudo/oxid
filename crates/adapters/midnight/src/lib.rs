@@ -9,17 +9,27 @@ mod dust_checkpoint;
 #[cfg(not(target_arch = "wasm32"))]
 mod dust_registration;
 #[cfg(not(target_arch = "wasm32"))]
+mod dust_replay;
+#[cfg(not(target_arch = "wasm32"))]
 mod dust_sync;
 #[cfg(not(target_arch = "wasm32"))]
 mod indexer;
+#[cfg(all(test, not(target_arch = "wasm32"), feature = "mixed-era-replay"))]
+mod legacy_replay_tests;
 #[cfg(not(target_arch = "wasm32"))]
 mod local_proving;
+#[cfg(not(target_arch = "wasm32"))]
+mod preprod_transport;
 #[cfg(all(not(target_arch = "wasm32"), feature = "proving-bench"))]
 mod proof_benchmark;
+#[cfg(not(target_arch = "wasm32"))]
+mod replay_era;
 #[cfg(not(target_arch = "wasm32"))]
 mod shielded;
 #[cfg(not(target_arch = "wasm32"))]
 mod shielded_checkpoint;
+#[cfg(not(target_arch = "wasm32"))]
+mod shielded_replay;
 #[cfg(not(target_arch = "wasm32"))]
 mod shielded_sync;
 #[cfg(not(target_arch = "wasm32"))]
@@ -48,6 +58,10 @@ pub use local_proving::{
 };
 #[cfg(all(not(target_arch = "wasm32"), feature = "proving-bench"))]
 pub use local_proving::{MidnightLocalProvingFixtureReport, run_local_proving_fixture};
+#[cfg(not(target_arch = "wasm32"))]
+pub use preprod_transport::{
+    MidnightPreprodCredential, MidnightPreprodPreflightError, preflight_blockfrost_preprod,
+};
 #[cfg(all(not(target_arch = "wasm32"), feature = "proving-bench"))]
 pub use proof_benchmark::{MidnightProofBenchmark, MidnightProofBenchmarkConfig};
 #[cfg(not(target_arch = "wasm32"))]
@@ -56,8 +70,9 @@ pub use shielded_checkpoint::{
 };
 #[cfg(not(target_arch = "wasm32"))]
 pub use submission::{
-    MidnightChainIdentityError, MidnightProvingMode, MidnightRemoteProvingMaterialSource,
-    MidnightStandaloneConfig, MidnightStandaloneConfigError, authenticate_midnight_chain_identity,
+    MidnightChainIdentityError, MidnightProofServerVersionError, MidnightProvingMode,
+    MidnightRemoteProvingMaterialSource, MidnightStandaloneConfig, MidnightStandaloneConfigError,
+    authenticate_midnight_chain_identity,
 };
 #[cfg(not(target_arch = "wasm32"))]
 pub use submission_journal::{
