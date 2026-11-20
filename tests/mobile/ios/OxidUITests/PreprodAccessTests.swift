@@ -11,7 +11,13 @@ final class PreprodAccessTests: XCTestCase {
 
         let configure = app.buttons["Enter project ID"]
         XCTAssertTrue(configure.waitForExistence(timeout: 20))
-        XCTAssertTrue(app.staticTexts["PreProd network access needs a Blockfrost project ID"].exists)
+        let missing = app.descendants(matching: .any).matching(
+            NSPredicate(
+                format: "label CONTAINS %@",
+                "PreProd network access needs a Blockfrost project ID"
+            )
+        ).firstMatch
+        XCTAssertTrue(missing.exists, app.debugDescription)
         configure.tap()
 
         let secureField = app.secureTextFields["preprod-project-id"]
