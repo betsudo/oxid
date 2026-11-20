@@ -3,6 +3,7 @@
 import AVFoundation
 import Foundation
 import LocalAuthentication
+import os
 import Security
 import UIKit
 import UniformTypeIdentifiers
@@ -176,8 +177,7 @@ private enum PreprodAccess {
     private static let query: [CFString: Any] = [
         kSecClass: kSecClassGenericPassword,
         kSecAttrService: "io.medianox.oxid.blockfrost",
-        kSecAttrAccount: "preprod",
-        kSecAttrSynchronizable: false
+        kSecAttrAccount: "preprod"
     ]
 
     private static func isValid(_ projectId: String) -> Bool {
@@ -194,9 +194,13 @@ private enum PreprodAccess {
         let status: OSStatus
         var result: CFTypeRef?
         status = SecItemCopyMatching(readQuery as CFDictionary, &result)
-        if status == errSecItemNotFound { return "" }
-        guard status == errSecSuccess,
-              let value = result as? Data,
+        if status == errSecItemNotFound { return "missing" }
+        guard status == errSecSuccess else {
+            Logger(subsystem: "io.medianox.oxid", category: "preprod-keychain")
+                .error("Project ID lookup failed with OSStatus \(status, privacy: .public)")
+            return "unavailable"
+        }
+        guard let value = result as? Data,
               let projectId = String(data: value, encoding: .utf8),
               isValid(projectId) else { return "unavailable" }
         return projectId

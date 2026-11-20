@@ -30,7 +30,7 @@ pub fn read_preprod_project_id() -> Result<Option<Zeroizing<String>>, NativeBrid
         ios_bridge::readPreprodProjectId(&plugin).map_err(|_| NativeBridgeError::Failed)?,
     );
     match value.as_str() {
-        "" => Ok(None),
+        "missing" => Ok(None),
         "unavailable" => Err(NativeBridgeError::Unavailable),
         _ => Ok(Some(value)),
     }
