@@ -22,18 +22,45 @@
       cargoVendorSource = builtins.readFile (cargoVendorPath + "/import-cargo-lock.nix");
       lookupByName = ''select(.name == "''${pkg.name}")'';
       lookupByVersion = ''select(.name == "''${pkg.name}" and .version == "''${pkg.version}")'';
+      flatVendorLink = ''ln -s "$crate" $out/$(basename "$crate" | cut -c 34-)'';
+      flatGitSourceConfig = ''cat "$crate/.cargo-config" >> $out/.cargo/config.toml'';
+      # Keep the indentation of nixpkgs' enclosing string so its shell
+      # heredocs still start and end at column zero after Nix parses it.
+      indentVendorScript =
+        script: builtins.replaceStrings [ "\n" ] [ "\n              " ] (pkgs.lib.removeSuffix "\n" script);
       versionedCargoVendor =
         assert builtins.length (pkgs.lib.splitString lookupByName cargoVendorSource) == 3;
+        assert builtins.length (pkgs.lib.splitString flatVendorLink cargoVendorSource) == 2;
+        assert builtins.length (pkgs.lib.splitString flatGitSourceConfig cargoVendorSource) == 2;
         import (
           builtins.toFile "oxid-import-cargo-lock.nix" (
             builtins.replaceStrings
               [
                 lookupByName
+                flatVendorLink
+                flatGitSourceConfig
                 "  jq,\n"
                 "readFile ./replace-workspace-values.py"
               ]
               [
                 lookupByVersion
+                # Cargo directory sources are indexed by name and version.
+                # A Git package must not shadow its crates.io counterpart.
+                (indentVendorScript ''
+                  destination="$out"
+                  if [ -e "$crate/.cargo-config" ]; then
+                    sourceHash=$(sha256sum "$crate/.cargo-config" | cut -d' ' -f1)
+                    destination="$out/.cargo/git-$sourceHash"
+                    mkdir -p "$destination"
+                  fi
+                  ln -sT "$crate" "$destination/$(basename "$crate" | cut -c 34-)"
+                '')
+                (indentVendorScript ''
+                  sed "s/^replace-with = \"vendored-sources\"$/replace-with = \"vendored-git-$sourceHash\"/" \
+                    "$crate/.cargo-config" >> "$out/.cargo/config.toml"
+                  printf '\n[source.vendored-git-%s]\ndirectory = "cargo-vendor-dir/.cargo/git-%s"\n' \
+                    "$sourceHash" "$sourceHash" >> "$out/.cargo/config.toml"
+                '')
                 "  jq,\n  workspaceValuesSource,\n"
                 "workspaceValuesSource"
               ]
