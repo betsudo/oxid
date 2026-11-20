@@ -58,8 +58,11 @@ OXID_MOBILE_CUSTODY=native OXID_MOBILE_PORTAL_PROFILE=preview \
 The build verifies the signed profile with the independent trust root and
 requires its Portal digest to match. The artifact receipt binds all three
 digests. Startup rechecks signature and time validity, admits the exact
-HTTPS Portal configuration and issuer key, then authenticates node genesis.
-If the node cannot be reached, the app stays on **Preview access**. Use
+HTTPS Portal configuration and issuer key, then authenticates node genesis
+and checks the private HTTPS proof server's `/version` for the Ledger 9
+release paired with the app. The version check sends no witnesses or
+provider credentials. If a required service cannot be reached, the app stays
+on **Preview access**. Use
 **Retry connection** after restoring connectivity. The wallet remains gated
 until the signed deployment passes startup checks.
 
@@ -84,8 +87,9 @@ target/debug/examples/preprod_preflight "$REVIEWED_PREPROD_GENESIS_HEX"   < "$OX
 ```
 
 The probe confirms the signed genesis over node WSS and checks the exact hash
-of the HTTP indexer tip at the same node height. Its receipt contains a public
-height or a bounded failure category. The mobile PreProd startup and Portal
+of the HTTP indexer tip at the same node height. The node runtime and indexer
+protocol at that block must both match the pinned Ledger 9 runtime. Its
+receipt contains a public height or a bounded failure category. The mobile PreProd startup and Portal
 issuance require their own qualification.
 
 ## Build and provision the isolated PreProd iOS profile

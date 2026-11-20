@@ -166,6 +166,9 @@ pub enum ProductionDeploymentCompositionError {
     PreprodIndexerUnavailable,
     PreprodIndexerWebsocketUnavailable,
     PreprodChainViewMismatch,
+    PreprodIncompatibleRuntime,
+    PublicProofServerUnavailable,
+    PublicProofServerIncompatibleVersion,
     InvalidSsiProfile,
     PlatformStorageUnavailable,
     NativeDidDeploymentUnavailable,
@@ -201,6 +204,15 @@ impl fmt::Display for ProductionDeploymentCompositionError {
             }
             Self::PreprodChainViewMismatch => {
                 "PreProd node and indexer disagree on the indexed block"
+            }
+            Self::PreprodIncompatibleRuntime => {
+                "PreProd runtime does not match this Ledger 9 build"
+            }
+            Self::PublicProofServerUnavailable => {
+                "the configured private proof server is unavailable"
+            }
+            Self::PublicProofServerIncompatibleVersion => {
+                "the configured private proof server does not match this Ledger 9 build"
             }
             Self::InvalidSsiProfile => "authenticated SSI deployment profile is invalid",
             Self::PlatformStorageUnavailable => "protected platform storage is unavailable",
@@ -280,6 +292,9 @@ pub async fn authenticate_preprod_deployment(
             }
             MidnightPreprodPreflightError::ChainViewMismatch => {
                 ProductionDeploymentCompositionError::PreprodChainViewMismatch
+            }
+            MidnightPreprodPreflightError::IncompatibleRuntime => {
+                ProductionDeploymentCompositionError::PreprodIncompatibleRuntime
             }
             MidnightPreprodPreflightError::NodeUnavailable => {
                 ProductionDeploymentCompositionError::ChainIdentityUnavailable

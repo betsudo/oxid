@@ -23,6 +23,8 @@ pub(crate) const NODE_ROUTE: &str = "wss://rpc.midnight-preprod.blockfrost.io";
 pub(crate) const INDEXER_ROUTE: &str = "https://midnight-preprod.blockfrost.io/api/v0";
 pub(crate) const INDEXER_SOCKET_ROUTE: &str = "wss://midnight-preprod.blockfrost.io/api/v0/ws";
 const PROJECT_PREFIX: &str = "nightpreprod";
+// Midnight 2.1.101 Ledger 9 runtime, paired with the pinned app cohort.
+const LEDGER9_RUNTIME_SPEC: u32 = 2_001_100;
 
 /// A provider credential supplied to native transport at runtime.
 #[derive(PartialEq, Eq)]
@@ -117,6 +119,7 @@ pub enum MidnightPreprodPreflightError {
     IndexerUnavailable,
     IndexerWebsocketUnavailable,
     ChainViewMismatch,
+    IncompatibleRuntime,
 }
 
 impl fmt::Display for MidnightPreprodPreflightError {
@@ -131,6 +134,9 @@ impl fmt::Display for MidnightPreprodPreflightError {
                 "authenticated PreProd GraphQL WebSocket is unavailable"
             }
             Self::ChainViewMismatch => "PreProd node and indexer disagree on the indexed block",
+            Self::IncompatibleRuntime => {
+                "PreProd runtime does not match the supported Ledger 9 release"
+            }
         })
     }
 }
@@ -171,7 +177,7 @@ pub async fn preflight_blockfrost_preprod(
     if genesis.0 != *genesis_hash {
         return Err(MidnightPreprodPreflightError::GenesisMismatch);
     }
-    let (height, indexed_hash) =
+    let (height, indexed_hash, indexed_runtime) =
         fetch_identified_chain_tip(MidnightTransportRoute::new(indexer_url, Some(credential)))
             .await
             .map_err(|_| MidnightPreprodPreflightError::IndexerUnavailable)?;
@@ -182,9 +188,18 @@ pub async fn preflight_blockfrost_preprod(
     .await
     .map_err(|_| MidnightPreprodPreflightError::NodeUnavailable)?
     .map_err(|_| MidnightPreprodPreflightError::NodeUnavailable)?
-    .map(|hash| hash.0);
-    if node_hash != Some(indexed_hash) {
-        return Err(MidnightPreprodPreflightError::ChainViewMismatch);
+    .filter(|hash| hash.0 == indexed_hash)
+    .ok_or(MidnightPreprodPreflightError::ChainViewMismatch)?;
+    let node_runtime = timeout(
+        PREFLIGHT_TIMEOUT,
+        node.state_get_runtime_version(Some(node_hash)),
+    )
+    .await
+    .map_err(|_| MidnightPreprodPreflightError::NodeUnavailable)?
+    .map_err(|_| MidnightPreprodPreflightError::NodeUnavailable)?;
+    if node_runtime.spec_version != LEDGER9_RUNTIME_SPEC || indexed_runtime != LEDGER9_RUNTIME_SPEC
+    {
+        return Err(MidnightPreprodPreflightError::IncompatibleRuntime);
     }
     verify_graphql_transport(MidnightTransportRoute::new(
         indexer_websocket_url,

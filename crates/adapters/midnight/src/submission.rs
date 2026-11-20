@@ -152,8 +152,15 @@ pub struct MidnightStandaloneConfig {
 pub enum MidnightProvingMode {
     /// Keep proof witnesses on-device and use an authenticated bounded cache.
     Local(MidnightLocalProvingConfig),
-    /// Development-only remote proof service using loopback HTTP or HTTPS.
+    /// Explicit remote proof service using loopback HTTP or authenticated HTTPS.
     Remote { proof_server_url: String },
+}
+
+/// Payload-free failures when checking the private public-network prover.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MidnightProofServerVersionError {
+    Unavailable,
+    IncompatibleVersion,
 }
 
 impl MidnightStandaloneConfig {
@@ -274,6 +281,20 @@ impl MidnightStandaloneConfig {
             credential,
         )
         .await
+    }
+
+    /// Verify the exact prover paired with this app's Ledger 9 dependency.
+    /// This sends only an unauthenticated version request, without witnesses.
+    pub async fn verify_public_proof_server(&self) -> Result<(), MidnightProofServerVersionError> {
+        let MidnightProvingMode::Remote { proof_server_url } = &self.proving else {
+            return Err(MidnightProofServerVersionError::Unavailable);
+        };
+        let endpoint = Url::parse(proof_server_url)
+            .map_err(|_| MidnightProofServerVersionError::Unavailable)?;
+        if endpoint.scheme() != "https" {
+            return Err(MidnightProofServerVersionError::Unavailable);
+        }
+        verify_ledger9_proof_server_version(&endpoint).await
     }
 
     /// Supplies only the two authenticated read routes needed by contract-state readers.
@@ -830,10 +851,10 @@ pub(super) async fn fetch_chain_tip_with_headers(
     decode_chain_tip_body(&body)
 }
 
-/// Returns the Ledger 9 tip height and its 32-byte block hash for node comparison.
+/// Returns the Ledger 9 tip height, block hash, and runtime for node comparison.
 pub(super) async fn fetch_identified_chain_tip(
     route: MidnightTransportRoute<'_>,
-) -> Result<(u64, [u8; 32]), WalletTransactionPortError> {
+) -> Result<(u64, [u8; 32], u32), WalletTransactionPortError> {
     let headers = route
         .headers()
         .map_err(|_| WalletTransactionPortError::Unavailable)?;
@@ -841,7 +862,9 @@ pub(super) async fn fetch_identified_chain_tip(
     decode_identified_chain_tip(&body)
 }
 
-fn decode_identified_chain_tip(body: &[u8]) -> Result<(u64, [u8; 32]), WalletTransactionPortError> {
+fn decode_identified_chain_tip(
+    body: &[u8],
+) -> Result<(u64, [u8; 32], u32), WalletTransactionPortError> {
     let root = parse_chain_tip_body(body)?;
     let tip = decode_chain_tip(&root)?;
     let hash = root
@@ -851,7 +874,12 @@ fn decode_identified_chain_tip(body: &[u8]) -> Result<(u64, [u8; 32]), WalletTra
     let mut bytes = [0; 32];
     hex::decode_to_slice(hash.strip_prefix("0x").unwrap_or(hash), &mut bytes)
         .map_err(|_| WalletTransactionPortError::InvalidChainState)?;
-    Ok((tip.height, bytes))
+    let runtime = root
+        .pointer("/data/block/protocolVersion")
+        .and_then(Value::as_u64)
+        .and_then(|version| u32::try_from(version).ok())
+        .ok_or(WalletTransactionPortError::InvalidChainState)?;
+    Ok((tip.height, bytes, runtime))
 }
 
 async fn fetch_chain_tip_body(
@@ -1659,6 +1687,34 @@ impl HttpDustProvingProvider {
             .resolve_key(preimage.key_location.0.as_ref())?
             .ok_or_else(|| anyhow::anyhow!("external proving material is unavailable"))
     }
+}
+
+async fn verify_ledger9_proof_server_version(
+    endpoint: &Url,
+) -> Result<(), MidnightProofServerVersionError> {
+    use MidnightProofServerVersionError::{IncompatibleVersion, Unavailable};
+
+    // Paired with the Ledger 9.1.0.2 dependency and its proof wire format.
+    const PROOF_SERVER_VERSION: &[u8] = b"9.0.2";
+    let response = chain_tip_client(endpoint)
+        .map_err(|_| Unavailable)?
+        .get(format!(
+            "{}/version",
+            endpoint.as_str().trim_end_matches('/')
+        ))
+        .send()
+        .await
+        .map_err(|_| Unavailable)?;
+    if !response.status().is_success() {
+        return Err(Unavailable);
+    }
+    let body = bounded_response(response, 64)
+        .await
+        .map_err(|_| Unavailable)?;
+    if body != PROOF_SERVER_VERSION {
+        return Err(IncompatibleVersion);
+    }
+    Ok(())
 }
 
 async fn prove_via_http(
@@ -2724,15 +2780,65 @@ mod tests {
                 "height": 42,
                 "timestamp": 1_750_000_000_000_u64,
                 "hash": "42".repeat(32),
+                "protocolVersion": 2_001_100_u32,
                 "ledgerParameters": hex::encode(parameters),
             }}
         });
         assert_eq!(
             decode_identified_chain_tip(&serde_json::to_vec(&tip).unwrap()).unwrap(),
-            (42, [0x42; 32]),
+            (42, [0x42; 32], 2_001_100),
         );
         tip["data"]["block"]["hash"] = json!("1234");
         assert!(decode_identified_chain_tip(&serde_json::to_vec(&tip).unwrap()).is_err());
+    }
+
+    #[test]
+    fn public_proof_server_version_probe_uses_the_prover_path_and_rejects_old_releases() {
+        use std::io::{BufRead as _, BufReader, Write as _};
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        for (version, expected) in [
+            ("9.0.2", Ok(())),
+            (
+                "9.0.1",
+                Err(MidnightProofServerVersionError::IncompatibleVersion),
+            ),
+        ] {
+            let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+            let endpoint =
+                Url::parse(&format!("http://{}/prover", listener.local_addr().unwrap())).unwrap();
+            let server = std::thread::spawn(move || {
+                let (mut stream, _) = listener.accept().unwrap();
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(5)))
+                    .unwrap();
+                let mut request = BufReader::new(&mut stream);
+                let mut line = String::new();
+                request.read_line(&mut line).unwrap();
+                assert_eq!(line.trim_end(), "GET /prover/version HTTP/1.1");
+                loop {
+                    line.clear();
+                    if request.read_line(&mut line).unwrap() == 0 || line == "\r\n" {
+                        break;
+                    }
+                    assert!(!line.to_ascii_lowercase().starts_with("project_id:"));
+                }
+                write!(
+                    stream,
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{version}",
+                    version.len()
+                )
+                .unwrap();
+            });
+            assert_eq!(
+                runtime.block_on(verify_ledger9_proof_server_version(&endpoint)),
+                expected
+            );
+            server.join().unwrap();
+        }
     }
 
     #[test]

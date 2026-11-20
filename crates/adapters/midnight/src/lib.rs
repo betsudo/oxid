@@ -62,8 +62,9 @@ pub use shielded_checkpoint::{
 };
 #[cfg(not(target_arch = "wasm32"))]
 pub use submission::{
-    MidnightChainIdentityError, MidnightProvingMode, MidnightRemoteProvingMaterialSource,
-    MidnightStandaloneConfig, MidnightStandaloneConfigError, authenticate_midnight_chain_identity,
+    MidnightChainIdentityError, MidnightProofServerVersionError, MidnightProvingMode,
+    MidnightRemoteProvingMaterialSource, MidnightStandaloneConfig, MidnightStandaloneConfigError,
+    authenticate_midnight_chain_identity,
 };
 #[cfg(not(target_arch = "wasm32"))]
 pub use submission_journal::{

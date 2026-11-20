@@ -63,6 +63,7 @@ pub fn compose_embedded_preview_portal(
         .build()
         .map_err(|_| StartupError::PublicPortalRuntimeUnavailable)?;
     let deployment = runtime.block_on(super::authenticate_production_deployment(profile))?;
+    runtime.block_on(verify_public_prover(&deployment))?;
     super::public_portal::compose_authenticated_public_portal(deployment, portal)
 }
 
@@ -96,7 +97,28 @@ pub fn compose_embedded_preprod_portal(
         .map_err(|_| StartupError::PublicPortalRuntimeUnavailable)?;
     let deployment =
         runtime.block_on(super::authenticate_preprod_deployment(profile, credential))?;
+    runtime.block_on(verify_public_prover(&deployment))?;
     super::public_portal::compose_authenticated_public_portal(deployment, portal)
+}
+
+#[cfg(any(target_os = "ios", target_os = "android"))]
+async fn verify_public_prover(
+    deployment: &super::AuthenticatedProductionDeployment,
+) -> Result<(), StartupError> {
+    use oxid_adapter_midnight::MidnightProofServerVersionError;
+
+    deployment
+        .midnight
+        .verify_public_proof_server()
+        .await
+        .map_err(|error| match error {
+            MidnightProofServerVersionError::Unavailable => {
+                StartupError::PublicProofServerUnavailable
+            }
+            MidnightProofServerVersionError::IncompatibleVersion => {
+                StartupError::PublicProofServerIncompatibleVersion
+            }
+        })
 }
 
 #[cfg(all(feature = "preprod-portal", target_os = "ios"))]
