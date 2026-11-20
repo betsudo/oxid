@@ -268,7 +268,7 @@
           "paths": [
             "crates/ui-dioxus/src/lib.rs"
           ],
-          "extraLineCeiling": 510,
+          "extraLineCeiling": 484,
           "issue": "#757",
           "reason": "Preserves the verified post-decomposition ratchet while the remaining excess is removed.",
           "expiresOn": "2027-01-31"

@@ -646,7 +646,16 @@ fn one_authorization_drives_submission_and_reuses_authoritative_dust_readiness()
         prepared.state,
         oxid_wallet_application::WalletDustRegistrationSettlementState::AwaitingAuthorization
     );
-    let ready = block_on(capability.authorize(confirmation(true))).unwrap();
+    let review = capability
+        .authorization_review_for(prepared.identity.as_ref().unwrap())
+        .unwrap();
+    let ready = block_on(capability.authorize_review(review.clone(), true)).unwrap();
+    assert_eq!(
+        block_on(capability.authorize_review(review, true)),
+        Err(WalletDustSettlementError::Driver(
+            WalletDustRegistrationDriverError::AuthorizationNotPending,
+        ))
+    );
     assert_eq!(
         ready.state,
         oxid_wallet_application::WalletDustRegistrationSettlementState::Ready
@@ -784,6 +793,48 @@ fn authorization_review_exposes_only_presentation_safe_facts() {
     assert_eq!(review.input_count, 1);
     assert_eq!(review.maximum_fee_allowance.asset_id, "midnight:dust");
     assert!(!format!("{review:?}").contains("authorization_challenge"));
+}
+
+#[test]
+fn protected_review_cannot_approve_replaced_preview() {
+    let fake = Arc::new(FakeServices::new());
+    let capability = capability(&fake);
+    block_on(capability.refresh("profile_test".to_owned())).unwrap();
+    let review = capability.authorization_review().unwrap();
+
+    capability
+        .executor
+        .retained
+        .lock()
+        .unwrap()
+        .preview
+        .as_mut()
+        .unwrap()
+        .authorization_challenge
+        .push_str("-replaced");
+
+    assert_eq!(
+        block_on(capability.authorize_review(review, true)),
+        Err(WalletDustSettlementError::StaleReview)
+    );
+    assert_eq!(*fake.calls.lock().unwrap(), ["prepare"]);
+}
+
+#[test]
+fn protected_review_is_hidden_for_a_stale_wallet_generation() {
+    let fake = Arc::new(FakeServices::new());
+    let capability = capability(&fake);
+    let mut identity = block_on(capability.refresh("profile_test".to_owned()))
+        .unwrap()
+        .identity
+        .unwrap();
+    identity.generation += 1;
+
+    assert_eq!(
+        capability.authorization_review_for(&identity),
+        Err(WalletDustSettlementError::StaleReview)
+    );
+    assert_eq!(*fake.calls.lock().unwrap(), ["prepare"]);
 }
 
 #[test]

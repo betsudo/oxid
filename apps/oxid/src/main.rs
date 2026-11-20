@@ -63,6 +63,34 @@ impl oxid_ui_dioxus::WalletDustSettlementUiPort for ComposedWalletDustSettlement
     fn subscribe(&self) -> oxid_ui_dioxus::WalletDustSettlementSubscription {
         self.capability.subscribe()
     }
+
+    #[cfg(feature = "preview-portal")]
+    fn protected_review(
+        &self,
+        settlement: &oxid_ui_dioxus::WalletDustSettlementProjection,
+    ) -> Option<oxid_ui_dioxus::WalletDustProtectedReview> {
+        let review = self
+            .capability
+            .authorization_review_for(settlement.identity.as_ref()?)
+            .ok()?;
+        let display = review.confirmation(true);
+        let capability = std::sync::Arc::clone(&self.capability);
+        Some(oxid_ui_dioxus::WalletDustProtectedReview::new(
+            display.title,
+            display.summary,
+            move || {
+                let capability = std::sync::Arc::clone(&capability);
+                let review = review.clone();
+                async move {
+                    capability
+                        .authorize_review(review, true)
+                        .await
+                        .map(|_| ())
+                        .map_err(|error| error.to_string())
+                }
+            },
+        ))
+    }
 }
 
 fn main() {

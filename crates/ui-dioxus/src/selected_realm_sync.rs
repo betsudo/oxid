@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 pub(super) mod action_watch;
+pub(crate) mod dust_authorization;
 
 use super::*;
 use oxid_wallet_application::WalletDustRegistrationSettlementState as DustSettlement;
@@ -95,8 +96,18 @@ pub(super) fn AccountSyncCard(
             let lifecycle = selected_realm_lifecycle_presentation(overall_state);
             let account_state = selected_realm_sync::selected_realm_account_state(&realm.account);
             let account_status = selected_realm_lifecycle_presentation(account_state);
-            let (dust_label, dust_tone) =
-                selected_realm_sync::wallet_dust_status(&projection, &dust_settlement.read());
+            let settlement = dust_settlement.read();
+            let review = dust_authorization::protected_review(
+                services.wallet_dust_settlement().as_ref(),
+                &projection,
+                &settlement,
+            );
+            let (dust_label, dust_tone) = if review.is_some() {
+                ("Review needed", "syncing")
+            } else {
+                wallet_dust_status(&projection, &settlement)
+            };
+            drop(settlement);
             let observed_dust = selected_realm_sync::wallet_dust_observed_amount(&realm.dust);
             let provenance = selected_realm_provenance(realm);
             let chain_tip = selected_realm_chain_tip(realm);
@@ -156,6 +167,12 @@ pub(super) fn AccountSyncCard(
                                 aria_label: "DUST {dust_label}",
                                 "{dust_label}"
                             }
+                        }
+                    }
+                    if let Some(review) = review {
+                        dust_authorization::ProtectedDustReviewCard {
+                            key: "{projection.identity.profile.as_str()}-{projection.identity.realm.as_str()}-{projection.generation}",
+                            review,
                         }
                     }
                     if lifecycle.retry {
@@ -317,12 +334,8 @@ pub(super) fn wallet_dust_status(
     realm: &SelectedWalletRealmProjection,
     settlement: &WalletDustSettlementProjection,
 ) -> (&'static str, &'static str) {
-    let state = settlement.identity.as_ref().and_then(|identity| {
-        (identity.profile == realm.identity.profile
-            && identity.realm == realm.identity.realm
-            && identity.generation == realm.generation)
-            .then_some(settlement.state)
-    });
+    let state =
+        dust_authorization::settlement_matches_realm(realm, settlement).then_some(settlement.state);
     let live_balance = match &realm.view.dust {
         WalletRealmFamilyView::Ready(status)
             if status.state == "synced" && status.failure.is_none() =>

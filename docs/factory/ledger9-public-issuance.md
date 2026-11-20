@@ -64,15 +64,17 @@ Portal issuance, and the normal camera and link adapters. Wallet profiles,
 checkpoints, DID records, encrypted credentials, and recovery journals are
 stored in the app data directory scoped by network and genesis.
 
-Deploy the artifact only to the receipt-owned simulator. The protected DUST
-authorization flow and live qualification remain required. PreProd startup
-also requires the separate Blockfrost transport.
+Deploy the artifact only to the receipt-owned simulator. Preview requires live
+qualification. PreProd startup also requires the separate Blockfrost transport.
 
 ## Qualify the public app
 
 Use protected native custody. On the receipt-owned simulator, fund the fresh
-holder, observe automatic DUST readiness, deploy and resolve the holder DID,
-and accept the Portal Digital Passport offer through the normal consent flow.
+holder and open **Wallet status**. When **Review needed** appears under DUST,
+open **Review DUST registration**, check the NIGHT amount and maximum DUST fee,
+then select **Confirm registration**. Wait for the wallet to confirm the
+transaction and refresh its DUST balance automatically. Deploy and resolve the
+holder DID, then accept the Portal Digital Passport offer.
 Check the encrypted store, replace the app process with its data intact, and
 require fresh resolver-backed reverification. Capture exact source and
 artifact hashes, non-sensitive results, durations, and simulator cleanup.
