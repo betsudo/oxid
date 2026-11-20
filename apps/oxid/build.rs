@@ -12,14 +12,6 @@ mod portal_profile_authority;
 const PORTAL_MANIFEST_PATH_ENV: &str = "OXID_BUILD_PORTAL_DEPLOYMENT_MANIFEST_PATH";
 const PORTAL_MANIFEST_SHA256_ENV: &str = "OXID_BUILD_PORTAL_DEPLOYMENT_MANIFEST_SHA256";
 const MAX_PORTAL_MANIFEST_BYTES: usize = 65_536;
-#[cfg(feature = "preview-portal")]
-const PREVIEW_PROFILE_PATH_ENV: &str = "OXID_BUILD_PREVIEW_SIGNED_PROFILE_PATH";
-#[cfg(feature = "preview-portal")]
-const PREVIEW_PROFILE_SHA256_ENV: &str = "OXID_BUILD_PREVIEW_SIGNED_PROFILE_SHA256";
-#[cfg(feature = "preview-portal")]
-const PREVIEW_TRUST_ROOT_PATH_ENV: &str = "OXID_BUILD_PREVIEW_TRUST_ROOT_PATH";
-#[cfg(feature = "preview-portal")]
-const PREVIEW_TRUST_ROOT_SHA256_ENV: &str = "OXID_BUILD_PREVIEW_TRUST_ROOT_SHA256";
 const PORTAL_PROFILE_AUTHORITY_PATH_ENV: &str = "OXID_BUILD_PORTAL_PROFILE_AUTHORITY_PATH";
 const PORTAL_PROFILE_AUTHORITY_SHA256_ENV: &str = "OXID_BUILD_PORTAL_PROFILE_AUTHORITY_SHA256";
 const PORTAL_PUBLIC_ORIGIN_ENV: &str = "OXID_BUILD_PORTAL_PUBLIC_ORIGIN";
@@ -52,8 +44,9 @@ fn main() {
     let brand_directory = repository_root.join("brands/oxid");
     let output_directory =
         PathBuf::from(env::var_os("OUT_DIR").expect("Cargo must provide OUT_DIR"));
-    #[cfg(feature = "preview-portal")]
-    authorize_preview_build();
+    if let Some(network) = public_portal_network() {
+        authorize_public_portal_build(network);
+    }
     authorize_portal_profile();
     let brand = oxid_brand_build::load_brand_pack(&brand_directory)
         .unwrap_or_else(|error| panic!("default brand pack is invalid: {error}"));
@@ -148,12 +141,23 @@ fn authorize_portal_profile() {
     println!("cargo:rerun-if-changed={}", path.display());
 }
 
-#[cfg(feature = "preview-portal")]
-fn authorize_preview_build() {
+fn public_portal_network() -> Option<&'static str> {
+    match (
+        cfg!(feature = "preview-portal"),
+        cfg!(feature = "preprod-portal"),
+    ) {
+        (true, false) => Some("preview"),
+        (false, true) => Some("preprod"),
+        (false, false) => None,
+        (true, true) => panic!("select exactly one signed public Portal profile"),
+    }
+}
+
+fn authorize_public_portal_build(network: &str) {
     assert!(
         env::var("CARGO_CFG_TARGET_OS")
-            .is_ok_and(|target| matches!(target.as_str(), "ios" | "android")),
-        "preview-portal is available only on iOS and Android"
+            .is_ok_and(|target| target == "ios" || (target == "android" && network == "preview")),
+        "the selected public Portal profile is unavailable on this target"
     );
     let conflicting = [
         "DESKTOP",
@@ -172,15 +176,15 @@ fn authorize_preview_build() {
         !conflicting
             .iter()
             .any(|feature| env::var_os(format!("CARGO_FEATURE_{feature}")).is_some()),
-        "preview-portal is an isolated protected mobile profile"
+        "the selected public Portal profile requires the isolated protected mobile profile"
     );
 }
 
 fn embed_portal_manifests(output_directory: &std::path::Path) {
     let mobile_target = env::var("CARGO_CFG_TARGET_OS")
         .is_ok_and(|target| matches!(target.as_str(), "ios" | "android"));
-    let preview = cfg!(feature = "preview-portal");
-    if !mobile_target || (!preview && active_portal_profile().is_none()) {
+    let public = public_portal_network();
+    if !mobile_target || (public.is_none() && active_portal_profile().is_none()) {
         return;
     }
     let (manifest, digest) = read_pinned_input(
@@ -188,55 +192,61 @@ fn embed_portal_manifests(output_directory: &std::path::Path) {
         PORTAL_MANIFEST_SHA256_ENV,
         MAX_PORTAL_MANIFEST_BYTES,
     );
-    #[cfg(feature = "preview-portal")]
-    embed_preview_profile(output_directory, &digest);
+    #[cfg(any(feature = "preview-portal", feature = "preprod-portal"))]
+    if let Some(network) = public {
+        embed_public_profile(output_directory, &digest, network);
+    }
     fs::write(output_directory.join("portal-deployment.json"), manifest)
         .expect("Portal deployment manifest could not be embedded");
     println!("cargo:rustc-env=OXID_EMBEDDED_PORTAL_DEPLOYMENT_SHA256={digest}");
 }
 
-#[cfg(feature = "preview-portal")]
-fn embed_preview_profile(output_directory: &std::path::Path, manifest_digest: &str) {
+#[cfg(any(feature = "preview-portal", feature = "preprod-portal"))]
+fn embed_public_profile(output_directory: &std::path::Path, manifest_digest: &str, network: &str) {
     use oxid_adapter_deployment_profile::{DeploymentProfileVerifier, DeploymentTrustRoot};
     use std::time::{SystemTime, UNIX_EPOCH};
 
+    let prefix = format!("OXID_BUILD_{}", network.to_ascii_uppercase());
     let (trust_bytes, _) = read_pinned_input(
-        PREVIEW_TRUST_ROOT_PATH_ENV,
-        PREVIEW_TRUST_ROOT_SHA256_ENV,
+        &format!("{prefix}_TRUST_ROOT_PATH"),
+        &format!("{prefix}_TRUST_ROOT_SHA256"),
         4_096,
     );
-    let (profile_bytes, _) =
-        read_pinned_input(PREVIEW_PROFILE_PATH_ENV, PREVIEW_PROFILE_SHA256_ENV, 65_536);
+    let (profile_bytes, _) = read_pinned_input(
+        &format!("{prefix}_SIGNED_PROFILE_PATH"),
+        &format!("{prefix}_SIGNED_PROFILE_SHA256"),
+        65_536,
+    );
     let root = DeploymentTrustRoot::from_reviewed_json(&trust_bytes)
-        .expect("embedded Preview trust policy is invalid");
+        .expect("embedded public Portal trust policy is invalid");
     let verifier = DeploymentProfileVerifier::new("io.medianox.oxid", [root], 1)
-        .expect("embedded Preview trust policy is invalid");
+        .expect("embedded public Portal trust policy is invalid");
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .expect("trusted build time is unavailable")
         .as_secs();
     let profile = verifier
         .verify(&profile_bytes, now)
-        .expect("embedded signed Preview profile was rejected");
+        .expect("embedded signed public Portal profile was rejected");
     assert_eq!(
         profile.midnight().network_id(),
-        "preview",
-        "signed Preview network mismatch"
+        network,
+        "signed public Portal network mismatch"
     );
     assert!(
         profile.ssi().portal_manifest_sha256() == Some(manifest_digest),
-        "signed Preview Portal manifest digest mismatch"
+        "signed public Portal manifest digest mismatch"
     );
     fs::write(
-        output_directory.join("preview-trust-root.json"),
+        output_directory.join(format!("{network}-trust-root.json")),
         trust_bytes,
     )
-    .expect("Preview trust root could not be embedded");
+    .expect("public Portal trust root could not be embedded");
     fs::write(
-        output_directory.join("preview-signed-profile.json"),
+        output_directory.join(format!("{network}-signed-profile.json")),
         profile_bytes,
     )
-    .expect("signed Preview profile could not be embedded");
+    .expect("signed public Portal profile could not be embedded");
 }
 
 fn read_pinned_input(path_env: &str, digest_env: &str, max_bytes: usize) -> (Vec<u8>, String) {

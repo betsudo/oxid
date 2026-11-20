@@ -5,6 +5,9 @@
 #[cfg(test)]
 mod portal_profile_authority;
 
+#[cfg(all(feature = "preprod-portal", target_os = "ios"))]
+mod preprod_startup;
+
 mod generated_brand {
     include!(concat!(env!("OUT_DIR"), "/brand.rs"));
 }
@@ -64,7 +67,7 @@ impl oxid_ui_dioxus::WalletDustSettlementUiPort for ComposedWalletDustSettlement
         self.capability.subscribe()
     }
 
-    #[cfg(feature = "preview-portal")]
+    #[cfg(any(feature = "preview-portal", feature = "preprod-portal"))]
     fn protected_review(
         &self,
         settlement: &oxid_ui_dioxus::WalletDustSettlementProjection,
@@ -93,6 +96,12 @@ impl oxid_ui_dioxus::WalletDustSettlementUiPort for ComposedWalletDustSettlement
     }
 }
 
+#[cfg(all(feature = "preprod-portal", target_os = "ios"))]
+fn main() {
+    preprod_startup::launch();
+}
+
+#[cfg(not(feature = "preprod-portal"))]
 fn main() {
     #[cfg(all(feature = "developer-proof-benchmark", target_arch = "wasm32"))]
     compile_error!("developer-proof-benchmark is available only on native targets");
@@ -443,6 +452,66 @@ fn main() {
         feature = "preview-portal"
     )))]
     let application = oxid_composition::compose();
+    let ui = wallet_ui(&application);
+    let launcher = dioxus::LaunchBuilder::new()
+        .with_context(ui)
+        .with_context(generated_brand::BRAND_PROFILE);
+    #[cfg(any(target_os = "ios", target_os = "android"))]
+    {
+        let app_links = application.identity_link_ingress();
+        let presentation_lifecycle = application.set_credential_presentation_foreground();
+        let config = dioxus::mobile::Config::new()
+            .with_custom_index(include_str!("../assets/index.html").to_owned())
+            .with_custom_event_handler(move |event, _target| {
+                match event {
+                    dioxus::mobile::tao::event::Event::Opened { urls } => {
+                        for url in urls {
+                            // Fail closed without reproducing secret-bearing URLs in
+                            // logs. The Dioxus UI drains and classifies accepted links.
+                            let _ = app_links.capture(url.as_str().to_owned());
+                        }
+                    }
+                    dioxus::mobile::tao::event::Event::Suspended => {
+                        let _ = presentation_lifecycle.execute(false);
+                    }
+                    dioxus::mobile::tao::event::Event::Resumed => {
+                        let _ = presentation_lifecycle.execute(true);
+                    }
+                    _ => {}
+                }
+            });
+        launcher.with_cfg(config).launch(oxid_ui_dioxus::App);
+    }
+    #[cfg(all(
+        feature = "desktop",
+        not(any(target_os = "ios", target_os = "android"))
+    ))]
+    {
+        #[cfg(feature = "desktop-developer-pager-test")]
+        let (width, height) = developer_pager_viewport();
+        #[cfg(not(feature = "desktop-developer-pager-test"))]
+        let (width, height) = (390.0, 844.0);
+        launcher.with_cfg(
+            dioxus::desktop::Config::new().with_window(
+                dioxus::desktop::WindowBuilder::new()
+                    .with_title(generated_brand::BRAND_PROFILE.product_name())
+                    .with_inner_size(dioxus::desktop::tao::dpi::LogicalSize::new(width, height))
+                    .with_min_inner_size(dioxus::desktop::tao::dpi::LogicalSize::new(360.0, 640.0))
+                    .with_resizable(true),
+            ),
+        )
+    }
+    .launch(oxid_ui_dioxus::App);
+    #[cfg(all(
+        not(feature = "desktop"),
+        not(any(target_os = "ios", target_os = "android"))
+    ))]
+    launcher.launch(oxid_ui_dioxus::App);
+}
+
+fn wallet_ui(
+    application: &oxid_composition::ApplicationServices,
+) -> oxid_ui_dioxus::WalletUiServices {
     #[cfg(all(
         any(
             feature = "standalone-development",
@@ -466,13 +535,15 @@ fn main() {
     #[cfg(any(
         feature = "standalone-development",
         feature = "standalone-native-custody",
-        feature = "preview-portal"
+        feature = "preview-portal",
+        feature = "preprod-portal"
     ))]
     let credential_issuance_ready = true;
     #[cfg(not(any(
         feature = "standalone-development",
         feature = "standalone-native-custody",
-        feature = "preview-portal"
+        feature = "preview-portal",
+        feature = "preprod-portal"
     )))]
     let credential_issuance_ready = false;
     #[cfg(any(
@@ -706,60 +777,7 @@ fn main() {
         }
     }));
 
-    let launcher = dioxus::LaunchBuilder::new()
-        .with_context(ui)
-        .with_context(generated_brand::BRAND_PROFILE);
-    #[cfg(any(target_os = "ios", target_os = "android"))]
-    {
-        let app_links = application.identity_link_ingress();
-        let presentation_lifecycle = application.set_credential_presentation_foreground();
-        let config = dioxus::mobile::Config::new()
-            .with_custom_index(include_str!("../assets/index.html").to_owned())
-            .with_custom_event_handler(move |event, _target| {
-                match event {
-                    dioxus::mobile::tao::event::Event::Opened { urls } => {
-                        for url in urls {
-                            // Fail closed without reproducing secret-bearing URLs in
-                            // logs. The Dioxus UI drains and classifies accepted links.
-                            let _ = app_links.capture(url.as_str().to_owned());
-                        }
-                    }
-                    dioxus::mobile::tao::event::Event::Suspended => {
-                        let _ = presentation_lifecycle.execute(false);
-                    }
-                    dioxus::mobile::tao::event::Event::Resumed => {
-                        let _ = presentation_lifecycle.execute(true);
-                    }
-                    _ => {}
-                }
-            });
-        launcher.with_cfg(config).launch(oxid_ui_dioxus::App);
-    }
-    #[cfg(all(
-        feature = "desktop",
-        not(any(target_os = "ios", target_os = "android"))
-    ))]
-    {
-        #[cfg(feature = "desktop-developer-pager-test")]
-        let (width, height) = developer_pager_viewport();
-        #[cfg(not(feature = "desktop-developer-pager-test"))]
-        let (width, height) = (390.0, 844.0);
-        launcher.with_cfg(
-            dioxus::desktop::Config::new().with_window(
-                dioxus::desktop::WindowBuilder::new()
-                    .with_title(generated_brand::BRAND_PROFILE.product_name())
-                    .with_inner_size(dioxus::desktop::tao::dpi::LogicalSize::new(width, height))
-                    .with_min_inner_size(dioxus::desktop::tao::dpi::LogicalSize::new(360.0, 640.0))
-                    .with_resizable(true),
-            ),
-        )
-    }
-    .launch(oxid_ui_dioxus::App);
-    #[cfg(all(
-        not(feature = "desktop"),
-        not(any(target_os = "ios", target_os = "android"))
-    ))]
-    launcher.launch(oxid_ui_dioxus::App);
+    ui
 }
 
 #[cfg(test)]

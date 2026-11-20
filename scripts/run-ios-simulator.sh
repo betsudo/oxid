@@ -141,11 +141,11 @@ portal_manifest_path=""
 portal_manifest_sha256=""
 portal_profile_authority_path=""
 portal_profile_authority_sha256=""
-preview_artifact_binding=""
+public_portal_artifact_binding=""
 case "$portal_profile" in
   unavailable)
     ;;
-  local|preview)
+  local|preview|preprod)
     portal_manifest_path="${OXID_BUILD_PORTAL_DEPLOYMENT_MANIFEST_PATH:-}"
     portal_manifest_sha256="${OXID_BUILD_PORTAL_DEPLOYMENT_MANIFEST_SHA256:-}"
     if ! validate_pinned_build_input "$portal_manifest_path" "$portal_manifest_sha256"; then
@@ -162,22 +162,27 @@ case "$portal_profile" in
       if [ "$mobile_custody" != "native" ] || [ "$standalone_network_profile" != "simulated" ] || \
         [ "${OXID_UI_PROFILE:-user}" != "user" ] || \
         [ "${OXID_MOBILE_PRESENTATION_PROVING:-unavailable}" != "unavailable" ]; then
-        echo "OXID_MOBILE_PORTAL_PROFILE=preview requires the isolated native user profile." >&2
+        echo "OXID_MOBILE_PORTAL_PROFILE=$portal_profile requires the isolated native user profile." >&2
         exit 1
       fi
-      trust_digest="${OXID_BUILD_PREVIEW_TRUST_ROOT_SHA256:-}"
-      signed_profile_digest="${OXID_BUILD_PREVIEW_SIGNED_PROFILE_SHA256:-}"
-      if ! validate_pinned_build_input "${OXID_BUILD_PREVIEW_TRUST_ROOT_PATH:-}" "$trust_digest" || \
-        ! validate_pinned_build_input "${OXID_BUILD_PREVIEW_SIGNED_PROFILE_PATH:-}" "$signed_profile_digest"; then
-        echo "The signed Preview deployment profile or trust root path or digest is invalid." >&2
+      public_prefix="OXID_BUILD_$(printf '%s' "$portal_profile" | tr '[:lower:]' '[:upper:]')"
+      trust_path_name="${public_prefix}_TRUST_ROOT_PATH"
+      trust_digest_name="${public_prefix}_TRUST_ROOT_SHA256"
+      profile_path_name="${public_prefix}_SIGNED_PROFILE_PATH"
+      profile_digest_name="${public_prefix}_SIGNED_PROFILE_SHA256"
+      trust_digest="${!trust_digest_name:-}"
+      signed_profile_digest="${!profile_digest_name:-}"
+      if ! validate_pinned_build_input "${!trust_path_name:-}" "$trust_digest" || \
+        ! validate_pinned_build_input "${!profile_path_name:-}" "$signed_profile_digest"; then
+        echo "The signed $portal_profile deployment profile or trust root path or digest is invalid." >&2
         exit 1
       fi
-      preview_artifact_binding="|preview=$signed_profile_digest/$trust_digest/$portal_manifest_sha256"
-      mobile_features="preview-portal"
+      public_portal_artifact_binding="|$portal_profile=$signed_profile_digest/$trust_digest/$portal_manifest_sha256"
+      mobile_features="$portal_profile-portal"
     fi
     ;;
   *)
-    echo "OXID_MOBILE_PORTAL_PROFILE must be 'unavailable', 'local', or 'preview' for iOS Simulator." >&2
+    echo "OXID_MOBILE_PORTAL_PROFILE must be 'unavailable', 'local', 'preview', or 'preprod' for iOS Simulator." >&2
     exit 1
     ;;
 esac
@@ -293,7 +298,7 @@ fi
 
 app_bundle="$repository_root/target/dx/oxid-app/debug/ios/OxidApp.app"
 artifact_receipt="$repository_root/target/dx/oxid-app/debug/ios/oxid-app-artifact-receipt.json"
-artifact_configuration="$mobile_features|ui=$ui_profile|custody=$mobile_custody|network=$standalone_network_profile|tailnet=$tailnet_artifact_binding|portal=$portal_profile|proving=$mobile_presentation_proving$preview_artifact_binding"
+artifact_configuration="$mobile_features|ui=$ui_profile|custody=$mobile_custody|network=$standalone_network_profile|tailnet=$tailnet_artifact_binding|portal=$portal_profile|proving=$mobile_presentation_proving$public_portal_artifact_binding"
 
 artifact_verified=0
 if [ "$operation" = "ensure" ]; then

@@ -42,7 +42,9 @@ pub(super) fn compose_authenticated_public_portal(
     deployment: AuthenticatedProductionDeployment,
     portal: PortalIdentityConfiguration,
 ) -> Result<ApplicationServices, CompositionError> {
-    let network = MidnightNetwork::Preview;
+    let network = MidnightNetwork::parse(deployment.profile.midnight().network_id())
+        .filter(|network| matches!(network, MidnightNetwork::Preview | MidnightNetwork::Preprod))
+        .ok_or(CompositionError::InvalidMidnightProfile)?;
     let PortalIdentityConfiguration {
         client_factory,
         issuer_resolver,

@@ -863,41 +863,7 @@ async fn indexer_snapshot(
             .and_then(|cursor| i64::try_from(cursor).ok())
             .ok_or(IndexerTransportError::InvalidData)
     })?;
-    ensure_tls_provider()?;
-    let request = route
-        .graphql_request()
-        .map_err(|_| IndexerTransportError::Connect)?;
-    let mut config = WebSocketConfig::default();
-    config.max_message_size = Some(MAX_MESSAGE_BYTES);
-    config.max_frame_size = Some(MAX_FRAME_BYTES);
-    let endpoint_url = Url::parse(route.endpoint()).map_err(|_| IndexerTransportError::Connect)?;
-    let connector =
-        websocket_connector_for(&endpoint_url).map_err(|_| IndexerTransportError::Connect)?;
-    let (mut socket, response) = timeout(
-        CONNECT_TIMEOUT,
-        tokio_tungstenite::connect_async_tls_with_config(request, Some(config), false, connector),
-    )
-    .await
-    .map_err(|_| IndexerTransportError::Timeout)?
-    .map_err(|_| IndexerTransportError::Connect)?;
-    if response
-        .headers()
-        .get("Sec-WebSocket-Protocol")
-        .and_then(|value| value.to_str().ok())
-        != Some("graphql-transport-ws")
-    {
-        return Err(IndexerTransportError::Protocol);
-    }
-
-    socket
-        .send(Message::Text(
-            json!({ "type": "connection_init", "payload": {} })
-                .to_string()
-                .into(),
-        ))
-        .await
-        .map_err(|_| IndexerTransportError::Protocol)?;
-    wait_for_ack(&mut socket).await?;
+    let mut socket = connect_graphql_indexer(route).await?;
 
     socket
         .send(Message::Text(
@@ -979,6 +945,58 @@ async fn indexer_snapshot(
         .await;
     let _ = socket.close(None).await;
     accumulator.finish()
+}
+
+type GraphqlIndexerSocket =
+    tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
+
+async fn connect_graphql_indexer(
+    route: MidnightTransportRoute<'_>,
+) -> Result<GraphqlIndexerSocket, IndexerTransportError> {
+    ensure_tls_provider()?;
+    let request = route
+        .graphql_request()
+        .map_err(|_| IndexerTransportError::Connect)?;
+    let mut config = WebSocketConfig::default();
+    config.max_message_size = Some(MAX_MESSAGE_BYTES);
+    config.max_frame_size = Some(MAX_FRAME_BYTES);
+    let endpoint_url = Url::parse(route.endpoint()).map_err(|_| IndexerTransportError::Connect)?;
+    let connector =
+        websocket_connector_for(&endpoint_url).map_err(|_| IndexerTransportError::Connect)?;
+    let (mut socket, response) = timeout(
+        CONNECT_TIMEOUT,
+        tokio_tungstenite::connect_async_tls_with_config(request, Some(config), false, connector),
+    )
+    .await
+    .map_err(|_| IndexerTransportError::Timeout)?
+    .map_err(|_| IndexerTransportError::Connect)?;
+    if response
+        .headers()
+        .get("Sec-WebSocket-Protocol")
+        .and_then(|value| value.to_str().ok())
+        != Some("graphql-transport-ws")
+    {
+        return Err(IndexerTransportError::Protocol);
+    }
+
+    socket
+        .send(Message::Text(
+            json!({ "type": "connection_init", "payload": {} })
+                .to_string()
+                .into(),
+        ))
+        .await
+        .map_err(|_| IndexerTransportError::Protocol)?;
+    wait_for_ack(&mut socket).await?;
+    Ok(socket)
+}
+
+pub(crate) async fn verify_graphql_transport(
+    route: MidnightTransportRoute<'_>,
+) -> Result<(), IndexerTransportError> {
+    let mut socket = connect_graphql_indexer(route).await?;
+    let _ = timeout(CONNECT_TIMEOUT, socket.close(None)).await;
+    Ok(())
 }
 
 fn ensure_tls_provider() -> Result<(), IndexerTransportError> {

@@ -268,6 +268,7 @@ impl MidnightStandaloneConfig {
         preflight_blockfrost_preprod(
             self.node_websocket_url(),
             self.indexer_http_url(),
+            self.indexer().websocket_url(),
             genesis_hash,
             credential,
         )

@@ -75,6 +75,8 @@ mod public_portal;
     any(target_os = "ios", target_os = "android")
 ))]
 pub use preview_startup::compose_embedded_preview_portal;
+#[cfg(all(feature = "preprod-portal", target_os = "ios"))]
+pub use preview_startup::{begin_preprod_project_id_setup, compose_embedded_preprod_portal};
 
 #[cfg(test)]
 #[path = "profile_production/tests.rs"]
@@ -154,12 +156,15 @@ pub(super) fn public_portal_state_root(
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ProductionDeploymentCompositionError {
     InvalidMidnightProfile,
-    InvalidPreviewTrustPolicy,
-    InvalidSignedPreviewProfile,
-    PreviewStartupRuntimeUnavailable,
+    InvalidPublicPortalTrustPolicy,
+    InvalidSignedPublicPortalProfile,
+    PublicPortalRuntimeUnavailable,
     ChainIdentityUnavailable,
     ChainIdentityMismatch,
+    PreprodCredentialRequired,
+    PreprodCredentialUnavailable,
     PreprodIndexerUnavailable,
+    PreprodIndexerWebsocketUnavailable,
     PreprodChainViewMismatch,
     InvalidSsiProfile,
     PlatformStorageUnavailable,
@@ -171,16 +176,29 @@ impl fmt::Display for ProductionDeploymentCompositionError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str(match self {
             Self::InvalidMidnightProfile => "authenticated Midnight deployment profile is invalid",
-            Self::InvalidPreviewTrustPolicy => "embedded Preview trust policy is invalid",
-            Self::InvalidSignedPreviewProfile => "embedded signed Preview profile was rejected",
-            Self::PreviewStartupRuntimeUnavailable => "Preview startup runtime is unavailable",
+            Self::InvalidPublicPortalTrustPolicy => {
+                "embedded public Portal trust policy is invalid"
+            }
+            Self::InvalidSignedPublicPortalProfile => {
+                "embedded signed public Portal profile was rejected"
+            }
+            Self::PublicPortalRuntimeUnavailable => "public Portal startup runtime is unavailable",
             Self::ChainIdentityUnavailable => {
                 "authenticated Midnight chain identity is unavailable"
             }
             Self::ChainIdentityMismatch => {
                 "authenticated Midnight chain identity does not match the node"
             }
+            Self::PreprodCredentialRequired => {
+                "PreProd network access needs a Blockfrost project ID"
+            }
+            Self::PreprodCredentialUnavailable => {
+                "PreProd network access could not be read from the device"
+            }
             Self::PreprodIndexerUnavailable => "authenticated PreProd indexer is unavailable",
+            Self::PreprodIndexerWebsocketUnavailable => {
+                "authenticated PreProd GraphQL WebSocket is unavailable"
+            }
             Self::PreprodChainViewMismatch => {
                 "PreProd node and indexer disagree on the indexed block"
             }
@@ -256,6 +274,9 @@ pub async fn authenticate_preprod_deployment(
             }
             MidnightPreprodPreflightError::IndexerUnavailable => {
                 ProductionDeploymentCompositionError::PreprodIndexerUnavailable
+            }
+            MidnightPreprodPreflightError::IndexerWebsocketUnavailable => {
+                ProductionDeploymentCompositionError::PreprodIndexerWebsocketUnavailable
             }
             MidnightPreprodPreflightError::ChainViewMismatch => {
                 ProductionDeploymentCompositionError::PreprodChainViewMismatch

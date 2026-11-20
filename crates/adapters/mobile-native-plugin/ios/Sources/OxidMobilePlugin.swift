@@ -114,6 +114,48 @@ public final class OxidMobilePlugin: NSObject {
         CustodyCoordinator.shared.lockControl(profileId: profileId)
     }
 
+    @objc public func readPreprodProjectId() -> String {
+        PreprodAccess.read()
+    }
+
+    @objc public func beginPreprodProjectIdSetup() -> String {
+        onMain {
+            guard let presenter = Self.topViewController(),
+                  !(presenter is UIAlertController) else { return "unavailable" }
+            let prompt = UIAlertController(
+                title: "PreProd network access",
+                message: "Enter the Blockfrost project ID for Midnight PreProd.",
+                preferredStyle: .alert
+            )
+            prompt.addTextField { field in
+                field.isSecureTextEntry = true
+                field.autocorrectionType = .no
+                field.autocapitalizationType = .none
+                field.spellCheckingType = .no
+                field.accessibilityIdentifier = "preprod-project-id"
+            }
+            prompt.addAction(UIAlertAction(title: "Cancel", style: .cancel))
+            prompt.addAction(UIAlertAction(title: "Save", style: .default) { [weak prompt] _ in
+                let field = prompt?.textFields?.first
+                let saved = PreprodAccess.store(field?.text ?? "")
+                field?.text = nil
+                guard !saved else { return }
+                DispatchQueue.main.async {
+                    guard let statusPresenter = Self.topViewController() else { return }
+                    let status = UIAlertController(
+                        title: "PreProd access could not be saved",
+                        message: "Check the project ID and try again.",
+                        preferredStyle: .alert
+                    )
+                    status.addAction(UIAlertAction(title: "OK", style: .default))
+                    statusPresenter.present(status, animated: true)
+                }
+            })
+            presenter.present(prompt, animated: true)
+            return "presented"
+        }
+    }
+
     private func onMain(_ operation: @escaping () -> String) -> String {
         if Thread.isMainThread { return operation() }
         return DispatchQueue.main.sync(execute: operation)
@@ -127,6 +169,52 @@ public final class OxidMobilePlugin: NSObject {
         var current = root
         while let presented = current?.presentedViewController { current = presented }
         return current
+    }
+}
+
+private enum PreprodAccess {
+    private static let query: [CFString: Any] = [
+        kSecClass: kSecClassGenericPassword,
+        kSecAttrService: "io.medianox.oxid.blockfrost",
+        kSecAttrAccount: "preprod",
+        kSecAttrSynchronizable: false
+    ]
+
+    private static func isValid(_ projectId: String) -> Bool {
+        projectId.hasPrefix("nightpreprod") && (20...128).contains(projectId.utf8.count)
+            && projectId.utf8.allSatisfy { byte in
+                (48...57).contains(byte) || (65...90).contains(byte) || (97...122).contains(byte)
+            }
+    }
+
+    static func read() -> String {
+        var readQuery = query
+        readQuery[kSecReturnData] = true
+        readQuery[kSecMatchLimit] = kSecMatchLimitOne
+        let status: OSStatus
+        var result: CFTypeRef?
+        status = SecItemCopyMatching(readQuery as CFDictionary, &result)
+        if status == errSecItemNotFound { return "" }
+        guard status == errSecSuccess,
+              let value = result as? Data,
+              let projectId = String(data: value, encoding: .utf8),
+              isValid(projectId) else { return "unavailable" }
+        return projectId
+    }
+
+    static func store(_ projectId: String) -> Bool {
+        guard isValid(projectId) else { return false }
+        var value = Data(projectId.utf8)
+        defer { value.resetBytes(in: 0..<value.count) }
+        let changes: [CFString: Any] = [
+            kSecAttrAccessible: kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly,
+            kSecValueData: value
+        ]
+        let status = SecItemUpdate(query as CFDictionary, changes as CFDictionary)
+        if status == errSecSuccess { return true }
+        guard status == errSecItemNotFound else { return false }
+        let add = query.merging(changes) { _, new in new }
+        return SecItemAdd(add as CFDictionary, nil) == errSecSuccess
     }
 }
 

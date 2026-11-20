@@ -6502,6 +6502,7 @@ name = "oxid-app"
 version = "0.2.0"
 dependencies = [
  "dioxus",
+ "futures",
  "getrandom 0.2.17",
  "getrandom 0.4.3",
  "oxid-adapter-deployment-profile",

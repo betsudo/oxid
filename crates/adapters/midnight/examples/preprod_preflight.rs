@@ -15,6 +15,7 @@ fn main() -> ExitCode {
     match run() {
         Ok(height) => {
             println!("PreProd node and indexer agree at height {height}");
+            println!("PreProd GraphQL WebSocket acknowledged the authenticated session");
             ExitCode::SUCCESS
         }
         Err(error) => {
@@ -60,6 +61,7 @@ fn run() -> Result<u64, Box<dyn std::error::Error>> {
     Ok(runtime.block_on(preflight_blockfrost_preprod(
         "wss://rpc.midnight-preprod.blockfrost.io",
         "https://midnight-preprod.blockfrost.io/api/v0",
+        "wss://midnight-preprod.blockfrost.io/api/v0/ws",
         &genesis,
         &credential,
     ))?)

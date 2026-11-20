@@ -16,7 +16,7 @@ use subxt::{
 };
 use tokio::time::timeout;
 
-use super::submission::fetch_identified_chain_tip;
+use super::{indexer::verify_graphql_transport, submission::fetch_identified_chain_tip};
 
 const PREFLIGHT_TIMEOUT: Duration = Duration::from_secs(15);
 pub(crate) const NODE_ROUTE: &str = "wss://rpc.midnight-preprod.blockfrost.io";
@@ -115,6 +115,7 @@ pub enum MidnightPreprodPreflightError {
     NodeUnavailable,
     GenesisMismatch,
     IndexerUnavailable,
+    IndexerWebsocketUnavailable,
     ChainViewMismatch,
 }
 
@@ -126,6 +127,9 @@ impl fmt::Display for MidnightPreprodPreflightError {
             Self::NodeUnavailable => "authenticated PreProd node is unavailable",
             Self::GenesisMismatch => "PreProd node genesis differs from the signed profile",
             Self::IndexerUnavailable => "authenticated PreProd indexer is unavailable",
+            Self::IndexerWebsocketUnavailable => {
+                "authenticated PreProd GraphQL WebSocket is unavailable"
+            }
             Self::ChainViewMismatch => "PreProd node and indexer disagree on the indexed block",
         })
     }
@@ -138,10 +142,14 @@ impl std::error::Error for MidnightPreprodPreflightError {}
 pub async fn preflight_blockfrost_preprod(
     node_url: &str,
     indexer_url: &str,
+    indexer_websocket_url: &str,
     genesis_hash: &[u8; 32],
     credential: &MidnightPreprodCredential,
 ) -> Result<u64, MidnightPreprodPreflightError> {
-    if !is_preprod_node_route(node_url) || indexer_url != INDEXER_ROUTE {
+    if !is_preprod_node_route(node_url)
+        || indexer_url != INDEXER_ROUTE
+        || indexer_websocket_url != INDEXER_SOCKET_ROUTE
+    {
         return Err(MidnightPreprodPreflightError::InvalidRoute);
     }
     let client = timeout(
@@ -178,6 +186,12 @@ pub async fn preflight_blockfrost_preprod(
     if node_hash != Some(indexed_hash) {
         return Err(MidnightPreprodPreflightError::ChainViewMismatch);
     }
+    verify_graphql_transport(MidnightTransportRoute::new(
+        indexer_websocket_url,
+        Some(credential),
+    ))
+    .await
+    .map_err(|_| MidnightPreprodPreflightError::IndexerWebsocketUnavailable)?;
     Ok(height)
 }
 
@@ -267,6 +281,7 @@ mod tests {
                 futures::executor::block_on(preflight_blockfrost_preprod(
                     node,
                     indexer,
+                    INDEXER_SOCKET_ROUTE,
                     &[0; 32],
                     &credential,
                 )),

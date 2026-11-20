@@ -84,6 +84,25 @@ of the HTTP indexer tip at the same node height. Its receipt contains a public
 height or a bounded failure category. The mobile PreProd startup and Portal
 issuance require their own qualification.
 
+## Build and provision the isolated PreProd iOS profile
+
+Use independently reviewed PreProd signed inputs. Export the PreProd trust
+root and signed profile paths and SHA-256 pins using the
+`OXID_BUILD_PREPROD_TRUST_ROOT_*` and `OXID_BUILD_PREPROD_SIGNED_PROFILE_*`
+settings. Pin the Portal deployment manifest the same way as Preview.
+
+```bash
+OXID_MOBILE_CUSTODY=native OXID_MOBILE_PORTAL_PROFILE=preprod   ./bootstrap.sh -- bash scripts/run-ios-simulator.sh build
+```
+
+On first launch, choose **Enter project ID** and save the PreProd credential
+in the native secure field. Tap **Retry connection** after saving. The
+credential is stored in a device-only Keychain item and stays outside the
+app build, the wallet profile, and the UI's state. Startup checks signed
+inputs before accessing the credential. The background startup worker
+requires the node genesis, the indexed block hash, and the GraphQL
+WebSocket acknowledgement to agree with the configured routes.
+
 ## Qualify the public app
 
 Use protected native custody. On the receipt-owned simulator, fund the fresh

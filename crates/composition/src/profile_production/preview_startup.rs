@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 
-//! Startup for the separately selected Preview Portal mobile build.
+//! Signed-input admission and startup for public Portal mobile builds.
 
 #[cfg(any(target_os = "ios", target_os = "android"))]
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -16,20 +16,21 @@ use crate::portal::PortalIdentityConfiguration;
 
 const APP_AUDIENCE: &str = "io.medianox.oxid";
 
-fn admit_preview_inputs(
+fn admit_public_inputs(
     reviewed_trust_root: &[u8],
     signed_profile: &[u8],
     portal_manifest: &[u8],
     now: u64,
+    expected_network: &str,
 ) -> Result<(AuthenticatedDeploymentProfile, PortalIdentityConfiguration), StartupError> {
     let root = DeploymentTrustRoot::from_reviewed_json(reviewed_trust_root)
-        .map_err(|_| StartupError::InvalidPreviewTrustPolicy)?;
+        .map_err(|_| StartupError::InvalidPublicPortalTrustPolicy)?;
     let verifier = DeploymentProfileVerifier::new(APP_AUDIENCE, [root], 1)
-        .map_err(|_| StartupError::InvalidPreviewTrustPolicy)?;
+        .map_err(|_| StartupError::InvalidPublicPortalTrustPolicy)?;
     let profile = verifier
         .verify(signed_profile, now)
-        .map_err(|_| StartupError::InvalidSignedPreviewProfile)?;
-    if profile.midnight().network_id() != "preview" {
+        .map_err(|_| StartupError::InvalidSignedPublicPortalProfile)?;
+    if profile.midnight().network_id() != expected_network {
         return Err(StartupError::InvalidMidnightProfile);
     }
     let manifest = authenticate_public_portal_manifest(&profile, portal_manifest)?;
@@ -48,16 +49,60 @@ pub fn compose_embedded_preview_portal(
 ) -> Result<crate::services::ApplicationServices, StartupError> {
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .map_err(|_| StartupError::InvalidSignedPreviewProfile)?
+        .map_err(|_| StartupError::InvalidSignedPublicPortalProfile)?
         .as_secs();
-    let (profile, portal) =
-        admit_preview_inputs(reviewed_trust_root, signed_profile, portal_manifest, now)?;
+    let (profile, portal) = admit_public_inputs(
+        reviewed_trust_root,
+        signed_profile,
+        portal_manifest,
+        now,
+        "preview",
+    )?;
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
-        .map_err(|_| StartupError::PreviewStartupRuntimeUnavailable)?;
+        .map_err(|_| StartupError::PublicPortalRuntimeUnavailable)?;
     let deployment = runtime.block_on(super::authenticate_production_deployment(profile))?;
     super::public_portal::compose_authenticated_public_portal(deployment, portal)
+}
+
+/// Startup for a signed PreProd Portal profile and its device-local access credential.
+#[cfg(all(feature = "preprod-portal", target_os = "ios"))]
+pub fn compose_embedded_preprod_portal(
+    reviewed_trust_root: &[u8],
+    signed_profile: &[u8],
+    portal_manifest: &[u8],
+) -> Result<crate::services::ApplicationServices, StartupError> {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|_| StartupError::InvalidSignedPublicPortalProfile)?
+        .as_secs();
+    let (profile, portal) = admit_public_inputs(
+        reviewed_trust_root,
+        signed_profile,
+        portal_manifest,
+        now,
+        "preprod",
+    )?;
+    let mut secret = oxid_adapter_mobile_native::read_preprod_project_id()
+        .map_err(|_| StartupError::PreprodCredentialUnavailable)?
+        .ok_or(StartupError::PreprodCredentialRequired)?;
+    let credential =
+        oxid_adapter_midnight::MidnightPreprodCredential::new(std::mem::take(&mut *secret))
+            .map_err(|_| StartupError::PreprodCredentialUnavailable)?;
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|_| StartupError::PublicPortalRuntimeUnavailable)?;
+    let deployment =
+        runtime.block_on(super::authenticate_preprod_deployment(profile, credential))?;
+    super::public_portal::compose_authenticated_public_portal(deployment, portal)
+}
+
+#[cfg(all(feature = "preprod-portal", target_os = "ios"))]
+pub fn begin_preprod_project_id_setup() -> Result<(), StartupError> {
+    oxid_adapter_mobile_native::begin_preprod_project_id_setup()
+        .map_err(|_| StartupError::PreprodCredentialUnavailable)
 }
 
 #[cfg(test)]
@@ -73,8 +118,8 @@ mod tests {
 
     #[test]
     fn preview_startup_admits_reviewed_deployment_before_live_authentication() {
-        let (profile, portal) =
-            admit_preview_inputs(TRUST, PROFILE, MANIFEST, NOW).expect("valid signed inputs");
+        let (profile, portal) = admit_public_inputs(TRUST, PROFILE, MANIFEST, NOW, "preview")
+            .expect("valid signed inputs");
         assert_eq!(profile.midnight().network_id(), "preview");
         assert!(portal.client_factory.deployment().is_public_network());
         assert!(portal.test_ingress.is_none());
@@ -82,9 +127,25 @@ mod tests {
     }
 
     #[test]
+    fn preprod_startup_binds_the_preprod_manifest_and_rejects_preview() {
+        let trust = include_bytes!("../../tests/fixtures/preprod-portal/trust-root.json");
+        let profile = include_bytes!("../../tests/fixtures/preprod-portal/profile.json");
+        let manifest = include_bytes!("../../tests/fixtures/preprod-portal/portal.json");
+        let (profile, portal) = admit_public_inputs(trust, profile, manifest, NOW, "preprod")
+            .expect("reviewed PreProd fixture");
+        assert_eq!(profile.midnight().network_id(), "preprod");
+        assert!(portal.client_factory.deployment().is_public_network());
+        assert!(portal.test_ingress.is_none());
+        assert_eq!(
+            admit_public_inputs(TRUST, PROFILE, MANIFEST, NOW, "preprod").err(),
+            Some(StartupError::InvalidMidnightProfile),
+        );
+    }
+
+    #[test]
     fn preview_startup_rejects_wrong_network_expiry_and_changed_inputs() {
         let check = |trust: &[u8], profile: &[u8], manifest: &[u8], now| {
-            admit_preview_inputs(trust, profile, manifest, now).err()
+            admit_public_inputs(trust, profile, manifest, now, "preview").err()
         };
         assert_eq!(
             check(TRUST, WRONG_NETWORK, MANIFEST, NOW),
@@ -92,7 +153,7 @@ mod tests {
         );
         assert_eq!(
             check(TRUST, PROFILE, MANIFEST, 1_900_000_000),
-            Some(StartupError::InvalidSignedPreviewProfile)
+            Some(StartupError::InvalidSignedPublicPortalProfile)
         );
         let trust = std::str::from_utf8(TRUST).unwrap();
         let rolled_back = trust.replace(
@@ -101,11 +162,11 @@ mod tests {
         );
         assert_eq!(
             check(rolled_back.as_bytes(), PROFILE, MANIFEST, NOW),
-            Some(StartupError::InvalidSignedPreviewProfile)
+            Some(StartupError::InvalidSignedPublicPortalProfile)
         );
         assert_eq!(
             check(b"{}", PROFILE, MANIFEST, NOW),
-            Some(StartupError::InvalidPreviewTrustPolicy)
+            Some(StartupError::InvalidPublicPortalTrustPolicy)
         );
         assert_eq!(
             check(TRUST, PROFILE, b"{}", NOW),

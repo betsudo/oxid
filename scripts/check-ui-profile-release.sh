@@ -176,6 +176,8 @@ assert_public_fixture_feature_absent \
 assert_public_fixture_feature_absent \
   "iOS Preview Portal" "preview-portal" "aarch64-apple-ios"
 assert_public_fixture_feature_absent \
+  "iOS PreProd Portal" "preprod-portal" "aarch64-apple-ios"
+assert_public_fixture_feature_absent \
   "iOS native mobile" "mobile,standalone-native-custody" "aarch64-apple-ios"
 assert_public_fixture_feature_absent \
   "Android native mobile" "mobile,standalone-native-custody" "aarch64-linux-android"
