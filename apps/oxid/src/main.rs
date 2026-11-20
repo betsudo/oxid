@@ -5,8 +5,8 @@
 #[cfg(test)]
 mod portal_profile_authority;
 
-#[cfg(all(feature = "preprod-portal", target_os = "ios"))]
-mod preprod_startup;
+#[cfg(any(feature = "preview-portal", feature = "preprod-portal"))]
+mod public_portal_startup;
 
 mod generated_brand {
     include!(concat!(env!("OUT_DIR"), "/brand.rs"));
@@ -38,8 +38,7 @@ fn developer_pager_viewport() -> (f64, f64) {
 #[cfg(any(
     feature = "standalone-portal",
     feature = "standalone-portal-tailnet",
-    feature = "preprod-observation",
-    feature = "preview-portal"
+    feature = "preprod-observation"
 ))]
 fn startup_failure(error: impl std::fmt::Display) -> ! {
     eprintln!("Oxid startup failed: {error}");
@@ -96,12 +95,12 @@ impl oxid_ui_dioxus::WalletDustSettlementUiPort for ComposedWalletDustSettlement
     }
 }
 
-#[cfg(all(feature = "preprod-portal", target_os = "ios"))]
+#[cfg(any(feature = "preview-portal", feature = "preprod-portal"))]
 fn main() {
-    preprod_startup::launch();
+    public_portal_startup::launch();
 }
 
-#[cfg(not(feature = "preprod-portal"))]
+#[cfg(not(any(feature = "preview-portal", feature = "preprod-portal")))]
 fn main() {
     #[cfg(all(feature = "developer-proof-benchmark", target_arch = "wasm32"))]
     compile_error!("developer-proof-benchmark is available only on native targets");
@@ -352,16 +351,6 @@ fn main() {
                 panic!("embedded Compact presentation runtime is invalid: {error}")
             });
     #[cfg(all(
-        feature = "preview-portal",
-        any(target_os = "ios", target_os = "android")
-    ))]
-    let application = oxid_composition::compose_embedded_preview_portal(
-        include_bytes!(concat!(env!("OUT_DIR"), "/preview-trust-root.json")),
-        include_bytes!(concat!(env!("OUT_DIR"), "/preview-signed-profile.json")),
-        include_bytes!(concat!(env!("OUT_DIR"), "/portal-deployment.json")),
-    )
-    .unwrap_or_else(|error| startup_failure(error));
-    #[cfg(all(
         feature = "preprod-observation",
         any(target_os = "ios", target_os = "android")
     ))]
@@ -448,8 +437,7 @@ fn main() {
     #[cfg(not(any(
         feature = "standalone-development",
         feature = "standalone-native-custody",
-        feature = "preprod-observation",
-        feature = "preview-portal"
+        feature = "preprod-observation"
     )))]
     let application = oxid_composition::compose();
     let ui = wallet_ui(&application);

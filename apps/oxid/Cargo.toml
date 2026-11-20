@@ -107,6 +107,7 @@ preprod-observation = [
 # Explicit signed Preview issuer profile with protected platform custody.
 preview-portal = [
   "mobile",
+  "dep:futures",
   "dep:oxid-adapter-deployment-profile",
   "oxid-composition/public-portal",
 ]

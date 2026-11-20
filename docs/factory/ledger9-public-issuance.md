@@ -59,6 +59,10 @@ The build verifies the signed profile with the independent trust root and
 requires its Portal digest to match. The artifact receipt binds all three
 digests. Startup rechecks signature and time validity, admits the exact
 HTTPS Portal configuration and issuer key, then authenticates node genesis.
+If the node cannot be reached, the app stays on **Preview access**. Use
+**Retry connection** after restoring connectivity. The wallet remains gated
+until the signed deployment passes startup checks.
+
 The Preview feature selects platform custody, native DID deployment, strict
 Portal issuance, and the normal camera and link adapters. Wallet profiles,
 checkpoints, DID records, encrypted credentials, and recovery journals are
