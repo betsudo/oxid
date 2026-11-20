@@ -1,0 +1,9 @@
+subscription DustLedgerEvents($id: Int) {
+  dustLedgerEvents(id: $id) {
+    __typename
+    id
+    maxId
+    protocolVersion
+    raw
+  }
+}

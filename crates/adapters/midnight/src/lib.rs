@@ -9,9 +9,13 @@ mod dust_checkpoint;
 #[cfg(not(target_arch = "wasm32"))]
 mod dust_registration;
 #[cfg(not(target_arch = "wasm32"))]
+mod dust_replay;
+#[cfg(not(target_arch = "wasm32"))]
 mod dust_sync;
 #[cfg(not(target_arch = "wasm32"))]
 mod indexer;
+#[cfg(all(test, not(target_arch = "wasm32"), feature = "mixed-era-replay"))]
+mod legacy_replay_compatibility;
 #[cfg(not(target_arch = "wasm32"))]
 mod local_proving;
 #[cfg(not(target_arch = "wasm32"))]
@@ -19,9 +23,13 @@ mod preprod_transport;
 #[cfg(all(not(target_arch = "wasm32"), feature = "proving-bench"))]
 mod proof_benchmark;
 #[cfg(not(target_arch = "wasm32"))]
+mod replay_era;
+#[cfg(not(target_arch = "wasm32"))]
 mod shielded;
 #[cfg(not(target_arch = "wasm32"))]
 mod shielded_checkpoint;
+#[cfg(not(target_arch = "wasm32"))]
+mod shielded_replay;
 #[cfg(not(target_arch = "wasm32"))]
 mod shielded_sync;
 #[cfg(not(target_arch = "wasm32"))]

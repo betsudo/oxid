@@ -146,6 +146,9 @@ impl MidnightIndexerConfig {
 
     pub(crate) fn websocket_route(&self) -> MidnightTransportRoute<'_> {
         MidnightTransportRoute::new(self.websocket_url(), self.preprod_credential.as_deref())
+            .with_mixed_eras(crate::replay_era::has_mixed_history(
+                self.network_id.as_str(),
+            ))
     }
 
     #[cfg(test)]

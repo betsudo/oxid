@@ -14,19 +14,22 @@ use std::{
 };
 
 use midnight_serialize::Serializable as _;
-use midnight_storage::DefaultDB;
-use midnight_zswap::{keys::SecretKeys, local::State as ZswapState};
+use midnight_zswap::keys::SecretKeys;
 use oxid_foundation::UnixTimestampMillis;
 use oxid_wallet_domain::ChainNetworkId;
 use sha2::{Digest as _, Sha256};
 
-use crate::shielded::project_zswap_state;
+use crate::{
+    replay_era::{LedgerEra, has_mixed_history},
+    shielded::project_zswap_state,
+    shielded_replay::ShieldedReplayState,
+};
 
 const MAGIC: &[u8; 8] = b"OXIDZSWP";
-const SCHEMA_VERSION: u32 = 1;
+const SCHEMA_VERSION: u32 = 2;
 const MAX_RECORDS: usize = 4;
 const MAX_NETWORK_BYTES: usize = 64;
-const MAX_STATE_BYTES: usize = 32 * 1024 * 1024;
+pub(crate) const MAX_STATE_BYTES: usize = 32 * 1024 * 1024;
 const MAX_FILE_BYTES: u64 = 128 * 1024 * 1024;
 const CHECKSUM_BYTES: usize = 32;
 static TEMPORARY_FILE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
@@ -77,7 +80,7 @@ pub(crate) struct StoredShieldedCheckpoint {
     pub(crate) current_cursor: u64,
     pub(crate) target_cursor: u64,
     pub(crate) updated_at: UnixTimestampMillis,
-    pub(crate) state: ZswapState<DefaultDB>,
+    pub(crate) state: ShieldedReplayState,
 }
 
 pub(crate) trait MidnightShieldedCheckpointStore: Send + Sync {
@@ -273,6 +276,14 @@ impl MidnightShieldedCheckpointStore for BinaryMidnightShieldedCheckpointStore {
                 && record.key_fingerprint == replacement.key_fingerprint
                 && record.source_fingerprint == replacement.source_fingerprint
         }) {
+            // A foreground operation and the background worker can finish
+            // out of order. Do not replace a better public replay boundary.
+            if has_mixed_history(&replacement.network_id)
+                && (record.current_cursor > replacement.current_cursor
+                    || (record.state.current().is_some() && replacement.state.current().is_none()))
+            {
+                return Ok(());
+            }
             *record = replacement;
         } else {
             if records.len() >= MAX_RECORDS {
@@ -303,7 +314,7 @@ struct ShieldedCheckpointRecord {
     current_cursor: u64,
     target_cursor: u64,
     updated_at_millis: u64,
-    state: ZswapState<DefaultDB>,
+    state: ShieldedReplayState,
 }
 
 fn encode_document(
@@ -331,9 +342,11 @@ fn encode_document(
         bytes.extend_from_slice(&record.current_cursor.to_be_bytes());
         bytes.extend_from_slice(&record.target_cursor.to_be_bytes());
         bytes.extend_from_slice(&record.updated_at_millis.to_be_bytes());
-        let mut state = Vec::new();
-        midnight_serialize::tagged_serialize(&record.state, &mut state)
-            .map_err(|_| ShieldedCheckpointStoreError::InvalidData)?;
+        let (era, state) = encode_state(&record.state)?;
+        bytes.push(match era {
+            LedgerEra::V8 => 8,
+            LedgerEra::V9 => 9,
+        });
         if state.is_empty() || state.len() > MAX_STATE_BYTES {
             return Err(ShieldedCheckpointStoreError::InvalidData);
         }
@@ -371,7 +384,8 @@ fn decode_document(
     reader
         .read_exact(&mut magic)
         .map_err(|_| ShieldedCheckpointStoreError::InvalidData)?;
-    if &magic != MAGIC || read_u32(&mut reader)? != SCHEMA_VERSION {
+    let version = read_u32(&mut reader)?;
+    if &magic != MAGIC || !matches!(version, 1 | SCHEMA_VERSION) {
         return Err(ShieldedCheckpointStoreError::InvalidData);
     }
     let count = usize::try_from(read_u32(&mut reader)?)
@@ -396,6 +410,15 @@ fn decode_document(
         let current_cursor = read_u64(&mut reader)?;
         let target_cursor = read_u64(&mut reader)?;
         let updated_at_millis = read_u64(&mut reader)?;
+        let era = if version == 1 {
+            LedgerEra::V9
+        } else {
+            match read_array::<1>(&mut reader)?[0] {
+                8 => LedgerEra::V8,
+                9 => LedgerEra::V9,
+                _ => return Err(ShieldedCheckpointStoreError::InvalidData),
+            }
+        };
         let state_len = usize::try_from(read_u32(&mut reader)?)
             .map_err(|_| ShieldedCheckpointStoreError::InvalidData)?;
         if state_len == 0 || state_len > MAX_STATE_BYTES {
@@ -405,8 +428,7 @@ fn decode_document(
         reader
             .read_exact(&mut state_bytes)
             .map_err(|_| ShieldedCheckpointStoreError::InvalidData)?;
-        let state = midnight_serialize::tagged_deserialize(&state_bytes[..])
-            .map_err(|_| ShieldedCheckpointStoreError::InvalidData)?;
+        let state = decode_state(era, &state_bytes)?;
         records.push(ShieldedCheckpointRecord {
             network_id,
             key_fingerprint,
@@ -426,6 +448,44 @@ fn decode_document(
     Ok(records)
 }
 
+fn encode_state(
+    state: &ShieldedReplayState,
+) -> Result<(LedgerEra, Vec<u8>), ShieldedCheckpointStoreError> {
+    let mut bytes = Vec::new();
+    let era = match state {
+        ShieldedReplayState::Current(state) => {
+            midnight_serialize::tagged_serialize(state, &mut bytes)
+                .map_err(|_| ShieldedCheckpointStoreError::InvalidData)?;
+            LedgerEra::V9
+        }
+        #[cfg(feature = "mixed-era-replay")]
+        ShieldedReplayState::Legacy(state) => {
+            midnight_legacy_serialize::tagged_serialize(state, &mut bytes)
+                .map_err(|_| ShieldedCheckpointStoreError::InvalidData)?;
+            LedgerEra::V8
+        }
+    };
+    Ok((era, bytes))
+}
+
+fn decode_state(
+    era: LedgerEra,
+    bytes: &[u8],
+) -> Result<ShieldedReplayState, ShieldedCheckpointStoreError> {
+    let invalid = |_| ShieldedCheckpointStoreError::InvalidData;
+    match era {
+        LedgerEra::V9 => midnight_serialize::tagged_deserialize(bytes)
+            .map(ShieldedReplayState::Current)
+            .map_err(invalid),
+        #[cfg(feature = "mixed-era-replay")]
+        LedgerEra::V8 => midnight_legacy_serialize::tagged_deserialize(bytes)
+            .map(ShieldedReplayState::Legacy)
+            .map_err(invalid),
+        #[cfg(not(feature = "mixed-era-replay"))]
+        LedgerEra::V8 => Err(ShieldedCheckpointStoreError::InvalidData),
+    }
+}
+
 fn validate_records(
     records: &[ShieldedCheckpointRecord],
 ) -> Result<(), ShieldedCheckpointStoreError> {
@@ -440,13 +500,17 @@ fn validate_records(
             || crate::network_by_id(&network_id)
                 .map_err(|_| ShieldedCheckpointStoreError::InvalidData)?
                 .is_none()
+            || (record.state.current().is_none() && !has_mixed_history(&record.network_id))
             || record.current_cursor > record.target_cursor
             || !scopes.insert((
                 &record.network_id,
                 record.key_fingerprint,
                 record.source_fingerprint,
             ))
-            || project_zswap_state(&record.state).is_err()
+            || record
+                .state
+                .current()
+                .is_some_and(|state| project_zswap_state(state).is_err())
         {
             return Err(ShieldedCheckpointStoreError::InvalidData);
         }
@@ -458,7 +522,10 @@ fn validate_checkpoint(
     checkpoint: &StoredShieldedCheckpoint,
 ) -> Result<(), ShieldedCheckpointStoreError> {
     if checkpoint.current_cursor > checkpoint.target_cursor
-        || project_zswap_state(&checkpoint.state).is_err()
+        || checkpoint
+            .state
+            .current()
+            .is_some_and(|state| project_zswap_state(state).is_err())
     {
         return Err(ShieldedCheckpointStoreError::InvalidData);
     }
@@ -569,6 +636,7 @@ pub(crate) enum ShieldedCheckpointStoreError {
 
 #[cfg(test)]
 mod tests {
+    use midnight_zswap::local::State as ZswapState;
     use std::sync::atomic::{AtomicU64, Ordering};
 
     use midnight_coin_structure::coin::{Info as CoinInfo, ShieldedTokenType};
@@ -641,14 +709,12 @@ mod tests {
             current_cursor: 4,
             target_cursor,
             updated_at: UnixTimestampMillis::new(1_700_000_000_123),
-            state,
+            state: ShieldedReplayState::Current(state),
         }
     }
 
-    fn tagged_state(state: &ZswapState<DefaultDB>) -> Vec<u8> {
-        let mut bytes = Vec::new();
-        midnight_serialize::tagged_serialize(state, &mut bytes).expect("state serializes");
-        bytes
+    fn tagged_state(state: &ShieldedReplayState) -> Vec<u8> {
+        encode_state(state).expect("state serializes").1
     }
 
     #[test]

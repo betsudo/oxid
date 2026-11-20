@@ -49,6 +49,7 @@ use crate::{
     shielded_checkpoint::{
         MidnightShieldedCheckpointStore, ShieldedCheckpointStoreError, StoredShieldedCheckpoint,
     },
+    shielded_replay::ShieldedReplayKeys,
     shielded_transport::{
         ShieldedSyncProgress, ShieldedTransportError, source_fingerprint,
         synchronize_shielded_with_control,
@@ -568,7 +569,10 @@ where
 
         let path = shielded_path(request.account_index)
             .map_err(|_| WalletTransactionPortError::InvalidData)?;
-        let source = source_fingerprint(self.config.websocket_url());
+        let source = source_fingerprint(
+            self.config.websocket_url(),
+            self.config.websocket_route().mixed_eras(),
+        );
         let mut plan = None;
         self.keys
             .use_derived_secret(profile_id, &path, &mut |seed| {
@@ -585,7 +589,10 @@ where
                     return Err(WalletSecurityPortError::InvalidOperation);
                 }
                 plan = Some(build_shielded_transfer(
-                    checkpoint.state,
+                    checkpoint
+                        .state
+                        .into_current()
+                        .ok_or(WalletSecurityPortError::InvalidOperation)?,
                     &keys,
                     network_id,
                     request,
@@ -812,7 +819,9 @@ where
         return Err(ShieldedTransportError::Cancelled);
     }
     let zswap_keys = ZswapSecretKeys::from(ZswapSeed::from(*seed));
-    let source = source_fingerprint(config.websocket_url());
+    let route = config.websocket_route();
+    let keys = ShieldedReplayKeys::new(&zswap_keys, route.mixed_eras().then_some(seed));
+    let source = source_fingerprint(config.websocket_url(), route.mixed_eras());
     let latest = match checkpoints.load(&key.1, &zswap_keys, &source) {
         Ok(checkpoint) => checkpoint,
         Err(ShieldedCheckpointStoreError::InvalidData) => None,
@@ -827,7 +836,7 @@ where
             checkpoint.current_cursor,
             checkpoint.target_cursor,
             0,
-            &checkpoint.state,
+            checkpoint.state.current(),
             checkpoint.updated_at,
         )?;
         update_running_snapshot(sessions, key, cancellation, cached)?;
@@ -857,8 +866,8 @@ where
                 )
             };
             synchronize_shielded_with_control(
-                config.websocket_route(),
-                &zswap_keys,
+                route,
+                &keys,
                 latest.clone(),
                 cancellation,
                 &mut observe,
@@ -867,7 +876,7 @@ where
         };
         let synchronized = match first {
             Err(ShieldedTransportError::InvalidData)
-                if latest.is_some() && !emitted_progress.get() =>
+                if latest.is_some() && !route.mixed_eras() && !emitted_progress.get() =>
             {
                 let mut observe = |progress: &ShieldedSyncProgress| {
                     observe_progress(
@@ -881,14 +890,8 @@ where
                         progress,
                     )
                 };
-                synchronize_shielded_with_control(
-                    config.websocket_route(),
-                    &zswap_keys,
-                    None,
-                    cancellation,
-                    &mut observe,
-                )
-                .await?
+                synchronize_shielded_with_control(route, &keys, None, cancellation, &mut observe)
+                    .await?
             }
             Ok(synchronized) => synchronized,
             Err(error) => return Err(error),
@@ -906,7 +909,7 @@ where
             synchronized.target_cursor,
             u64::try_from(synchronized.events_processed)
                 .map_err(|_| ShieldedTransportError::InvalidData)?,
-            &synchronized.state,
+            Some(&synchronized.state),
             updated_at,
         )
     })
@@ -952,7 +955,7 @@ where
         progress.target_cursor,
         u64::try_from(progress.events_processed)
             .map_err(|_| ShieldedTransportError::InvalidData)?,
-        &progress.state,
+        progress.state.current(),
         updated_at,
     )?;
     update_running_snapshot(sessions, key, cancellation, status)
@@ -1094,16 +1097,19 @@ fn progress_snapshot(
     current_cursor: u64,
     target_cursor: u64,
     events_processed: u64,
-    zswap_state: &midnight_zswap::local::State<midnight_storage::DefaultDB>,
+    zswap_state: Option<&ZswapState<DefaultDB>>,
     updated_at: oxid_foundation::UnixTimestampMillis,
 ) -> Result<WalletShieldedSyncSnapshot, ShieldedTransportError> {
-    let projection =
-        project_zswap_state(zswap_state).map_err(|_| ShieldedTransportError::InvalidData)?;
+    let projection = zswap_state
+        .map(project_zswap_state)
+        .transpose()
+        .map_err(|_| ShieldedTransportError::InvalidData)?;
     let balances = projection
-        .balances
+        .as_ref()
         .into_iter()
+        .flat_map(|state| &state.balances)
         .map(|balance| {
-            WalletShieldedTokenBalance::new(balance.token_type_hex, balance.atomic_units)
+            WalletShieldedTokenBalance::new(balance.token_type_hex.clone(), balance.atomic_units)
                 .map_err(|_| ShieldedTransportError::InvalidData)
         })
         .collect::<Result<Vec<_>, _>>()?;
@@ -1113,8 +1119,8 @@ fn progress_snapshot(
         Some(current_cursor),
         Some(target_cursor),
         events_processed,
-        Some(projection.owned_note_count),
-        Some(projection.commitment_count),
+        projection.as_ref().map(|state| state.owned_note_count),
+        projection.as_ref().map(|state| state.commitment_count),
         balances,
         Some(updated_at),
     )
@@ -1498,7 +1504,7 @@ mod tests {
                 current_cursor: 0,
                 target_cursor: 0,
                 updated_at: UnixTimestampMillis::new(1_699_999_999_000),
-                state: midnight_zswap::local::State::new(),
+                state: crate::shielded_replay::ShieldedReplayState::Current(ZswapState::new()),
             })),
             saves: AtomicUsize::new(0),
         });

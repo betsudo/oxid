@@ -67,6 +67,7 @@ pub(crate) fn is_preprod_node_route(endpoint: &str) -> bool {
 pub(crate) struct MidnightTransportRoute<'a> {
     endpoint: &'a str,
     credential: Option<&'a MidnightPreprodCredential>,
+    mixed_eras: bool,
 }
 
 impl<'a> MidnightTransportRoute<'a> {
@@ -77,7 +78,17 @@ impl<'a> MidnightTransportRoute<'a> {
         Self {
             endpoint,
             credential,
+            mixed_eras: false,
         }
+    }
+
+    pub(crate) fn with_mixed_eras(mut self, mixed_eras: bool) -> Self {
+        self.mixed_eras = mixed_eras;
+        self
+    }
+
+    pub(crate) fn mixed_eras(self) -> bool {
+        self.mixed_eras
     }
 
     pub(crate) fn endpoint(self) -> &'a str {

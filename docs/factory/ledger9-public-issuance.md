@@ -115,6 +115,36 @@ The build links a simulator-only Keychain identity into the simulator
 executable. Physical iOS builds use their provisioned application identifier
 and Keychain access group. [Apple Keychain entitlement guidance](https://developer.apple.com/documentation/security/errsecmissingentitlement)
 
+## Replay wallet history across the Ledger 9 upgrade
+
+The Preview and PreProd indexers retain legacy DUST and shielded history.
+Oxid's public Portal build includes the native Ledger 8 decoder for that
+history and selects the decoder from each event's `protocolVersion`. A
+missing or invalid version, a wire-format mismatch, or a return to Ledger 8
+after Ledger 9 stops replay at the most recent durable checkpoint.
+
+The DUST cursor survives the transition. The Ledger 9 DUST tree starts empty
+and replays the new era's registrations. Shielded replay carries its
+commitment tree, owned notes, and observed outputs into Ledger 9. The wallet
+releases reservations from legacy pending spends. Checkpoints record the
+active ledger era, so a restart resumes with the correct decoder and the
+same next cursor. Historical checkpoints can report progress while live
+synchronization catches up. Transaction preparation requires a current
+Ledger 9 result.
+
+Run the bounded native regression matrix before public qualification:
+
+```bash
+./bootstrap.sh -- cargo test --locked -p oxid-adapter-midnight --lib --features mixed-era-replay
+```
+
+The transport fixtures interrupt DUST and shielded replay immediately before
+the transition, reopen their files, and reject an era regression after the
+transition. Use the signed deployment to qualify real history on Preview
+and PreProd. The standalone builds continue to use their Ledger 9 stream.
+See [Midnight's Ledger 9 upgrade notes](https://docs.midnight.network/relnotes/ledger-9#detect-the-upgrade-in-your-wallet-or-dapp)
+and [Oxid #1212](https://github.com/betsudo/oxid/issues/1212).
+
 ## Qualify the public app
 
 Use protected native custody. On the receipt-owned simulator, fund the fresh

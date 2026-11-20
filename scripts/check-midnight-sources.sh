@@ -36,11 +36,47 @@ metadata_file="$(mktemp)"
 trap 'rm -f "$metadata_file"' EXIT
 cargo metadata --locked --format-version 1 >"$metadata_file"
 
+# Historical event decoders may coexist only under exact, optional aliases in
+# the wallet adapter. They are not the native runtime, DID, or prover source.
+if ! jq -e --slurpfile policy "$manifest" '
+  $policy[0].wallet.historicalReplay as $legacy
+  | ([.workspace_members[] as $member
+       | .packages[] | select(.id == $member)
+       | .name as $owner | .dependencies[]
+       | select((.rename // "") | startswith("midnight-legacy-"))
+       | . + { owner: $owner }]) as $dependencies
+  | (($dependencies | map(.name) | sort) == ($legacy.packages | keys | sort))
+    and all($dependencies[];
+      .owner == $legacy.owner
+      and .optional
+      and .path == null
+      and .source == $legacy.registry
+      and .req == ("=" + $legacy.packages[.name])
+      and .rename == ("midnight-legacy-" + (.name | ltrimstr("midnight-")))
+    )
+    and any(.packages[];
+      .name == $legacy.owner
+      and ((.features[$legacy.feature] | sort)
+        == ($dependencies | map("dep:" + .rename) | sort))
+      and ((.features.default // []) | index($legacy.feature) | not)
+    )
+' "$metadata_file" >/dev/null; then
+  echo "Ledger 8 replay requires exact optional registry aliases scoped to the Midnight wallet adapter." >&2
+  exit 1
+fi
+
 direct_count=0
 while IFS=$'\t' read -r package rename source path; do
   [ -n "$package" ] || continue
   direct_count=$((direct_count + 1))
+  case "$rename" in
+    midnight-legacy-*) continue ;;
+  esac
   case "$package" in
+    midnight-ledger|midnight-storage-core)
+      echo "$package may be used directly only through a reviewed historical replay alias." >&2
+      exit 1
+      ;;
     midnight-ledger-v9|midnight-zswap|midnight-onchain-runtime|midnight-serialize|\
       midnight-base-crypto|midnight-coin-structure|midnight-onchain-state|\
       midnight-storage|midnight-transient-crypto)

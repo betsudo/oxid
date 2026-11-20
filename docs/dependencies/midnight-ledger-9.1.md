@@ -17,6 +17,14 @@ Oxid selects one Ledger 9 cohort for its native production graph:
 | `betsudo/midnight-zkir` | `3377ad9e48741f60e0aa17010b6f23e34223d906` | ZKIR `3.2.1`, schema 20 |
 | `betsudo/midnight-identity` | `e7e28eea94515d59b5e7360a717f5c0dee3eecdf` | merged DID/VC Ledger 9 release source `0.5.0` |
 
+Preview and PreProd history includes events encoded before the Ledger 9
+upgrade. The adapter's optional `mixed-era-replay` feature pins the published
+Ledger 8.1.3 decoder cohort with lockfile checksums. That cohort is used only
+for historical wallet replay. The Ledger 9 graph continues to own live state,
+transaction construction, proving, and DID/VC calls. The source check admits
+only the exact replay aliases in `wallet.historicalReplay`. See [the public
+issuance runbook](../factory/ledger9-public-issuance.md#replay-wallet-history-across-the-ledger-9-upgrade).
+
 The identity revision is the immutable merge commit of upstream PR
 `betsudo/midnight-identity#110` and is the qualified release source.
 

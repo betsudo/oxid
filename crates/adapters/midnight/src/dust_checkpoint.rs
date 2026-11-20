@@ -13,14 +13,18 @@ use std::{
     },
 };
 
-use midnight_ledger::dust::{DustLocalState, DustParameters, DustPublicKey};
-use midnight_storage::DefaultDB;
+use midnight_ledger::dust::{DustParameters, DustPublicKey};
 use oxid_foundation::UnixTimestampMillis;
 use oxid_wallet_domain::ChainNetworkId;
 use sha2::{Digest as _, Sha256};
 
+use crate::{
+    dust_replay::DustReplayState,
+    replay_era::{LedgerEra, has_mixed_history},
+};
+
 const MAGIC: &[u8; 8] = b"OXIDDUST";
-const SCHEMA_VERSION: u32 = 1;
+const SCHEMA_VERSION: u32 = 2;
 const MAX_RECORDS: usize = 4;
 const MAX_NETWORK_BYTES: usize = 64;
 const MAX_STATE_BYTES: usize = 16 * 1024 * 1024;
@@ -73,7 +77,7 @@ pub(crate) struct StoredDustCheckpoint {
     pub(crate) current_cursor: u64,
     pub(crate) target_cursor: u64,
     pub(crate) updated_at: UnixTimestampMillis,
-    pub(crate) state: DustLocalState<DefaultDB>,
+    pub(crate) state: DustReplayState,
 }
 
 pub(crate) trait MidnightDustCheckpointStore: Send + Sync {
@@ -99,7 +103,7 @@ pub(crate) trait MidnightDustCheckpointStore: Send + Sync {
         current_cursor: u64,
         target_cursor: u64,
         updated_at: UnixTimestampMillis,
-        state: &DustLocalState<DefaultDB>,
+        state: &DustReplayState,
     ) -> Result<(), DustCheckpointStoreError>;
 }
 
@@ -130,7 +134,7 @@ impl MidnightDustCheckpointStore for UnavailableMidnightDustCheckpointStore {
         _: u64,
         _: u64,
         _: UnixTimestampMillis,
-        _: &DustLocalState<DefaultDB>,
+        _: &DustReplayState,
     ) -> Result<(), DustCheckpointStoreError> {
         Ok(())
     }
@@ -273,7 +277,8 @@ impl MidnightDustCheckpointStore for BinaryMidnightDustCheckpointStore {
             .find(|record| {
                 record.network_id == network_id.as_str()
                     && record.public_key_fingerprint == public_key_fingerprint
-                    && record.parameters_fingerprint == parameters_fingerprint
+                    && (record.state.current().is_none()
+                        || record.parameters_fingerprint == parameters_fingerprint)
             })
             .map(|record| StoredDustCheckpoint {
                 current_cursor: record.current_cursor,
@@ -290,7 +295,7 @@ impl MidnightDustCheckpointStore for BinaryMidnightDustCheckpointStore {
         current_cursor: u64,
         target_cursor: u64,
         updated_at: UnixTimestampMillis,
-        state: &DustLocalState<DefaultDB>,
+        state: &DustReplayState,
     ) -> Result<(), DustCheckpointStoreError> {
         validate_checkpoint_cursors(current_cursor, target_cursor)?;
         let _guard = self
@@ -301,7 +306,7 @@ impl MidnightDustCheckpointStore for BinaryMidnightDustCheckpointStore {
         let replacement = DustCheckpointRecord {
             network_id: network_id.as_str().to_owned(),
             public_key_fingerprint,
-            parameters_fingerprint: parameters_fingerprint(&state.params)?,
+            parameters_fingerprint: state_parameters_fingerprint(state)?,
             current_cursor,
             target_cursor,
             updated_at_millis: updated_at.value(),
@@ -316,6 +321,14 @@ impl MidnightDustCheckpointStore for BinaryMidnightDustCheckpointStore {
             record.network_id == replacement.network_id
                 && record.public_key_fingerprint == replacement.public_key_fingerprint
         }) {
+            // A foreground operation and the background worker can finish
+            // out of order. Do not replace a better public replay boundary.
+            if has_mixed_history(&replacement.network_id)
+                && (record.current_cursor > replacement.current_cursor
+                    || (record.state.current().is_some() && replacement.state.current().is_none()))
+            {
+                return Ok(());
+            }
             *record = replacement;
         } else {
             if records.len() >= MAX_RECORDS {
@@ -338,7 +351,7 @@ struct DustCheckpointRecord {
     current_cursor: u64,
     target_cursor: u64,
     updated_at_millis: u64,
-    state: DustLocalState<DefaultDB>,
+    state: DustReplayState,
 }
 
 fn encode_document(records: &[DustCheckpointRecord]) -> Result<Vec<u8>, DustCheckpointStoreError> {
@@ -364,9 +377,11 @@ fn encode_document(records: &[DustCheckpointRecord]) -> Result<Vec<u8>, DustChec
         bytes.extend_from_slice(&record.current_cursor.to_be_bytes());
         bytes.extend_from_slice(&record.target_cursor.to_be_bytes());
         bytes.extend_from_slice(&record.updated_at_millis.to_be_bytes());
-        let mut state = Vec::new();
-        midnight_serialize::tagged_serialize(&record.state, &mut state)
-            .map_err(|_| DustCheckpointStoreError::InvalidData)?;
+        let (era, state) = encode_state(&record.state)?;
+        bytes.push(match era {
+            LedgerEra::V8 => 8,
+            LedgerEra::V9 => 9,
+        });
         if state.len() > MAX_STATE_BYTES {
             return Err(DustCheckpointStoreError::InvalidData);
         }
@@ -389,7 +404,8 @@ fn decode_document(bytes: &[u8]) -> Result<Vec<DustCheckpointRecord>, DustCheckp
     reader
         .read_exact(&mut magic)
         .map_err(|_| DustCheckpointStoreError::InvalidData)?;
-    if &magic != MAGIC || read_u32(&mut reader)? != SCHEMA_VERSION {
+    let version = read_u32(&mut reader)?;
+    if &magic != MAGIC || !matches!(version, 1 | SCHEMA_VERSION) {
         return Err(DustCheckpointStoreError::InvalidData);
     }
     let count = usize::try_from(read_u32(&mut reader)?)
@@ -414,6 +430,15 @@ fn decode_document(bytes: &[u8]) -> Result<Vec<DustCheckpointRecord>, DustCheckp
         let current_cursor = read_u64(&mut reader)?;
         let target_cursor = read_u64(&mut reader)?;
         let updated_at_millis = read_u64(&mut reader)?;
+        let era = if version == 1 {
+            LedgerEra::V9
+        } else {
+            match read_array::<1>(&mut reader)?[0] {
+                8 => LedgerEra::V8,
+                9 => LedgerEra::V9,
+                _ => return Err(DustCheckpointStoreError::InvalidData),
+            }
+        };
         let state_len = usize::try_from(read_u32(&mut reader)?)
             .map_err(|_| DustCheckpointStoreError::InvalidData)?;
         if state_len == 0 || state_len > MAX_STATE_BYTES {
@@ -423,8 +448,7 @@ fn decode_document(bytes: &[u8]) -> Result<Vec<DustCheckpointRecord>, DustCheckp
         reader
             .read_exact(&mut state_bytes)
             .map_err(|_| DustCheckpointStoreError::InvalidData)?;
-        let state = midnight_serialize::tagged_deserialize(&state_bytes[..])
-            .map_err(|_| DustCheckpointStoreError::InvalidData)?;
+        let state = decode_state(era, &state_bytes)?;
         records.push(DustCheckpointRecord {
             network_id,
             public_key_fingerprint,
@@ -444,6 +468,54 @@ fn decode_document(bytes: &[u8]) -> Result<Vec<DustCheckpointRecord>, DustCheckp
     Ok(records)
 }
 
+fn encode_state(state: &DustReplayState) -> Result<(LedgerEra, Vec<u8>), DustCheckpointStoreError> {
+    let mut bytes = Vec::new();
+    let era = match state {
+        DustReplayState::Current(state) => {
+            midnight_serialize::tagged_serialize(state, &mut bytes)
+                .map_err(|_| DustCheckpointStoreError::InvalidData)?;
+            LedgerEra::V9
+        }
+        #[cfg(feature = "mixed-era-replay")]
+        DustReplayState::Legacy(state) => {
+            midnight_legacy_serialize::tagged_serialize(state, &mut bytes)
+                .map_err(|_| DustCheckpointStoreError::InvalidData)?;
+            LedgerEra::V8
+        }
+    };
+    Ok((era, bytes))
+}
+
+fn decode_state(era: LedgerEra, bytes: &[u8]) -> Result<DustReplayState, DustCheckpointStoreError> {
+    let invalid = |_| DustCheckpointStoreError::InvalidData;
+    match era {
+        LedgerEra::V9 => midnight_serialize::tagged_deserialize(bytes)
+            .map(DustReplayState::Current)
+            .map_err(invalid),
+        #[cfg(feature = "mixed-era-replay")]
+        LedgerEra::V8 => midnight_legacy_serialize::tagged_deserialize(bytes)
+            .map(DustReplayState::Legacy)
+            .map_err(invalid),
+        #[cfg(not(feature = "mixed-era-replay"))]
+        LedgerEra::V8 => Err(DustCheckpointStoreError::InvalidData),
+    }
+}
+
+fn state_parameters_fingerprint(
+    state: &DustReplayState,
+) -> Result<[u8; 32], DustCheckpointStoreError> {
+    match state {
+        DustReplayState::Current(state) => parameters_fingerprint(&state.params),
+        #[cfg(feature = "mixed-era-replay")]
+        DustReplayState::Legacy(state) => {
+            let mut bytes = Vec::new();
+            midnight_legacy_serialize::tagged_serialize(&state.params, &mut bytes)
+                .map_err(|_| DustCheckpointStoreError::InvalidData)?;
+            Ok(Sha256::digest(bytes).into())
+        }
+    }
+}
+
 fn validate_records(records: &[DustCheckpointRecord]) -> Result<(), DustCheckpointStoreError> {
     if records.len() > MAX_RECORDS {
         return Err(DustCheckpointStoreError::InvalidData);
@@ -456,9 +528,10 @@ fn validate_records(records: &[DustCheckpointRecord]) -> Result<(), DustCheckpoi
             || crate::network_by_id(&network_id)
                 .map_err(|_| DustCheckpointStoreError::InvalidData)?
                 .is_none()
+            || (record.state.current().is_none() && !has_mixed_history(&record.network_id))
             || record.current_cursor > record.target_cursor
             || !scopes.insert((&record.network_id, record.public_key_fingerprint))
-            || parameters_fingerprint(&record.state.params)? != record.parameters_fingerprint
+            || state_parameters_fingerprint(&record.state)? != record.parameters_fingerprint
         {
             return Err(DustCheckpointStoreError::InvalidData);
         }
@@ -640,14 +713,12 @@ mod tests {
             current_cursor: 42,
             target_cursor: 42,
             updated_at: UnixTimestampMillis::new(1_700_000_000_123),
-            state: DustLocalState::new(parameters),
+            state: DustReplayState::Current(DustLocalState::new(parameters)),
         }
     }
 
-    fn tagged_state(state: &DustLocalState<DefaultDB>) -> Vec<u8> {
-        let mut bytes = Vec::new();
-        midnight_serialize::tagged_serialize(state, &mut bytes).expect("state serializes");
-        bytes
+    fn tagged_state(state: &DustReplayState) -> Vec<u8> {
+        encode_state(state).expect("state serializes").1
     }
 
     fn save_checkpoint(

@@ -14,6 +14,19 @@
       "packageVersion": "1.0.2",
       "protocolVersion": 2001100
     },
+    "historicalReplay": {
+      "owner": "oxid-adapter-midnight",
+      "feature": "mixed-era-replay",
+      "registry": "registry+https://github.com/rust-lang/crates.io-index",
+      "packages": {
+        "midnight-ledger": "8.1.3",
+        "midnight-zswap": "8.1.3",
+        "midnight-coin-structure": "2.0.2",
+        "midnight-storage": "2.0.3",
+        "midnight-storage-core": "1.2.1",
+        "midnight-serialize": "1.1.1"
+      }
+    },
     "compact": {
       "repository": "https://github.com/betsudo/compact",
       "revision": "d6513a24debac14d43a8199460d9dc2c6d9af2b1",
