@@ -349,8 +349,15 @@ test("guidance, required contexts, and review configuration agree", async () => 
     "docs/site/src/quality-baseline-2026-08-26.md:generic-api-key:271",
     "docs/migration/midnight-ledger-prototype.md:generic-api-key:386",
     "scripts/git-hooks/check-github-web-flow-key.mjs:generic-api-key:8",
+    // Public Ed25519 verification keys for signed simulator fixtures.
+    "crates/composition/tests/fixtures/preprod-portal/trust-root.json:generic-api-key:2",
+    "crates/composition/tests/fixtures/preview-portal/trust-root.json:generic-api-key:2",
   ];
   assert.deepEqual(gitleaksIgnore.trim().split("\n"), gitleaksFingerprints);
+  for (const network of ["preprod", "preview"]) {
+    const trust = await read(`crates/composition/tests/fixtures/${network}-portal/trust-root.json`);
+    assert.match(trust.split("\n")[1], /^  "verifyingKeyHex": "[0-9a-f]{64}",$/u);
+  }
   const scan = await read(".github/workflows/scan.yml");
   const scanJobStart = scan.indexOf("  scan:");
   assert.ok(scanJobStart >= 0, "scan.yml: scan job");

@@ -1,1 +1,7 @@
-{"keyId":"preview-test-only","verifyingKeyHex":"6b406679013d0ad82516a5b7c30ca557c412edd797013879fed8f63c3ee8082f","validFromSeconds":1700000000,"validUntilSeconds":2000000000,"minimumProfileSequence":3}
+{
+  "verifyingKeyHex": "6b406679013d0ad82516a5b7c30ca557c412edd797013879fed8f63c3ee8082f",
+  "keyId": "preview-test-only",
+  "validFromSeconds": 1700000000,
+  "validUntilSeconds": 2000000000,
+  "minimumProfileSequence": 3
+}
