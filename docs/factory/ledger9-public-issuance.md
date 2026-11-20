@@ -103,6 +103,11 @@ inputs before accessing the credential. The background startup worker
 requires the node genesis, the indexed block hash, and the GraphQL
 WebSocket acknowledgement to agree with the configured routes.
 
+The simulator launcher signs the completed bundle with a simulator-only
+Keychain identity before recording the artifact digest. Physical iOS builds
+use their provisioned application identifier and Keychain access group.
+ [Apple Keychain entitlement guidance](https://developer.apple.com/documentation/security/errsecmissingentitlement)
+
 ## Qualify the public app
 
 Use protected native custody. On the receipt-owned simulator, fund the fresh
