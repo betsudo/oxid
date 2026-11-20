@@ -32,6 +32,22 @@ Local and Tailnet use their existing manifest routes. Keep transport
 credentials, seeds, proofs, and offer contents out of profile bytes and run
 evidence.
 
+## Compose the Preview wallet
+
+The `oxid-composition/public-portal` feature installs the protected mobile
+wallet, native DID deployment, and strict Portal issuance through
+`compose_authenticated_public_portal`. Supply the authenticated deployment
+and its bound manifest together. The composition requires the native DID
+artifacts and stores wallet profiles, checkpoints, submission and recovery
+journals, DID records, and encrypted credentials under the platform data
+directory scoped by network and genesis. A fresh chain gets a fresh scope.
+
+Public DUST registration uses protected authorization. The development
+automatic-registration authority is isolated to its existing local path.
+The public mobile app still needs a signed Preview startup profile and a
+user-facing protected DUST authorization flow before funded live testing.
+PreProd startup also needs the separate Blockfrost transport.
+
 ## Qualify the public app
 
 Use protected native custody. On the receipt-owned simulator, fund the fresh

@@ -122,6 +122,7 @@ fn compose_in_memory_with_presentation_and_approvals(
         Arc::clone(&security),
         Arc::clone(&midnight),
         IdentityAdapters {
+            backup_recovery_journal: None,
             did_repository: Arc::new(InMemoryDidRecordRepository::new()),
             did_resolver: Arc::new(StandaloneDidResolver),
             did_lifecycle: did_lifecycle_port,

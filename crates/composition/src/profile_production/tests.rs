@@ -18,6 +18,7 @@ fn production_facing_composition_fails_closed_without_native_custody() {
         Arc::new(UnavailableWalletSecurity),
         Arc::new(unavailable_midnight_wallet()),
         IdentityAdapters {
+            backup_recovery_journal: None,
             did_repository: Arc::new(UnavailableDidRecordRepository),
             did_resolver: Arc::new(UnavailableDidResolver),
             did_lifecycle: Arc::new(UnavailableDidLifecycle),
@@ -106,5 +107,40 @@ fn production_facing_composition_fails_closed_without_native_custody() {
                 profile_id: "profile_test".to_owned(),
             })
             .is_err()
+    );
+}
+
+#[test]
+fn public_portal_state_is_scoped_to_the_platform_realm_and_genesis() {
+    use std::path::Path;
+
+    use oxid_identity_application::MidnightNetwork;
+
+    let platform = Path::new("/app/data/wallet-profiles.json");
+    let preview = public_portal_state_root(platform, MidnightNetwork::Preview, &[1; 32])
+        .expect("absolute platform scope");
+    assert_eq!(
+        preview,
+        platform
+            .parent()
+            .unwrap()
+            .join("public-networks/preview")
+            .join("01".repeat(32))
+    );
+    assert_ne!(
+        Some(preview.clone()),
+        public_portal_state_root(platform, MidnightNetwork::Preview, &[2; 32])
+    );
+    assert_ne!(
+        Some(preview),
+        public_portal_state_root(platform, MidnightNetwork::Preprod, &[1; 32])
+    );
+    assert_eq!(
+        public_portal_state_root(
+            Path::new("wallet-profiles.json"),
+            MidnightNetwork::Preview,
+            &[1; 32]
+        ),
+        None
     );
 }

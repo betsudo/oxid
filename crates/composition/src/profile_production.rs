@@ -29,7 +29,6 @@ use super::wiring::compose_with_identity_adapters;
     feature = "preprod-observation",
     any(target_os = "ios", target_os = "android")
 ))]
-#[cfg(any(target_os = "ios", target_os = "android"))]
 use super::wiring::with_native_wallet_onboarding;
 #[cfg(any(target_os = "ios", target_os = "android"))]
 use oxid_adapter_platform_system::OsRandom;
@@ -85,7 +84,7 @@ impl AuthenticatedProductionDeployment {
     /// genesis check used for the native wallet. A profile without an issuance
     /// pin remains an observation profile.
     #[cfg(any(
-        feature = "mobile-portal",
+        any(feature = "mobile-portal", feature = "public-portal"),
         not(any(target_os = "ios", target_os = "android"))
     ))]
     pub fn authenticate_portal_manifest(
@@ -113,6 +112,30 @@ impl AuthenticatedProductionDeployment {
     }
 }
 
+/// Public mobile state must never be reopened against a different genesis.
+#[cfg(any(
+    test,
+    all(
+        feature = "public-portal",
+        any(target_os = "ios", target_os = "android")
+    )
+))]
+pub(super) fn public_portal_state_root(
+    platform_profile_path: &std::path::Path,
+    network: oxid_identity_application::MidnightNetwork,
+    genesis: &[u8; 32],
+) -> Option<std::path::PathBuf> {
+    platform_profile_path
+        .parent()
+        .filter(|parent| parent.is_absolute())
+        .map(|parent| {
+            parent
+                .join("public-networks")
+                .join(network.as_str())
+                .join(hex::encode(genesis))
+        })
+}
+
 /// Payload-free failures from the production deployment composition gate.
 #[cfg(not(target_arch = "wasm32"))]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -121,6 +144,8 @@ pub enum ProductionDeploymentCompositionError {
     ChainIdentityUnavailable,
     ChainIdentityMismatch,
     InvalidSsiProfile,
+    PlatformStorageUnavailable,
+    NativeDidDeploymentUnavailable,
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -135,6 +160,8 @@ impl fmt::Display for ProductionDeploymentCompositionError {
                 "authenticated Midnight chain identity does not match the node"
             }
             Self::InvalidSsiProfile => "authenticated SSI deployment profile is invalid",
+            Self::PlatformStorageUnavailable => "protected platform storage is unavailable",
+            Self::NativeDidDeploymentUnavailable => "native Midnight DID deployment is unavailable",
         })
     }
 }
@@ -224,6 +251,7 @@ pub fn compose_authenticated_production(
         Arc::clone(&security),
         Arc::clone(&midnight),
         IdentityAdapters {
+            backup_recovery_journal: None,
             did_repository: Arc::new(UnavailableDidRecordRepository),
             did_resolver: Arc::new(did_resolver),
             did_lifecycle: Arc::new(UnavailableDidLifecycle),
@@ -294,6 +322,7 @@ pub fn compose() -> ApplicationServices {
         security,
         Arc::new(unavailable_midnight_wallet()),
         IdentityAdapters {
+            backup_recovery_journal: None,
             did_repository: Arc::new(UnavailableDidRecordRepository),
             did_resolver: Arc::new(UnavailableDidResolver),
             did_lifecycle: Arc::new(UnavailableDidLifecycle),

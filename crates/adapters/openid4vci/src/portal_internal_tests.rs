@@ -246,6 +246,7 @@ fn admits_public_ledger9_manifest_only_against_exact_signed_inputs() {
         let admitted = parse(digest.as_str(), network, &issuer_metadata, resolver)
             .expect("trusted public manifest");
         assert!(admitted.uses_ledger9_jubjub_jwk());
+        assert!(admitted.is_public_network());
         assert!(!admitted.is_ledger9_tailnet());
         assert_eq!(admitted.issuer_did(), manifest.issuer_did);
         assert!(PortalOid4vciClientFactory::new(admitted).is_ok());

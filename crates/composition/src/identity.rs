@@ -24,7 +24,7 @@ use oxid_adapter_did_midnight::{HttpDidResolver, HttpDidResolverConfig};
     any(
         all(not(target_os = "ios"), not(target_os = "android")),
         all(
-            feature = "mobile-portal",
+            any(feature = "mobile-portal", feature = "public-portal"),
             any(target_os = "ios", target_os = "android")
         )
     )
@@ -38,9 +38,15 @@ use oxid_adapter_openid4vci::PortalOid4vciClientFactory;
 use super::environment::MIDNIGHT_DID_RESOLVER_URL_ENV;
 use super::environment::{CREDENTIAL_KEY_PATH_ENV, CREDENTIAL_STORE_PATH_ENV, DID_STORE_PATH_ENV};
 use oxid_adapter_storage_credential_json::EncryptedJsonCredentialRepository;
-use oxid_adapter_storage_identity_json::{
-    JsonDidDeploymentOperationRepository, JsonDidRecordRepository,
-};
+#[cfg(all(
+    not(target_arch = "wasm32"),
+    any(
+        feature = "mobile-portal",
+        not(any(target_os = "ios", target_os = "android"))
+    )
+))]
+use oxid_adapter_storage_identity_json::JsonDidDeploymentOperationRepository;
+use oxid_adapter_storage_identity_json::JsonDidRecordRepository;
 use oxid_adapter_storage_json::JsonWalletProfileRepository;
 #[cfg(not(target_arch = "wasm32"))]
 use oxid_adapter_vc_midnight::NativeCompactPresentationRuntime;
@@ -48,10 +54,19 @@ use oxid_credential_application::{
     CredentialDisclosurePort, CredentialInboxPort, CredentialRepository,
     CredentialVerificationPort, UnavailableCredentialRepository,
 };
+#[cfg(all(
+    not(target_arch = "wasm32"),
+    any(
+        feature = "mobile-portal",
+        not(any(target_os = "ios", target_os = "android"))
+    )
+))]
 use oxid_identity_application::{
-    DidDeploymentOperationRepository, DidJubjubChallengeSigningPort, DidLifecyclePort,
-    DidPublicationPort, DidRecordRepository, DidResolutionPort,
-    UnavailableDidDeploymentOperationRepository, UnavailableDidRecordRepository,
+    DidDeploymentOperationRepository, UnavailableDidDeploymentOperationRepository,
+};
+use oxid_identity_application::{
+    DidJubjubChallengeSigningPort, DidLifecyclePort, DidPublicationPort, DidRecordRepository,
+    DidResolutionPort, UnavailableDidRecordRepository,
 };
 use oxid_platform_ports::IdentityLinkIngressPort;
 
@@ -84,7 +99,7 @@ pub(super) enum CredentialIssuanceComposition {
         any(
             all(not(target_os = "ios"), not(target_os = "android")),
             all(
-                feature = "mobile-portal",
+                any(feature = "mobile-portal", feature = "public-portal"),
                 any(target_os = "ios", target_os = "android")
             )
         )
@@ -127,6 +142,8 @@ pub(super) enum CredentialPresentationComposition {
 }
 
 pub(super) struct IdentityAdapters {
+    pub(super) backup_recovery_journal:
+        Option<Arc<dyn oxid_adapter_backup_complete::RecoveryJournalPort>>,
     pub(super) did_repository: Arc<dyn DidRecordRepository>,
     pub(super) did_resolver: Arc<dyn DidResolutionPort>,
     pub(super) did_lifecycle: Arc<dyn DidLifecyclePort>,
@@ -187,7 +204,13 @@ pub(super) fn headless_did_repository() -> Arc<dyn DidRecordRepository> {
     )
 }
 
-#[cfg(not(target_arch = "wasm32"))]
+#[cfg(all(
+    not(target_arch = "wasm32"),
+    any(
+        feature = "mobile-portal",
+        not(any(target_os = "ios", target_os = "android"))
+    )
+))]
 pub(super) fn headless_did_deployment_repository() -> Arc<dyn DidDeploymentOperationRepository> {
     let path = std::env::var_os(DID_STORE_PATH_ENV)
         .map(std::path::PathBuf::from)

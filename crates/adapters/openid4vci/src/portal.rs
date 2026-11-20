@@ -403,6 +403,11 @@ impl PortalDeploymentManifest {
     }
 
     #[must_use]
+    pub fn is_public_network(&self) -> bool {
+        matches!(self.routes, PortalManifestRoutes::Public { .. })
+    }
+
+    #[must_use]
     pub fn is_ledger9_tailnet(&self) -> bool {
         matches!(self.routes, PortalManifestRoutes::Tailnet(_)) && self.uses_ledger9_jubjub_jwk()
     }
