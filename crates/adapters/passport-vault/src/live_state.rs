@@ -29,6 +29,8 @@ use subxt::{
 };
 use tokio::time::timeout;
 
+use oxid_adapter_platform_system::NativeRequestAuthentication;
+
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 const MAX_ENDPOINT_CHARACTERS: usize = 2_048;
@@ -87,6 +89,7 @@ struct NodeAnchoredPassportVaultStateConfig {
     indexer_endpoint: Url,
     node_endpoint: String,
     client: Client,
+    authentication: Option<Arc<dyn NativeRequestAuthentication>>,
     contexts: Mutex<BTreeMap<String, PassportVaultCallChainContext>>,
 }
 
@@ -211,6 +214,14 @@ impl NodeAnchoredPassportVaultStateSource {
         indexer_endpoint: impl AsRef<str>,
         node_endpoint: impl AsRef<str>,
     ) -> Result<Self, NodeAnchoredPassportVaultStateConfigError> {
+        Self::new_with_authentication(indexer_endpoint, node_endpoint, None)
+    }
+
+    pub fn new_with_authentication(
+        indexer_endpoint: impl AsRef<str>,
+        node_endpoint: impl AsRef<str>,
+        authentication: Option<Arc<dyn NativeRequestAuthentication>>,
+    ) -> Result<Self, NodeAnchoredPassportVaultStateConfigError> {
         ensure_tls_provider()
             .map_err(|()| NodeAnchoredPassportVaultStateConfigError::ClientUnavailable)?;
         let indexer_endpoint = validate_http_endpoint(indexer_endpoint.as_ref())
@@ -230,6 +241,7 @@ impl NodeAnchoredPassportVaultStateSource {
             indexer_endpoint,
             node_endpoint,
             client,
+            authentication,
             contexts: Mutex::new(BTreeMap::new()),
         })))
     }
@@ -288,9 +300,13 @@ async fn read_on_runtime(
     config: Arc<NodeAnchoredPassportVaultStateConfig>,
     contract_address_hex: String,
 ) -> Result<PassportVaultContractStateSnapshot, PassportVaultContractStateSourceError> {
+    let headers = authorized_headers(&config, &config.node_endpoint)?;
     let rpc_client = timeout(
         CONNECT_TIMEOUT,
-        oxid_adapter_platform_system::connect_json_rpc_websocket(&config.node_endpoint),
+        oxid_adapter_platform_system::connect_json_rpc_websocket_with_headers(
+            &config.node_endpoint,
+            headers,
+        ),
     )
     .await
     .map_err(|_| PassportVaultContractStateSourceError::Unavailable)?
@@ -351,6 +367,20 @@ fn retain_context(
     Ok(())
 }
 
+fn authorized_headers(
+    config: &NodeAnchoredPassportVaultStateConfig,
+    endpoint: &str,
+) -> Result<reqwest::header::HeaderMap, PassportVaultContractStateSourceError> {
+    config.authentication.as_ref().map_or_else(
+        || Ok(reqwest::header::HeaderMap::new()),
+        |authentication| {
+            authentication
+                .headers_for(endpoint)
+                .map_err(|_| PassportVaultContractStateSourceError::Unavailable)
+        },
+    )
+}
+
 async fn fetch_indexer_snapshot(
     config: &NodeAnchoredPassportVaultStateConfig,
     contract_address_hex: &str,
@@ -377,6 +407,10 @@ async fn fetch_indexer_snapshot(
         CONTENT_TYPE,
         reqwest::header::HeaderValue::from_static("application/json"),
     );
+    request.headers_mut().extend(authorized_headers(
+        config,
+        config.indexer_endpoint.as_str(),
+    )?);
     *request.body_mut() = Some(reqwest::Body::from(body));
     let response = config
         .client
@@ -637,6 +671,54 @@ mod tests {
         assert!(validate_node_endpoint("ws://localhost:9944").is_some());
         assert!(validate_node_endpoint("ws://node.example").is_none());
         assert!(validate_node_endpoint("wss://user@node.example").is_none());
+    }
+
+    #[test]
+    fn contract_state_uses_pinned_authentication_and_fails_closed_on_other_routes() {
+        use oxid_adapter_platform_system::TransportTrustError;
+        use reqwest::header::{HeaderMap, HeaderValue};
+
+        struct FixtureAuthentication;
+
+        impl NativeRequestAuthentication for FixtureAuthentication {
+            fn headers_for(&self, endpoint: &str) -> Result<HeaderMap, TransportTrustError> {
+                if !["https://indexer.example/graphql", "wss://node.example/"].contains(&endpoint) {
+                    return Err(TransportTrustError::InvalidEndpoint);
+                }
+                let mut value = HeaderValue::from_static("fixture-contract-credential");
+                value.set_sensitive(true);
+                let mut headers = HeaderMap::new();
+                headers.insert("project_id", value);
+                Ok(headers)
+            }
+        }
+
+        let source = NodeAnchoredPassportVaultStateSource::new_with_authentication(
+            "https://indexer.example/graphql",
+            "wss://node.example",
+            Some(Arc::new(FixtureAuthentication)),
+        )
+        .unwrap();
+        for endpoint in [source.0.indexer_endpoint.as_str(), &source.0.node_endpoint] {
+            let headers = authorized_headers(&source.0, endpoint).unwrap();
+            assert!(headers["project_id"].is_sensitive());
+            assert!(!format!("{headers:?}").contains("fixture-contract-credential"));
+        }
+        assert_eq!(
+            authorized_headers(&source.0, "https://unrelated.example/graphql"),
+            Err(PassportVaultContractStateSourceError::Unavailable),
+        );
+
+        let local = NodeAnchoredPassportVaultStateSource::new(
+            "http://127.0.0.1:8088/api/v1/graphql",
+            "ws://127.0.0.1:9944",
+        )
+        .unwrap();
+        assert!(
+            authorized_headers(&local.0, local.0.indexer_endpoint.as_str())
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[test]

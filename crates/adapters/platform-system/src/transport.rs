@@ -44,6 +44,11 @@ impl fmt::Display for TransportTrustError {
 
 impl Error for TransportTrustError {}
 
+/// Native authorization that can populate headers only for an admitted route.
+pub trait NativeRequestAuthentication: Send + Sync {
+    fn headers_for(&self, endpoint: &str) -> Result<HeaderMap, TransportTrustError>;
+}
+
 /// Returns a hardened HTTP builder whose trust policy is derived from the
 /// already-validated route. No retry or fallback to another trust policy is
 /// performed.

@@ -40,7 +40,8 @@ use midnight_transient_crypto::{
     },
 };
 use oxid_adapter_platform_system::{
-    connect_json_rpc_websocket_with_headers, http_client_builder_for, websocket_connector_for,
+    NativeRequestAuthentication, TransportTrustError, connect_json_rpc_websocket_with_headers,
+    http_client_builder_for, websocket_connector_for,
 };
 use oxid_platform_ports::ClockPort;
 use oxid_wallet_application::WalletTransactionPortError;
@@ -275,6 +276,12 @@ impl MidnightStandaloneConfig {
         .await
     }
 
+    /// Supplies only the two authenticated read routes needed by contract-state readers.
+    pub fn contract_state_authentication(&self) -> Option<Arc<dyn NativeRequestAuthentication>> {
+        self.indexer.preprod_credential.as_ref()?;
+        Some(Arc::new(self.clone()))
+    }
+
     pub(crate) fn indexer_http_route(&self) -> MidnightTransportRoute<'_> {
         MidnightTransportRoute::new(
             &self.indexer_http_url,
@@ -307,6 +314,26 @@ impl MidnightStandaloneConfig {
     #[must_use]
     pub const fn proving(&self) -> &MidnightProvingMode {
         &self.proving
+    }
+}
+
+impl NativeRequestAuthentication for MidnightStandaloneConfig {
+    fn headers_for(
+        &self,
+        endpoint: &str,
+    ) -> Result<reqwest::header::HeaderMap, TransportTrustError> {
+        let route = if endpoint == self.indexer_http_url() {
+            self.indexer_http_route()
+        } else if endpoint == self.node_websocket_url()
+            || (is_preprod_node_route(endpoint) && is_preprod_node_route(self.node_websocket_url()))
+        {
+            self.node_route()
+        } else {
+            return Err(TransportTrustError::InvalidEndpoint);
+        };
+        route
+            .headers()
+            .map_err(|_| TransportTrustError::ConnectionUnavailable)
     }
 }
 
@@ -1655,6 +1682,7 @@ async fn prove_via_http(
         // Keep proof material on the explicitly configured route rather than an ambient
         // process proxy. This also preserves loopback proving inside pure Nix builds.
         .no_proxy()
+        .redirect(reqwest::redirect::Policy::none())
         .connect_timeout(CONNECT_TIMEOUT)
         .timeout(PROOF_TIMEOUT)
         .build()
@@ -2027,6 +2055,21 @@ mod tests {
         assert!(configured.node_route().headers().unwrap()["project_id"].is_sensitive());
         assert!(configured.indexer_http_route().headers().unwrap()["project_id"].is_sensitive());
         assert!(!format!("{configured:?}").contains("nightpreprodXXXX"));
+        let authentication = configured.contract_state_authentication().unwrap();
+        for endpoint in [
+            configured.indexer_http_url(),
+            configured.node_websocket_url(),
+        ] {
+            assert!(authentication.headers_for(endpoint).unwrap()["project_id"].is_sensitive());
+        }
+        let canonical_node = format!("{}/", configured.node_websocket_url());
+        assert!(authentication.headers_for(&canonical_node).unwrap()["project_id"].is_sensitive());
+        for endpoint in [INDEXER_SOCKET_ROUTE, "https://proof.example.test"] {
+            assert_eq!(
+                authentication.headers_for(endpoint),
+                Err(TransportTrustError::InvalidEndpoint),
+            );
+        }
         for (network, ws) in [
             ("preview", INDEXER_SOCKET_ROUTE),
             ("preprod", "wss://other.example.test/api/v0/ws"),

@@ -217,9 +217,10 @@ impl NodeAnchoredDidDeploymentContextSource {
         config: &MidnightStandaloneConfig,
         wallet: Arc<dyn MidnightPublicCallContextSource>,
     ) -> Result<Self, NativeDidDeploymentError> {
-        let chain = NodeAnchoredPassportVaultStateSource::new(
+        let chain = NodeAnchoredPassportVaultStateSource::new_with_authentication(
             config.indexer_http_url(),
             config.node_websocket_url(),
+            config.contract_state_authentication(),
         )
         .map_err(|_| NativeDidDeploymentError::Unavailable)?;
         Ok(Self {
