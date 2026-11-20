@@ -21,7 +21,10 @@ test("Portal iOS holder preparation follows the current DID detail contract", as
   assert.match(fixture, /requestFixedGrant\(for: address\)/u);
   assert.match(fixture, /staticTexts\["Transfer confirmed"\]/u);
   assert.match(fixture, /func testFundedWalletRecoversAcrossRestart\(\)/u);
-  assert.match(fixture, /\["DUST Ready"\]/u);
+  assert.match(
+    fixture,
+    /\.matching\(NSPredicate\(format: "label == %@ OR label BEGINSWITH %@", "DUST Ready", "DUST Ready, "\)\)/u,
+  );
   assert.match(fixture, /readReceiveLabel\(\) == before/u);
   assert.doesNotMatch(fixture, /staticTexts\["Identity"\]/u);
   assert.match(
