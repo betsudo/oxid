@@ -1165,6 +1165,20 @@ mod tests {
             .unwrap();
         let (endpoint, server) =
             server_for_eras(0, vec![old_message.clone(), current_message.clone()], true);
+        let uninterrupted = runtime
+            .block_on(synchronize_shielded_with_control(
+                MidnightTransportRoute::new(&endpoint, None).with_mixed_eras(true),
+                &replay_keys,
+                None,
+                &cancel,
+                &mut |_| Ok(()),
+            ))
+            .unwrap();
+        server.join().unwrap();
+        assert_eq!(uninterrupted.events_processed, 2);
+
+        let (endpoint, server) =
+            server_for_eras(0, vec![old_message.clone(), current_message.clone()], true);
         let interrupted = runtime.block_on(synchronize_shielded_with_control(
             MidnightTransportRoute::new(&endpoint, None).with_mixed_eras(true),
             &replay_keys,
@@ -1225,9 +1239,37 @@ mod tests {
         server.join().unwrap();
         let projection = project_zswap_state(&actual.state).unwrap();
         assert_eq!((actual.current_cursor, actual.target_cursor), (10, 10));
+        assert_eq!(actual.events_processed, 1);
         assert_eq!(projection.owned_note_count, 2);
         assert_eq!(projection.commitment_count, 2);
         assert_eq!(projection.balances[0].atomic_units, 126);
+
+        let current_checkpoint = store.load(&network, &keys, &source).unwrap().unwrap();
+        let (endpoint, server) = server_for_eras(11, Vec::new(), true);
+        let resumed = runtime
+            .block_on(synchronize_shielded_with_control(
+                MidnightTransportRoute::new(&endpoint, None).with_mixed_eras(true),
+                &replay_keys,
+                Some(current_checkpoint),
+                &cancel,
+                &mut |_| Ok(()),
+            ))
+            .unwrap();
+        server.join().unwrap();
+        assert_eq!(resumed.events_processed, 0);
+        assert_eq!(
+            (resumed.current_cursor, resumed.target_cursor),
+            (uninterrupted.current_cursor, uninterrupted.target_cursor)
+        );
+        let mut uninterrupted_bytes = Vec::new();
+        let mut resumed_bytes = Vec::new();
+        midnight_serialize::tagged_serialize(&uninterrupted.state, &mut uninterrupted_bytes)
+            .unwrap();
+        midnight_serialize::tagged_serialize(&resumed.state, &mut resumed_bytes).unwrap();
+        assert!(
+            resumed_bytes == uninterrupted_bytes,
+            "shielded checkpoint changed native state"
+        );
 
         let current_checkpoint = store.load(&network, &keys, &source).unwrap().unwrap();
         let mut regression = old_message;

@@ -3085,7 +3085,9 @@ mod tests {
         let (endpoint, worker) = serve_dust_subscriptions_for_eras(
             vec![
                 (0, vec![(1, 8, legacy.clone()), (8, 8, current.clone())]),
+                (0, vec![(1, 8, legacy.clone()), (8, 8, current.clone())]),
                 (2, vec![(8, 8, current)]),
+                (9, vec![]),
                 (9, vec![(9, 9, legacy)]),
             ],
             true,
@@ -3100,6 +3102,17 @@ mod tests {
         let config = MidnightDustCheckpointConfig::new(directory.path().join("dust.bin")).unwrap();
         let parameters = INITIAL_PARAMETERS.dust;
         let cancel = AtomicBool::new(false);
+        let uninterrupted = runtime()
+            .block_on(synchronize_dust_with_control(
+                route,
+                &keys,
+                parameters,
+                None,
+                &cancel,
+                &mut |_| Ok(()),
+            ))
+            .unwrap();
+        assert_eq!(uninterrupted.events_processed, 2);
         let interrupted = runtime().block_on(synchronize_dust_with_control(
             route,
             &keys,
@@ -3157,6 +3170,7 @@ mod tests {
             ))
             .unwrap();
         assert_eq!(synchronized.current_cursor, 8);
+        assert_eq!(synchronized.events_processed, 1);
         assert_eq!(
             synchronized
                 .state
@@ -3168,6 +3182,34 @@ mod tests {
             .unwrap()
             .unwrap();
         assert!(post_upgrade.state.current().is_some());
+        let resumed = runtime()
+            .block_on(synchronize_dust_with_control(
+                route,
+                &keys,
+                parameters,
+                Some(post_upgrade),
+                &cancel,
+                &mut |_| Ok(()),
+            ))
+            .unwrap();
+        assert_eq!(resumed.events_processed, 0);
+        assert_eq!(
+            (resumed.current_cursor, resumed.target_cursor),
+            (uninterrupted.current_cursor, uninterrupted.target_cursor)
+        );
+        let mut uninterrupted_bytes = Vec::new();
+        let mut resumed_bytes = Vec::new();
+        midnight_serialize::tagged_serialize(&uninterrupted.state, &mut uninterrupted_bytes)
+            .unwrap();
+        midnight_serialize::tagged_serialize(&resumed.state, &mut resumed_bytes).unwrap();
+        assert!(
+            resumed_bytes == uninterrupted_bytes,
+            "DUST checkpoint changed native state"
+        );
+        let post_upgrade = store
+            .load(&network, &public_key, parameters)
+            .unwrap()
+            .unwrap();
         assert_eq!(
             runtime()
                 .block_on(synchronize_dust_with_control(

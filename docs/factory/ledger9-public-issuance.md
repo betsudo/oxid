@@ -140,10 +140,11 @@ Run the bounded native regression matrix before public qualification:
 ./bootstrap.sh -- cargo test --locked -p oxid-adapter-midnight --lib --features mixed-era-replay
 ```
 
-The transport fixtures interrupt DUST and shielded replay immediately before
-the transition, reopen their files, and reject an era regression after the
-transition. Use the signed deployment to qualify real history on Preview
-and PreProd. The standalone builds continue to use their Ledger 9 stream.
+The transport fixtures reopen DUST and shielded checkpoints before and after
+the transition. They compare the resumed cursors and serialized wallet state
+with uninterrupted replay at the same tip, then reject a return to Ledger 8.
+Use the signed deployment to qualify real history on Preview and PreProd.
+The standalone builds continue to use their Ledger 9 stream.
 See [Midnight's Ledger 9 upgrade notes](https://docs.midnight.network/relnotes/ledger-9#detect-the-upgrade-in-your-wallet-or-dapp)
 and [Oxid #1212](https://github.com/betsudo/oxid/issues/1212).
 
