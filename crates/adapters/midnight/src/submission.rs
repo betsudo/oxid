@@ -59,7 +59,7 @@ use crate::{
     },
     dust_replay::{DustReplayKeys, DustReplayState, replay_dust_batch},
     local_proving,
-    replay_era::{ReplayEvent, replay_era},
+    replay_era::{ReplayEvent, ReplayWindow, replay_era},
     submission_journal::{StoredSubmissionJournalEntry, StoredSubmissionState},
     transaction::{
         MidnightCompletionOutcome, MidnightCompletionRequest, MidnightRegistrationContext,
@@ -1010,6 +1010,27 @@ pub(crate) async fn synchronize_dust_controlled(
     cancellation: &AtomicBool,
     observe: &mut dyn FnMut(&DustSyncProgress<'_>) -> Result<(), WalletTransactionPortError>,
 ) -> Result<DustSynchronization, WalletTransactionPortError> {
+    synchronize_dust_controlled_with_limits(
+        route,
+        keys,
+        parameters,
+        checkpoint,
+        cancellation,
+        observe,
+        (MAX_DUST_EVENTS, MAX_DUST_TOTAL_BYTES),
+    )
+    .await
+}
+
+async fn synchronize_dust_controlled_with_limits(
+    route: MidnightTransportRoute<'_>,
+    keys: &DustReplayKeys<'_>,
+    parameters: DustParameters,
+    checkpoint: Option<StoredDustCheckpoint>,
+    cancellation: &AtomicBool,
+    observe: &mut dyn FnMut(&DustSyncProgress<'_>) -> Result<(), WalletTransactionPortError>,
+    limits: (usize, usize),
+) -> Result<DustSynchronization, WalletTransactionPortError> {
     ensure_submission_active(cancellation)?;
     let (mut state, starting_cursor, starting_target) = checkpoint.map_or_else(
         || (None, None, None),
@@ -1035,8 +1056,7 @@ pub(crate) async fn synchronize_dust_controlled(
     let synchronization = timeout(SNAPSHOT_TIMEOUT, async {
         let mut durable_cursor = starting_cursor;
         let mut target_id = starting_target;
-        let mut total_bytes = 0_usize;
-        let mut event_count = 0_usize;
+        let mut window = ReplayWindow::new(limits, route.mixed_eras(), starting_cursor);
         let mut replayed_events = 0_usize;
         loop {
             ensure_dust_sync_active(cancellation, started_at)?;
@@ -1167,15 +1187,7 @@ pub(crate) async fn synchronize_dust_controlled(
                                 {
                                     break DustReceiveOutcome::Saturated;
                                 }
-                                event_count = event_count
-                                    .checked_add(1)
-                                    .ok_or(WalletTransactionPortError::InvalidChainState)?;
-                                total_bytes = total_bytes
-                                    .checked_add(decoded.raw_bytes)
-                                    .ok_or(WalletTransactionPortError::InvalidChainState)?;
-                                if total_bytes > MAX_DUST_TOTAL_BYTES
-                                    || event_count > MAX_DUST_EVENTS
-                                {
+                                if !window.accept(decoded.raw_bytes) {
                                     break DustReceiveOutcome::BudgetExhausted;
                                 }
                                 segment_bytes = next_segment_bytes;
@@ -1233,6 +1245,9 @@ pub(crate) async fn synchronize_dust_controlled(
 
             if segment.is_empty() {
                 if outcome == DustReceiveOutcome::BudgetExhausted {
+                    if window.renew(durable_cursor) {
+                        continue;
+                    }
                     return Err(WalletTransactionPortError::Timeout);
                 }
                 let current_cursor =
@@ -1303,7 +1318,9 @@ pub(crate) async fn synchronize_dust_controlled(
                 batch.clear();
             }
             if outcome == DustReceiveOutcome::BudgetExhausted {
-                // Progress is durable; another sync can continue from this boundary.
+                if window.renew(durable_cursor) {
+                    continue;
+                }
                 return Err(WalletTransactionPortError::Timeout);
             }
             if durable_cursor != Some(segment_cursor) {
@@ -3165,6 +3182,48 @@ mod tests {
             Some(WalletTransactionPortError::InvalidChainState)
         );
         worker.join().unwrap();
+    }
+
+    #[test]
+    fn public_dust_continues_at_the_durable_cursor_after_a_full_window() {
+        let raw = parameter_change_event_hex();
+        let (endpoint, worker) = serve_dust_subscriptions_for_eras(
+            vec![
+                (
+                    0,
+                    vec![
+                        (1, 8, raw.clone()),
+                        (2, 8, raw.clone()),
+                        (8, 8, raw.clone()),
+                    ],
+                ),
+                (3, vec![(8, 8, raw)]),
+            ],
+            true,
+        );
+        let route = MidnightTransportRoute::new(&endpoint, None).with_mixed_eras(true);
+        let secret = DustSecretKey::derive_secret_key(&[7; 32]);
+        let keys = DustReplayKeys::new(&secret, None);
+        let mut observed = Vec::new();
+        let synchronized = runtime()
+            .block_on(synchronize_dust_controlled_with_limits(
+                route,
+                &keys,
+                INITIAL_PARAMETERS.dust,
+                None,
+                &AtomicBool::new(false),
+                &mut |progress| {
+                    observed.push((progress.current_cursor, progress.events_processed));
+                    Ok(())
+                },
+                (2, MAX_DUST_TOTAL_BYTES),
+            ))
+            .unwrap();
+        worker.join().unwrap();
+
+        assert_eq!(observed, [(2, 2), (8, 3)]);
+        assert_eq!(synchronized.current_cursor, synchronized.target_cursor);
+        assert_eq!(synchronized.events_processed, 3);
     }
 
     #[test]

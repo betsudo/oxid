@@ -18,6 +18,7 @@ use tokio_tungstenite::tungstenite::{Message, protocol::WebSocketConfig};
 use url::Url;
 
 use crate::{
+    replay_era::ReplayWindow,
     shielded::{
         DecodedZswapEvent, MIXED_ZSWAP_LEDGER_EVENTS_QUERY, ZSWAP_LEDGER_EVENTS_QUERY,
         decode_zswap_event,
@@ -102,6 +103,25 @@ pub(crate) async fn synchronize_shielded_with_control(
     cancellation: &AtomicBool,
     observe: &mut dyn FnMut(&ShieldedSyncProgress) -> Result<(), ShieldedTransportError>,
 ) -> Result<ShieldedSynchronization, ShieldedTransportError> {
+    synchronize_shielded_with_limits(
+        route,
+        keys,
+        checkpoint,
+        cancellation,
+        observe,
+        (MAX_EVENTS, MAX_TOTAL_BYTES),
+    )
+    .await
+}
+
+async fn synchronize_shielded_with_limits(
+    route: MidnightTransportRoute<'_>,
+    keys: &ShieldedReplayKeys<'_>,
+    checkpoint: Option<StoredShieldedCheckpoint>,
+    cancellation: &AtomicBool,
+    observe: &mut dyn FnMut(&ShieldedSyncProgress) -> Result<(), ShieldedTransportError>,
+    limits: (usize, usize),
+) -> Result<ShieldedSynchronization, ShieldedTransportError> {
     ensure_active(cancellation)?;
     let (mut state, starting_cursor, starting_target) = checkpoint.map_or_else(
         || (None, None, None),
@@ -117,8 +137,7 @@ pub(crate) async fn synchronize_shielded_with_control(
     let synchronization = timeout(SYNCHRONIZATION_TIMEOUT, async {
         let mut durable_cursor = starting_cursor;
         let mut target_cursor = starting_target;
-        let mut total_bytes = 0_usize;
-        let mut event_count = 0_usize;
+        let mut window = ReplayWindow::new(limits, route.mixed_eras(), starting_cursor);
         let mut replayed_events = 0_usize;
         loop {
             ensure_active(cancellation)?;
@@ -255,13 +274,7 @@ pub(crate) async fn synchronize_shielded_with_control(
                                 {
                                     break ShieldedReceiveOutcome::Saturated;
                                 }
-                                event_count = event_count
-                                    .checked_add(1)
-                                    .ok_or(ShieldedTransportError::InvalidData)?;
-                                total_bytes = total_bytes
-                                    .checked_add(decoded.raw_bytes)
-                                    .ok_or(ShieldedTransportError::InvalidData)?;
-                                if event_count > MAX_EVENTS || total_bytes > MAX_TOTAL_BYTES {
+                                if !window.accept(decoded.raw_bytes) {
                                     break ShieldedReceiveOutcome::BudgetExhausted;
                                 }
                                 segment_bytes = next_segment_bytes;
@@ -318,6 +331,9 @@ pub(crate) async fn synchronize_shielded_with_control(
 
             if segment.is_empty() {
                 if outcome == ShieldedReceiveOutcome::BudgetExhausted {
+                    if window.renew(durable_cursor) {
+                        continue;
+                    }
                     return Err(ShieldedTransportError::Timeout);
                 }
                 let current_cursor = durable_cursor.ok_or(ShieldedTransportError::InvalidData)?;
@@ -384,6 +400,9 @@ pub(crate) async fn synchronize_shielded_with_control(
                 batch.clear();
             }
             if outcome == ShieldedReceiveOutcome::BudgetExhausted {
+                if window.renew(durable_cursor) {
+                    continue;
+                }
                 return Err(ShieldedTransportError::Timeout);
             }
             if durable_cursor != Some(segment_cursor) {
@@ -728,6 +747,54 @@ mod tests {
             });
         });
         (format!("ws://{address}"), handle)
+    }
+
+    #[test]
+    fn public_shielded_reopens_from_the_checkpoint_after_a_full_window() {
+        let keys = SecretKeys::from(Seed::from([7; 32]));
+        let message = |value, index, cursor| {
+            let mut message = event_value(&output(&keys, value, index), cursor, 8);
+            message["payload"]["data"]["zswapLedgerEvents"]["protocolVersion"] = json!(2_001_100);
+            message
+        };
+        let closed = Arc::new((Mutex::new(false), Condvar::new()));
+        let (endpoint, worker) = segmented_server(
+            vec![
+                (
+                    0,
+                    vec![message(1, 0, 1), message(2, 1, 2), message(3, 2, 8)],
+                ),
+                (3, vec![message(3, 2, 8)]),
+            ],
+            Arc::clone(&closed),
+        );
+        let route = MidnightTransportRoute::new(&endpoint, None).with_mixed_eras(true);
+        let replay_keys = ShieldedReplayKeys::new(&keys, None);
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let mut observed = Vec::new();
+        let synchronized = runtime
+            .block_on(synchronize_shielded_with_limits(
+                route,
+                &replay_keys,
+                None,
+                &AtomicBool::new(false),
+                &mut |progress| {
+                    observed.push((progress.current_cursor, progress.events_processed));
+                    Ok(())
+                },
+                (2, MAX_TOTAL_BYTES),
+            ))
+            .unwrap();
+        worker.join().unwrap();
+
+        assert_eq!(observed, [(2, 2), (8, 3)]);
+        assert_eq!(synchronized.current_cursor, synchronized.target_cursor);
+        let projection = project_zswap_state(&synchronized.state).unwrap();
+        assert_eq!(projection.owned_note_count, 3);
+        assert_eq!(projection.balances[0].atomic_units, 6);
     }
 
     #[test]

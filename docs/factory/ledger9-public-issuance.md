@@ -129,8 +129,10 @@ commitment tree, owned notes, and observed outputs into Ledger 9. The wallet
 releases reservations from legacy pending spends. Checkpoints record the
 active ledger era, so a restart resumes with the correct decoder and the
 same next cursor. Historical checkpoints can report progress while live
-synchronization catches up. Transaction preparation requires a current
-Ledger 9 result.
+synchronization catches up. The native worker can reopen the stream from its
+latest durable cursor when a replay window fills. This keeps sync progress
+visible while retaining the overall session deadline. Transaction preparation
+requires a current Ledger 9 result.
 
 Run the bounded native regression matrix before public qualification:
 
