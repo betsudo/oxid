@@ -174,6 +174,8 @@ assert_public_fixture_feature_absent \
 assert_public_fixture_feature_absent \
   "bare Android standalone Tailnet route" "mobile,standalone-tailnet" "aarch64-linux-android"
 assert_public_fixture_feature_absent \
+  "iOS Preview Portal" "preview-portal" "aarch64-apple-ios"
+assert_public_fixture_feature_absent \
   "iOS native mobile" "mobile,standalone-native-custody" "aarch64-apple-ios"
 assert_public_fixture_feature_absent \
   "Android native mobile" "mobile,standalone-native-custody" "aarch64-linux-android"

@@ -22,40 +22,34 @@ use oxid_adapter_vc_midnight::{DigitalPassportDisclosureAdapter, MidnightCredent
 use oxid_credential_application::UnavailableCredentialInbox;
 use oxid_identity_application::MidnightNetwork;
 
-use super::did_deployment::{native_did_deployment, native_did_proving_material};
-use super::identity::{
+use super::{AuthenticatedProductionDeployment, public_portal_state_root};
+use crate::did_deployment::{native_did_deployment, native_did_proving_material};
+use crate::identity::{
     CredentialIssuanceComposition, CredentialPresentationComposition, IdentityAdapters,
     SelfIssuedAuthenticationComposition,
 };
-use super::passport_vault::PassportVaultRepositoryComposition;
-use super::portal::PortalIdentityConfiguration;
-use super::profile_production::{AuthenticatedProductionDeployment, public_portal_state_root};
-use super::services::ApplicationServices;
-use super::wiring::{compose_with_identity_adapters, with_native_wallet_onboarding};
+use crate::passport_vault::PassportVaultRepositoryComposition;
+use crate::portal::PortalIdentityConfiguration;
+use crate::services::ApplicationServices;
+use crate::wiring::{compose_with_identity_adapters, with_native_wallet_onboarding};
 
-use super::profile_production::ProductionDeploymentCompositionError as CompositionError;
+use super::ProductionDeploymentCompositionError as CompositionError;
 
 /// Installs native Portal issuance only after signed profile, chain identity,
 /// and exact Portal manifest admission. State and journals belong to that
 /// chain's genesis. The wallet uses platform-backed custody for signing.
-pub fn compose_authenticated_public_portal(
+pub(super) fn compose_authenticated_public_portal(
     deployment: AuthenticatedProductionDeployment,
-    manifest_bytes: &[u8],
+    portal: PortalIdentityConfiguration,
 ) -> Result<ApplicationServices, CompositionError> {
     let network = MidnightNetwork::Preview;
-    // PreProd startup must first supply its authenticated Blockfrost transport.
-    if deployment.profile.midnight().network_id() != network.as_str() {
-        return Err(CompositionError::InvalidMidnightProfile);
-    }
-    let manifest = deployment.authenticate_portal_manifest(manifest_bytes)?;
     let PortalIdentityConfiguration {
         client_factory,
         issuer_resolver,
         trust_anchor,
         test_ingress,
         did_publisher,
-    } = PortalIdentityConfiguration::new(manifest, None, None)
-        .map_err(|_| CompositionError::InvalidSsiProfile)?;
+    } = portal;
     let platform_profiles = JsonWalletProfileRepository::at_platform_location();
     let state_root = platform_profiles
         .configured_path()

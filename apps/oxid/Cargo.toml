@@ -104,6 +104,12 @@ preprod-observation = [
   "oxid-composition/preprod-observation",
   "oxid-ui-dioxus/preprod-observation",
 ]
+# Explicit signed Preview issuer profile with protected platform custody.
+preview-portal = [
+  "mobile",
+  "dep:oxid-adapter-deployment-profile",
+  "oxid-composition/public-portal",
+]
 # Opt-in iOS/Android standalone proof conformance harness. This embeds the
 # reviewed Compact artifact closure and selects the foreground-only worker;
 # normal mobile and production builds remain proof-disabled.
@@ -142,6 +148,7 @@ getrandom_04 = { package = "getrandom", version = "=0.4.3", features = [
 oxid-adapter-identity-ingress.workspace = true
 
 [build-dependencies]
+oxid-adapter-deployment-profile = { workspace = true, optional = true }
 oxid-adapter-identity-ingress.workspace = true
 oxid-brand-build.workspace = true
 sha2.workspace = true

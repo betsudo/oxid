@@ -54,6 +54,30 @@ impl fmt::Debug for DeploymentTrustRoot {
 }
 
 impl DeploymentTrustRoot {
+    /// Reads reviewed public trust material supplied by the build. A signed
+    /// envelope is never a source of its own verification key.
+    pub fn from_reviewed_json(bytes: &[u8]) -> Result<Self, DeploymentProfileError> {
+        if bytes.is_empty() || bytes.len() > 4_096 {
+            return Err(DeploymentProfileError::InvalidTrustRoot);
+        }
+        let configuration: TrustRootConfiguration =
+            serde_json::from_slice(bytes).map_err(|_| DeploymentProfileError::InvalidTrustRoot)?;
+        if !is_canonical_32_byte_hex(&configuration.verifying_key_hex) {
+            return Err(DeploymentProfileError::InvalidTrustRoot);
+        }
+        let mut verifying_key = [0; 32];
+        hex::decode_to_slice(configuration.verifying_key_hex, &mut verifying_key)
+            .map_err(|_| DeploymentProfileError::InvalidTrustRoot)?;
+        Self::new(
+            configuration.key_id,
+            verifying_key,
+            configuration.valid_from_seconds,
+            configuration.valid_until_seconds,
+            configuration.revoked_at_seconds,
+            configuration.minimum_profile_sequence,
+        )
+    }
+
     /// Constructs one trust root from reviewed public material.
     pub fn new(
         key_id: impl Into<String>,
@@ -434,6 +458,17 @@ impl fmt::Display for DeploymentProfileError {
 }
 
 impl Error for DeploymentProfileError {}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct TrustRootConfiguration {
+    key_id: String,
+    verifying_key_hex: String,
+    valid_from_seconds: u64,
+    valid_until_seconds: u64,
+    revoked_at_seconds: Option<u64>,
+    minimum_profile_sequence: u64,
+}
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]

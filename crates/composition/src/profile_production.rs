@@ -59,6 +59,23 @@ pub struct AuthenticatedProductionDeployment {
     pub(super) midnight: MidnightStandaloneConfig,
 }
 
+#[cfg(all(
+    feature = "public-portal",
+    not(target_arch = "wasm32"),
+    any(test, target_os = "ios", target_os = "android")
+))]
+mod preview_startup;
+#[cfg(all(
+    feature = "public-portal",
+    any(target_os = "ios", target_os = "android")
+))]
+mod public_portal;
+#[cfg(all(
+    feature = "public-portal",
+    any(target_os = "ios", target_os = "android")
+))]
+pub use preview_startup::compose_embedded_preview_portal;
+
 #[cfg(test)]
 #[path = "profile_production/tests.rs"]
 mod tests;
@@ -79,37 +96,33 @@ impl AuthenticatedProductionDeployment {
     pub const fn profile(&self) -> &AuthenticatedDeploymentProfile {
         &self.profile
     }
+}
 
-    /// Binds the reviewed Portal manifest to the same signed profile and
-    /// genesis check used for the native wallet. A profile without an issuance
-    /// pin remains an observation profile.
-    #[cfg(any(
-        any(feature = "mobile-portal", feature = "public-portal"),
-        not(any(target_os = "ios", target_os = "android"))
-    ))]
-    pub fn authenticate_portal_manifest(
-        &self,
-        bytes: &[u8],
-    ) -> Result<
-        oxid_adapter_openid4vci::PortalDeploymentManifest,
-        ProductionDeploymentCompositionError,
-    > {
-        let ssi = self.profile.ssi();
-        let digest = ssi
-            .portal_manifest_sha256()
+#[cfg(all(
+    feature = "public-portal",
+    not(target_arch = "wasm32"),
+    any(test, target_os = "ios", target_os = "android")
+))]
+pub(super) fn authenticate_public_portal_manifest(
+    profile: &AuthenticatedDeploymentProfile,
+    bytes: &[u8],
+) -> Result<oxid_adapter_openid4vci::PortalDeploymentManifest, ProductionDeploymentCompositionError>
+{
+    let ssi = profile.ssi();
+    let digest = ssi
+        .portal_manifest_sha256()
+        .ok_or(ProductionDeploymentCompositionError::InvalidSsiProfile)?;
+    let network =
+        oxid_identity_application::MidnightNetwork::parse(profile.midnight().network_id())
             .ok_or(ProductionDeploymentCompositionError::InvalidSsiProfile)?;
-        let network =
-            oxid_identity_application::MidnightNetwork::parse(self.profile.midnight().network_id())
-                .ok_or(ProductionDeploymentCompositionError::InvalidSsiProfile)?;
-        oxid_adapter_openid4vci::PortalDeploymentManifest::from_public_bytes(
-            bytes,
-            digest,
-            network,
-            ssi.issuer_metadata_url(),
-            ssi.did_resolver_url(),
-        )
-        .map_err(|_| ProductionDeploymentCompositionError::InvalidSsiProfile)
-    }
+    oxid_adapter_openid4vci::PortalDeploymentManifest::from_public_bytes(
+        bytes,
+        digest,
+        network,
+        ssi.issuer_metadata_url(),
+        ssi.did_resolver_url(),
+    )
+    .map_err(|_| ProductionDeploymentCompositionError::InvalidSsiProfile)
 }
 
 /// Public mobile state must never be reopened against a different genesis.
@@ -141,6 +154,9 @@ pub(super) fn public_portal_state_root(
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ProductionDeploymentCompositionError {
     InvalidMidnightProfile,
+    InvalidPreviewTrustPolicy,
+    InvalidSignedPreviewProfile,
+    PreviewStartupRuntimeUnavailable,
     ChainIdentityUnavailable,
     ChainIdentityMismatch,
     InvalidSsiProfile,
@@ -153,6 +169,9 @@ impl fmt::Display for ProductionDeploymentCompositionError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str(match self {
             Self::InvalidMidnightProfile => "authenticated Midnight deployment profile is invalid",
+            Self::InvalidPreviewTrustPolicy => "embedded Preview trust policy is invalid",
+            Self::InvalidSignedPreviewProfile => "embedded signed Preview profile was rejected",
+            Self::PreviewStartupRuntimeUnavailable => "Preview startup runtime is unavailable",
             Self::ChainIdentityUnavailable => {
                 "authenticated Midnight chain identity is unavailable"
             }

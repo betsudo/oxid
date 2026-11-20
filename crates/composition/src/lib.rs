@@ -21,17 +21,6 @@ mod profile_mobile;
 #[cfg(all(feature = "preprod-observation", not(target_arch = "wasm32")))]
 mod profile_preprod;
 mod profile_production;
-#[cfg(all(
-    feature = "public-portal",
-    any(target_os = "ios", target_os = "android")
-))]
-mod profile_public_portal;
-#[cfg(all(
-    feature = "public-portal",
-    any(target_os = "ios", target_os = "android")
-))]
-pub use profile_public_portal::compose_authenticated_public_portal;
-
 #[cfg(all(feature = "proof-benchmark", not(target_arch = "wasm32")))]
 mod proof_benchmark;
 mod services;

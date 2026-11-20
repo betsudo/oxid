@@ -2,7 +2,7 @@
 
 #![forbid(unsafe_code)]
 
-use std::{env, fs, path::PathBuf};
+use std::{env, fs, io::Read as _, path::PathBuf};
 
 use sha2::{Digest as _, Sha256};
 
@@ -12,6 +12,14 @@ mod portal_profile_authority;
 const PORTAL_MANIFEST_PATH_ENV: &str = "OXID_BUILD_PORTAL_DEPLOYMENT_MANIFEST_PATH";
 const PORTAL_MANIFEST_SHA256_ENV: &str = "OXID_BUILD_PORTAL_DEPLOYMENT_MANIFEST_SHA256";
 const MAX_PORTAL_MANIFEST_BYTES: usize = 65_536;
+#[cfg(feature = "preview-portal")]
+const PREVIEW_PROFILE_PATH_ENV: &str = "OXID_BUILD_PREVIEW_SIGNED_PROFILE_PATH";
+#[cfg(feature = "preview-portal")]
+const PREVIEW_PROFILE_SHA256_ENV: &str = "OXID_BUILD_PREVIEW_SIGNED_PROFILE_SHA256";
+#[cfg(feature = "preview-portal")]
+const PREVIEW_TRUST_ROOT_PATH_ENV: &str = "OXID_BUILD_PREVIEW_TRUST_ROOT_PATH";
+#[cfg(feature = "preview-portal")]
+const PREVIEW_TRUST_ROOT_SHA256_ENV: &str = "OXID_BUILD_PREVIEW_TRUST_ROOT_SHA256";
 const PORTAL_PROFILE_AUTHORITY_PATH_ENV: &str = "OXID_BUILD_PORTAL_PROFILE_AUTHORITY_PATH";
 const PORTAL_PROFILE_AUTHORITY_SHA256_ENV: &str = "OXID_BUILD_PORTAL_PROFILE_AUTHORITY_SHA256";
 const PORTAL_PUBLIC_ORIGIN_ENV: &str = "OXID_BUILD_PORTAL_PUBLIC_ORIGIN";
@@ -44,6 +52,8 @@ fn main() {
     let brand_directory = repository_root.join("brands/oxid");
     let output_directory =
         PathBuf::from(env::var_os("OUT_DIR").expect("Cargo must provide OUT_DIR"));
+    #[cfg(feature = "preview-portal")]
+    authorize_preview_build();
     authorize_portal_profile();
     let brand = oxid_brand_build::load_brand_pack(&brand_directory)
         .unwrap_or_else(|error| panic!("default brand pack is invalid: {error}"));
@@ -51,7 +61,7 @@ fn main() {
         .unwrap_or_else(|error| panic!("thin app manifest does not match its brand: {error}"));
     oxid_brand_build::generate_brand(&brand_directory, output_directory.clone())
         .unwrap_or_else(|error| panic!("default brand generation failed: {error}"));
-    embed_portal_manifest(&output_directory);
+    embed_portal_manifests(&output_directory);
 
     println!("cargo:rerun-if-changed={}", brand_directory.display());
     println!(
@@ -138,53 +148,134 @@ fn authorize_portal_profile() {
     println!("cargo:rerun-if-changed={}", path.display());
 }
 
-fn embed_portal_manifest(output_directory: &std::path::Path) {
-    println!("cargo:rerun-if-env-changed={PORTAL_MANIFEST_PATH_ENV}");
-    println!("cargo:rerun-if-env-changed={PORTAL_MANIFEST_SHA256_ENV}");
+#[cfg(feature = "preview-portal")]
+fn authorize_preview_build() {
+    assert!(
+        env::var("CARGO_CFG_TARGET_OS")
+            .is_ok_and(|target| matches!(target.as_str(), "ios" | "android")),
+        "preview-portal is available only on iOS and Android"
+    );
+    let conflicting = [
+        "DESKTOP",
+        "WEB",
+        "STANDALONE_DEVELOPMENT",
+        "STANDALONE_NATIVE_CUSTODY",
+        "STANDALONE_LOCAL",
+        "STANDALONE_TAILNET",
+        "STANDALONE_PORTAL",
+        "STANDALONE_PORTAL_TAILNET",
+        "PREPROD_OBSERVATION",
+        "UI_PROFILE_DEV",
+        "UI_PROFILE_DEMO",
+    ];
+    assert!(
+        !conflicting
+            .iter()
+            .any(|feature| env::var_os(format!("CARGO_FEATURE_{feature}")).is_some()),
+        "preview-portal is an isolated protected mobile profile"
+    );
+}
+
+fn embed_portal_manifests(output_directory: &std::path::Path) {
     let mobile_target = env::var("CARGO_CFG_TARGET_OS")
         .is_ok_and(|target| matches!(target.as_str(), "ios" | "android"));
-    let wasm_target = env::var("CARGO_CFG_TARGET_ARCH").is_ok_and(|target| target == "wasm32");
-    if active_portal_profile().is_none() || !mobile_target || wasm_target {
+    let preview = cfg!(feature = "preview-portal");
+    if !mobile_target || (!preview && active_portal_profile().is_none()) {
         return;
     }
+    let (manifest, digest) = read_pinned_input(
+        PORTAL_MANIFEST_PATH_ENV,
+        PORTAL_MANIFEST_SHA256_ENV,
+        MAX_PORTAL_MANIFEST_BYTES,
+    );
+    #[cfg(feature = "preview-portal")]
+    embed_preview_profile(output_directory, &digest);
+    fs::write(output_directory.join("portal-deployment.json"), manifest)
+        .expect("Portal deployment manifest could not be embedded");
+    println!("cargo:rustc-env=OXID_EMBEDDED_PORTAL_DEPLOYMENT_SHA256={digest}");
+}
 
-    let path = PathBuf::from(
-        env::var_os(PORTAL_MANIFEST_PATH_ENV)
-            .unwrap_or_else(|| panic!("standalone-portal requires {PORTAL_MANIFEST_PATH_ENV}")),
+#[cfg(feature = "preview-portal")]
+fn embed_preview_profile(output_directory: &std::path::Path, manifest_digest: &str) {
+    use oxid_adapter_deployment_profile::{DeploymentProfileVerifier, DeploymentTrustRoot};
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    let (trust_bytes, _) = read_pinned_input(
+        PREVIEW_TRUST_ROOT_PATH_ENV,
+        PREVIEW_TRUST_ROOT_SHA256_ENV,
+        4_096,
+    );
+    let (profile_bytes, _) =
+        read_pinned_input(PREVIEW_PROFILE_PATH_ENV, PREVIEW_PROFILE_SHA256_ENV, 65_536);
+    let root = DeploymentTrustRoot::from_reviewed_json(&trust_bytes)
+        .expect("embedded Preview trust policy is invalid");
+    let verifier = DeploymentProfileVerifier::new("io.medianox.oxid", [root], 1)
+        .expect("embedded Preview trust policy is invalid");
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("trusted build time is unavailable")
+        .as_secs();
+    let profile = verifier
+        .verify(&profile_bytes, now)
+        .expect("embedded signed Preview profile was rejected");
+    assert_eq!(
+        profile.midnight().network_id(),
+        "preview",
+        "signed Preview network mismatch"
     );
     assert!(
-        path.is_absolute(),
-        "{PORTAL_MANIFEST_PATH_ENV} must be absolute"
+        profile.ssi().portal_manifest_sha256() == Some(manifest_digest),
+        "signed Preview Portal manifest digest mismatch"
     );
+    fs::write(
+        output_directory.join("preview-trust-root.json"),
+        trust_bytes,
+    )
+    .expect("Preview trust root could not be embedded");
+    fs::write(
+        output_directory.join("preview-signed-profile.json"),
+        profile_bytes,
+    )
+    .expect("signed Preview profile could not be embedded");
+}
+
+fn read_pinned_input(path_env: &str, digest_env: &str, max_bytes: usize) -> (Vec<u8>, String) {
+    println!("cargo:rerun-if-env-changed={path_env}");
+    println!("cargo:rerun-if-env-changed={digest_env}");
+    let path =
+        PathBuf::from(env::var_os(path_env).unwrap_or_else(|| panic!("required {path_env}")));
+    assert!(path.is_absolute(), "{path_env} must be absolute");
     let metadata = fs::symlink_metadata(&path)
-        .unwrap_or_else(|_| panic!("standalone-portal manifest must be a readable regular file"));
+        .unwrap_or_else(|_| panic!("{path_env} must select a readable regular file"));
     assert!(
-        metadata.file_type().is_file() && !metadata.file_type().is_symlink(),
-        "standalone-portal manifest must be a regular non-symlink file"
+        metadata.file_type().is_file(),
+        "{path_env} must select a regular non-symlink file"
     );
-    let bytes = fs::read(&path)
-        .unwrap_or_else(|_| panic!("standalone-portal manifest must be a readable regular file"));
     assert!(
-        !bytes.is_empty() && bytes.len() <= MAX_PORTAL_MANIFEST_BYTES,
-        "standalone-portal manifest has an invalid size"
+        metadata.len() > 0 && metadata.len() <= max_bytes as u64,
+        "{path_env} has an invalid size"
     );
-    let digest = env::var(PORTAL_MANIFEST_SHA256_ENV)
-        .unwrap_or_else(|_| panic!("standalone-portal requires {PORTAL_MANIFEST_SHA256_ENV}"));
+    let mut bytes = Vec::with_capacity(metadata.len() as usize);
+    fs::File::open(&path)
+        .and_then(|file| file.take(max_bytes as u64 + 1).read_to_end(&mut bytes))
+        .unwrap_or_else(|_| panic!("{path_env} must select a readable regular file"));
+    assert!(
+        !bytes.is_empty() && bytes.len() <= max_bytes,
+        "{path_env} has an invalid size"
+    );
+    let digest = env::var(digest_env).unwrap_or_else(|_| panic!("required {digest_env}"));
     assert!(
         digest.len() == 64
             && digest
                 .bytes()
                 .all(|value| value.is_ascii_digit() || (b'a'..=b'f').contains(&value)),
-        "standalone-portal manifest digest must be lowercase SHA-256"
+        "{digest_env} must be lowercase SHA-256"
     );
     let actual = Sha256::digest(&bytes)
         .iter()
         .map(|byte| format!("{byte:02x}"))
         .collect::<String>();
-    assert_eq!(actual, digest, "standalone-portal manifest digest mismatch");
-
-    fs::write(output_directory.join("portal-deployment.json"), bytes)
-        .expect("standalone-portal manifest must embed into OUT_DIR");
-    println!("cargo:rustc-env=OXID_EMBEDDED_PORTAL_DEPLOYMENT_SHA256={digest}");
+    assert!(actual == digest, "{digest_env} mismatch");
     println!("cargo:rerun-if-changed={}", path.display());
+    (bytes, digest)
 }

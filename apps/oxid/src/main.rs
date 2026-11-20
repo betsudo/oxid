@@ -35,7 +35,8 @@ fn developer_pager_viewport() -> (f64, f64) {
 #[cfg(any(
     feature = "standalone-portal",
     feature = "standalone-portal-tailnet",
-    feature = "preprod-observation"
+    feature = "preprod-observation",
+    feature = "preview-portal"
 ))]
 fn startup_failure(error: impl std::fmt::Display) -> ! {
     eprintln!("Oxid startup failed: {error}");
@@ -314,6 +315,16 @@ fn main() {
                 panic!("embedded Compact presentation runtime is invalid: {error}")
             });
     #[cfg(all(
+        feature = "preview-portal",
+        any(target_os = "ios", target_os = "android")
+    ))]
+    let application = oxid_composition::compose_embedded_preview_portal(
+        include_bytes!(concat!(env!("OUT_DIR"), "/preview-trust-root.json")),
+        include_bytes!(concat!(env!("OUT_DIR"), "/preview-signed-profile.json")),
+        include_bytes!(concat!(env!("OUT_DIR"), "/portal-deployment.json")),
+    )
+    .unwrap_or_else(|error| startup_failure(error));
+    #[cfg(all(
         feature = "preprod-observation",
         any(target_os = "ios", target_os = "android")
     ))]
@@ -400,7 +411,8 @@ fn main() {
     #[cfg(not(any(
         feature = "standalone-development",
         feature = "standalone-native-custody",
-        feature = "preprod-observation"
+        feature = "preprod-observation",
+        feature = "preview-portal"
     )))]
     let application = oxid_composition::compose();
     #[cfg(all(
@@ -425,12 +437,14 @@ fn main() {
     let standalone_credential_offer = None;
     #[cfg(any(
         feature = "standalone-development",
-        feature = "standalone-native-custody"
+        feature = "standalone-native-custody",
+        feature = "preview-portal"
     ))]
     let credential_issuance_ready = true;
     #[cfg(not(any(
         feature = "standalone-development",
-        feature = "standalone-native-custody"
+        feature = "standalone-native-custody",
+        feature = "preview-portal"
     )))]
     let credential_issuance_ready = false;
     #[cfg(any(
