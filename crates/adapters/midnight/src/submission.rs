@@ -40,7 +40,7 @@ use midnight_transient_crypto::{
     },
 };
 use oxid_adapter_platform_system::{
-    connect_json_rpc_websocket, http_client_builder_for, websocket_connector_for,
+    connect_json_rpc_websocket_with_headers, http_client_builder_for, websocket_connector_for,
 };
 use oxid_platform_ports::ClockPort;
 use oxid_wallet_application::WalletTransactionPortError;
@@ -315,12 +315,28 @@ pub async fn authenticate_midnight_chain_identity(
     node_websocket_url: &str,
     expected_genesis_hash: &[u8; 32],
 ) -> Result<(), MidnightChainIdentityError> {
+    authenticate_midnight_chain_identity_with_headers(
+        node_websocket_url,
+        expected_genesis_hash,
+        reqwest::header::HeaderMap::new(),
+    )
+    .await
+}
+
+pub(super) async fn authenticate_midnight_chain_identity_with_headers(
+    node_websocket_url: &str,
+    expected_genesis_hash: &[u8; 32],
+    headers: reqwest::header::HeaderMap,
+) -> Result<(), MidnightChainIdentityError> {
     super::indexer::validate_websocket_url(node_websocket_url)
         .map_err(|_| MidnightChainIdentityError::InvalidNodeEndpoint)?;
-    let client = timeout(CONNECT_TIMEOUT, connect_midnight_node(node_websocket_url))
-        .await
-        .map_err(|_| MidnightChainIdentityError::NodeUnavailable)?
-        .map_err(|_| MidnightChainIdentityError::NodeUnavailable)?;
+    let client = timeout(
+        CONNECT_TIMEOUT,
+        connect_midnight_node_with_headers(node_websocket_url, headers),
+    )
+    .await
+    .map_err(|_| MidnightChainIdentityError::NodeUnavailable)?
+    .map_err(|_| MidnightChainIdentityError::NodeUnavailable)?;
     let genesis_hash = client.genesis_hash();
     let observed: &[u8] = genesis_hash.as_ref();
     if observed == expected_genesis_hash {
@@ -331,13 +347,22 @@ pub async fn authenticate_midnight_chain_identity(
 }
 
 async fn connect_midnight_node(endpoint: &str) -> Result<OnlineClient<SubstrateConfig>, ()> {
+    connect_midnight_node_with_headers(endpoint, reqwest::header::HeaderMap::new()).await
+}
+
+async fn connect_midnight_node_with_headers(
+    endpoint: &str,
+    headers: reqwest::header::HeaderMap,
+) -> Result<OnlineClient<SubstrateConfig>, ()> {
     let url = Url::parse(endpoint).map_err(|_| ())?;
-    if url.scheme() == "ws" && url.query().is_none() {
+    if url.scheme() == "ws" && url.query().is_none() && headers.is_empty() {
         return OnlineClient::from_insecure_url(endpoint)
             .await
             .map_err(|_| ());
     }
-    let client = connect_json_rpc_websocket(endpoint).await.map_err(|_| ())?;
+    let client = connect_json_rpc_websocket_with_headers(endpoint, headers)
+        .await
+        .map_err(|_| ())?;
     OnlineClient::from_rpc_client(RpcClient::new(client))
         .await
         .map_err(|_| ())
@@ -726,10 +751,18 @@ pub(crate) struct ChainTip {
 pub(crate) async fn fetch_chain_tip(
     endpoint: &str,
 ) -> Result<ChainTip, WalletTransactionPortError> {
+    fetch_chain_tip_with_headers(endpoint, reqwest::header::HeaderMap::new()).await
+}
+
+pub(super) async fn fetch_chain_tip_with_headers(
+    endpoint: &str,
+    headers: reqwest::header::HeaderMap,
+) -> Result<ChainTip, WalletTransactionPortError> {
     ensure_tls_provider()?;
     let endpoint = Url::parse(endpoint).map_err(|_| WalletTransactionPortError::Unavailable)?;
     let client = chain_tip_client(&endpoint)?;
-    let request = chain_tip_request(endpoint.as_str())?;
+    let mut request = chain_tip_request(endpoint.as_str())?;
+    request.headers_mut().extend(headers);
     let response = client
         .execute(request)
         .await
@@ -760,6 +793,7 @@ fn chain_tip_client(endpoint: &Url) -> Result<reqwest::Client, WalletTransaction
         // Standalone wallet routes are explicit trust-boundary configuration. Do not let
         // ambient proxy variables silently redirect them.
         .no_proxy()
+        .redirect(reqwest::redirect::Policy::none())
         .connect_timeout(CONNECT_TIMEOUT)
         .timeout(CONNECT_TIMEOUT)
         .build()
@@ -1827,7 +1861,12 @@ fn websocket_message_type(value: &Value) -> Result<&str, WalletTransactionPortEr
 
 #[cfg(test)]
 mod tests {
-    use std::{net::TcpListener, sync::Condvar, thread};
+    use std::{
+        io::{BufRead, BufReader, ErrorKind, Write},
+        net::TcpListener,
+        sync::Condvar,
+        thread,
+    };
 
     use midnight_ledger::{
         events::{EventDetails, EventSource},
@@ -2521,6 +2560,58 @@ mod tests {
         assert_eq!(
             decode_chain_tip_body(&vec![0_u8; MAX_CHAIN_TIP_BYTES + 1]).err(),
             Some(WalletTransactionPortError::InvalidChainState)
+        );
+    }
+
+    #[test]
+    fn chain_tip_authenticates_one_request_and_refuses_redirects() {
+        const PROJECT_ID: &str = "fixture-indexer-credential";
+        let redirect_target = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        redirect_target.set_nonblocking(true).unwrap();
+        let destination = redirect_target.local_addr().unwrap();
+        let server = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let route = format!("http://{}/api/v0", server.local_addr().unwrap());
+        let fixture = thread::spawn(move || {
+            let (mut stream, _) = server.accept().unwrap();
+            stream.set_read_timeout(Some(CONNECT_TIMEOUT)).unwrap();
+            let mut request = BufReader::new(&mut stream);
+            let mut request_line = String::new();
+            request.read_line(&mut request_line).unwrap();
+            assert_eq!(request_line, "POST /api/v0 HTTP/1.1\r\n");
+            let mut project_id_received = false;
+            loop {
+                let mut line = String::new();
+                assert_ne!(request.read_line(&mut line).unwrap(), 0);
+                if line == "\r\n" {
+                    break;
+                }
+                if let Some((name, value)) = line.split_once(':')
+                    && name.eq_ignore_ascii_case("project_id")
+                {
+                    project_id_received = value.trim() == PROJECT_ID;
+                }
+            }
+            assert!(project_id_received);
+            write!(
+                stream,
+                "HTTP/1.1 307 Temporary Redirect\r\nLocation: http://{destination}/unexpected\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+            )
+            .unwrap();
+        });
+
+        let mut headers = reqwest::header::HeaderMap::new();
+        let mut project_id = reqwest::header::HeaderValue::from_static(PROJECT_ID);
+        project_id.set_sensitive(true);
+        headers.insert("project_id", project_id);
+        let result = runtime().block_on(fetch_chain_tip_with_headers(&route, headers));
+        assert!(matches!(
+            result,
+            Err(WalletTransactionPortError::InvalidChainState)
+        ));
+        fixture.join().unwrap();
+        assert_eq!(
+            redirect_target.accept().unwrap_err().kind(),
+            ErrorKind::WouldBlock,
         );
     }
 

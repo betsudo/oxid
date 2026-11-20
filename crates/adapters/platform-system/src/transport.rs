@@ -5,7 +5,7 @@
 use std::{error::Error, fmt, net::IpAddr, sync::Arc};
 
 use jsonrpsee::ws_client::{WsClient, WsClientBuilder};
-use reqwest::{Certificate, ClientBuilder};
+use reqwest::{Certificate, ClientBuilder, header::HeaderMap};
 use rustls::{ClientConfig, RootCertStore};
 use tokio_tungstenite::Connector;
 use tracing::{instrument::WithSubscriber, subscriber::NoSubscriber};
@@ -90,9 +90,18 @@ pub fn websocket_connector_for(endpoint: &Url) -> Result<Option<Connector>, Tran
 /// Connects JSON-RPC readers and submitters with the same roots as other
 /// WebSocket clients. Never follow redirects or trace an authenticated URL.
 pub async fn connect_json_rpc_websocket(endpoint: &str) -> Result<WsClient, TransportTrustError> {
+    connect_json_rpc_websocket_with_headers(endpoint, HeaderMap::new()).await
+}
+
+/// Connects a node through the native TLS policy with transport-scoped headers.
+pub async fn connect_json_rpc_websocket_with_headers(
+    endpoint: &str,
+    headers: HeaderMap,
+) -> Result<WsClient, TransportTrustError> {
     let url = Url::parse(endpoint).map_err(|_| TransportTrustError::InvalidEndpoint)?;
     // jsonrpsee counts the initial handshake as one connection attempt.
     let builder = WsClientBuilder::default()
+        .set_headers(headers)
         .max_redirections(1)
         .max_buffer_capacity_per_subscription(4096)
         .set_max_logging_length(0);
@@ -640,8 +649,10 @@ mod tests {
     }
 
     #[test]
-    fn json_rpc_websocket_rejects_missing_and_redirected_routes() {
-        use std::io::ErrorKind;
+    fn json_rpc_websocket_authenticates_one_upgrade_and_refuses_redirects() {
+        use std::io::{BufRead, BufReader, ErrorKind};
+
+        const PROJECT_ID: &str = "fixture-node-credential";
 
         let redirect_target = TcpListener::bind(("127.0.0.1", 0)).unwrap();
         redirect_target.set_nonblocking(true).unwrap();
@@ -655,15 +666,33 @@ mod tests {
             let server = thread::spawn(move || {
                 let (mut stream, _) = route.accept().unwrap();
                 bound_socket(&stream);
-                let mut request = [0_u8; 1024];
-                assert_ne!(stream.read(&mut request).unwrap(), 0);
+                let mut request = BufReader::new(&mut stream);
+                let mut project_id_received = false;
+                loop {
+                    let mut line = String::new();
+                    assert_ne!(request.read_line(&mut line).unwrap(), 0);
+                    if line == "\r\n" {
+                        break;
+                    }
+                    if let Some((name, value)) = line.split_once(':')
+                        && name.eq_ignore_ascii_case("project_id")
+                    {
+                        project_id_received = value.trim() == PROJECT_ID;
+                    }
+                }
+                assert!(project_id_received);
                 write!(
                     stream,
                     "HTTP/1.1 {response}Content-Length: 0\r\nConnection: close\r\n\r\n"
                 )
                 .unwrap();
             });
-            let result = runtime().block_on(connect_json_rpc_websocket(&endpoint));
+            let mut headers = HeaderMap::new();
+            let mut value = reqwest::header::HeaderValue::from_static(PROJECT_ID);
+            value.set_sensitive(true);
+            headers.insert("project_id", value);
+            let result =
+                runtime().block_on(connect_json_rpc_websocket_with_headers(&endpoint, headers));
             assert!(matches!(
                 result,
                 Err(TransportTrustError::ConnectionUnavailable)
