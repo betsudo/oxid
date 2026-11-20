@@ -143,6 +143,27 @@ mod tests {
     }
 
     #[test]
+    fn keychain_fixture_is_admitted_but_refuses_to_send_the_project_id() {
+        let trust = include_bytes!("../../tests/fixtures/preprod-portal/trust-root.json");
+        let profile = include_bytes!("../../tests/fixtures/preprod-portal/keychain-profile.json");
+        let manifest = include_bytes!("../../tests/fixtures/preprod-portal/portal.json");
+        let (profile, _) = admit_public_inputs(trust, profile, manifest, NOW, "preprod")
+            .expect("the keychain fixture must get past signed input admission");
+        let credential = oxid_adapter_midnight::MidnightPreprodCredential::new(format!(
+            "nightpreprod{}",
+            "Z".repeat(32)
+        ))
+        .expect("synthetic fixture project ID");
+        assert_eq!(
+            futures::executor::block_on(super::super::authenticate_preprod_deployment(
+                profile, credential,
+            ))
+            .err(),
+            Some(StartupError::InvalidMidnightProfile),
+        );
+    }
+
+    #[test]
     fn preview_startup_rejects_wrong_network_expiry_and_changed_inputs() {
         let check = |trust: &[u8], profile: &[u8], manifest: &[u8], now| {
             admit_public_inputs(trust, profile, manifest, now, "preview").err()
