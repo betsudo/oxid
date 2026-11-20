@@ -132,7 +132,10 @@ same next cursor. Historical checkpoints can report progress while live
 synchronization catches up. The native worker can reopen the stream from its
 latest durable cursor when a replay window fills. This keeps sync progress
 visible while retaining the overall session deadline. Transaction preparation
-requires a current Ledger 9 result.
+requires a current Ledger 9 result. When a public checkpoint's saved
+cursors match, the wallet asks the indexer for that event again to learn the
+current watermark. It applies only newer events. Silence or an empty
+subscription response does not confirm the saved state.
 
 Run the bounded native regression matrix before public qualification:
 
@@ -193,26 +196,44 @@ Check the receipt and artifact immediately before handing them to the device
 operator.
 
 ```bash
-candidate=target/android-release-candidate/preview
-apk="$candidate/oxid-app-arm64-v8a-release.apk"
-receipt="$candidate/receipt.json"
-jq -e '.schema == "oxid-android-preview-candidate-receipt-v1"
-  and .preview.network == "preview" and .preview.features == "preview-portal"' "$receipt"
-test "$(git rev-parse HEAD)" = "$(jq -er '.source.head' "$receipt")"
-test "$OXID_BUILD_PREVIEW_SIGNED_PROFILE_SHA256" = "$(jq -er '.preview.signedProfileSha256' "$receipt")"
-test "$OXID_BUILD_PREVIEW_TRUST_ROOT_SHA256" = "$(jq -er '.preview.trustRootSha256' "$receipt")"
-test "$OXID_BUILD_PORTAL_DEPLOYMENT_MANIFEST_SHA256" = "$(jq -er '.preview.portalManifestSha256' "$receipt")"
-test "$(shasum -a 256 "$apk" | cut -d' ' -f1)" = "$(jq -er '.artifact.sha256' "$receipt")"
+(
+  set -euo pipefail
+  candidate=target/android-release-candidate/preview
+  apk="$candidate/oxid-app-arm64-v8a-release.apk"
+  receipt="$candidate/receipt.json"
+  fail() { printf '%s\n' "$1" >&2; exit 1; }
+
+  jq -e '.schema == "oxid-android-preview-candidate-receipt-v1"
+    and .preview.network == "preview" and .preview.features == "preview-portal"' "$receipt" >/dev/null \
+    || fail "Invalid Android Preview candidate receipt"
+  head="$(git rev-parse --verify HEAD)" || fail "Android Preview source head unavailable"
+  test "$head" = "$(jq -er '.source.head' "$receipt")" \
+    || fail "Android Preview source head mismatch"
+  test "${OXID_BUILD_PREVIEW_SIGNED_PROFILE_SHA256:?}" = "$(jq -er '.preview.signedProfileSha256' "$receipt")" \
+    || fail "Android Preview signed profile mismatch"
+  test "${OXID_BUILD_PREVIEW_TRUST_ROOT_SHA256:?}" = "$(jq -er '.preview.trustRootSha256' "$receipt")" \
+    || fail "Android Preview trust root mismatch"
+  test "${OXID_BUILD_PORTAL_DEPLOYMENT_MANIFEST_SHA256:?}" = "$(jq -er '.preview.portalManifestSha256' "$receipt")" \
+    || fail "Android Preview Portal manifest mismatch"
+  apk_digest="$(shasum -a 256 "$apk" | cut -d' ' -f1)" || fail "Android Preview APK unreadable"
+  test "$apk_digest" = "$(jq -er '.artifact.sha256' "$receipt")" \
+    || fail "Android Preview APK digest mismatch"
+)
 ```
 
 When the owner authorizes the exact physical device and confirms signer
-continuity, install with `adb -s "$AUTHORIZED_DEVICE" install -r "$apk"`.
+continuity, install the verified APK.
+
+```bash
+adb -s "$AUTHORIZED_DEVICE" install -r target/android-release-candidate/preview/oxid-app-arm64-v8a-release.apk
+```
+
 If Android rejects the signature or version, resolve the signing or version
 issue before proceeding. Preserve the owner's wallet data throughout the
 demo. Use a separate protected test wallet for the public journey.
 
-Follow the public qualification steps with a fresh Portal QR displayed on a
-separate screen. After issuance, terminate and relaunch the app with its
+Open Oxid and wait for the wallet to finish startup. Follow the public
+qualification steps with a fresh Portal QR displayed on a separate screen. After issuance, terminate and relaunch the app with its
 data intact and verify the restored credential against the public resolver.
 Record the verified source and APK digests, signer fingerprint, chain
 identity, and non-sensitive outcomes. The handoff is `READY` when the

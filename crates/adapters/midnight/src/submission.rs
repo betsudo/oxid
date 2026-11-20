@@ -59,7 +59,7 @@ use crate::{
     },
     dust_replay::{DustReplayKeys, DustReplayState, replay_dust_batch},
     local_proving,
-    replay_era::{ReplayEvent, ReplayWindow, replay_era},
+    replay_era::{LedgerEra, ReplayEvent, ReplayWindow, replay_era},
     submission_journal::{StoredSubmissionJournalEntry, StoredSubmissionState},
     transaction::{
         MidnightCompletionOutcome, MidnightCompletionRequest, MidnightRegistrationContext,
@@ -1060,11 +1060,16 @@ async fn synchronize_dust_controlled_with_limits(
         let mut replayed_events = 0_usize;
         loop {
             ensure_dust_sync_active(cancellation, started_at)?;
-            let starting_id = match durable_cursor {
-                Some(cursor) => cursor
+            // Public streams include the requested event. Reconfirm a
+            // checkpoint that looked complete using that event's live watermark.
+            let mut anchor =
+                durable_cursor.filter(|cursor| route.mixed_eras() && Some(*cursor) == target_id);
+            let starting_id = match (anchor, durable_cursor) {
+                (Some(cursor), _) => cursor,
+                (None, Some(cursor)) => cursor
                     .checked_add(1)
                     .ok_or(WalletTransactionPortError::InvalidChainState)?,
-                None => 0,
+                (None, None) => 0,
             };
             let starting_id = i64::try_from(starting_id)
                 .map_err(|_| WalletTransactionPortError::InvalidChainState)?;
@@ -1165,6 +1170,22 @@ async fn synchronize_dust_controlled_with_limits(
                                     .ok_or(WalletTransactionPortError::InvalidChainState)?;
                                 let decoded =
                                     decode_dust_event_for_route(data, route.mixed_eras())?;
+                                if let Some(saved) = anchor.take() {
+                                    let matches_era = state.as_ref().is_some_and(|state| {
+                                        state.current().is_some()
+                                            == (decoded.event.era() == LedgerEra::V9)
+                                    });
+                                    if decoded.id != saved || decoded.max_id < saved || !matches_era
+                                    {
+                                        return Err(WalletTransactionPortError::InvalidChainState);
+                                    }
+                                    target_id = Some(decoded.max_id);
+                                    if decoded.max_id == saved {
+                                        break DustReceiveOutcome::TargetReached;
+                                    }
+                                    // The anchor was already applied. Replay only the new events.
+                                    continue;
+                                }
                                 let sequence_valid = match received_cursor {
                                     // DUST IDs are sparse global indexer cursors:
                                     // unrelated ledger activity can create gaps.
@@ -1248,6 +1269,9 @@ async fn synchronize_dust_controlled_with_limits(
                     if window.renew(durable_cursor) {
                         continue;
                     }
+                    return Err(WalletTransactionPortError::Timeout);
+                }
+                if route.mixed_eras() && outcome != DustReceiveOutcome::TargetReached {
                     return Err(WalletTransactionPortError::Timeout);
                 }
                 let current_cursor =
@@ -3086,9 +3110,11 @@ mod tests {
             vec![
                 (0, vec![(1, 8, legacy.clone()), (8, 8, current.clone())]),
                 (0, vec![(1, 8, legacy.clone()), (8, 8, current.clone())]),
-                (2, vec![(8, 8, current)]),
-                (9, vec![]),
-                (9, vec![(9, 9, legacy)]),
+                (2, vec![(8, 8, current.clone())]),
+                (8, vec![]),
+                (8, vec![(8, 8, current.clone())]),
+                (8, vec![(8, 12, current.clone()), (12, 12, current)]),
+                (8, vec![(8, 8, legacy)]),
             ],
             true,
         );
@@ -3098,7 +3124,7 @@ mod tests {
         let keys = DustReplayKeys::new(&dust_key, Some(&seed));
         let public_key = DustPublicKey::from(dust_key.clone());
         let network = ChainNetworkId::parse("preview").unwrap();
-        let directory = crate::legacy_replay_compatibility::private_checkpoint_directory();
+        let directory = crate::legacy_replay_tests::private_checkpoint_directory();
         let config = MidnightDustCheckpointConfig::new(directory.path().join("dust.bin")).unwrap();
         let parameters = INITIAL_PARAMETERS.dust;
         let cancel = AtomicBool::new(false);
@@ -3182,6 +3208,23 @@ mod tests {
             .unwrap()
             .unwrap();
         assert!(post_upgrade.state.current().is_some());
+        assert_eq!(
+            runtime()
+                .block_on(synchronize_dust_with_control(
+                    route,
+                    &keys,
+                    parameters,
+                    Some(post_upgrade),
+                    &cancel,
+                    &mut |_| panic!("a public checkpoint needs a live watermark"),
+                ))
+                .err(),
+            Some(WalletTransactionPortError::Timeout)
+        );
+        let post_upgrade = store
+            .load(&network, &public_key, parameters)
+            .unwrap()
+            .unwrap();
         let resumed = runtime()
             .block_on(synchronize_dust_with_control(
                 route,
@@ -3206,6 +3249,25 @@ mod tests {
             resumed_bytes == uninterrupted_bytes,
             "DUST checkpoint changed native state"
         );
+        let post_upgrade = store
+            .load(&network, &public_key, parameters)
+            .unwrap()
+            .unwrap();
+        let advanced = runtime()
+            .block_on(synchronize_dust_with_control(
+                route,
+                &keys,
+                parameters,
+                Some(post_upgrade),
+                &cancel,
+                &mut |progress| {
+                    assert_eq!((progress.current_cursor, progress.target_cursor), (12, 12));
+                    Ok(())
+                },
+            ))
+            .unwrap();
+        assert_eq!((advanced.current_cursor, advanced.target_cursor), (12, 12));
+        assert_eq!(advanced.events_processed, 1);
         let post_upgrade = store
             .load(&network, &public_key, parameters)
             .unwrap()

@@ -18,7 +18,7 @@ use tokio_tungstenite::tungstenite::{Message, protocol::WebSocketConfig};
 use url::Url;
 
 use crate::{
-    replay_era::ReplayWindow,
+    replay_era::{LedgerEra, ReplayWindow},
     shielded::{
         DecodedZswapEvent, MIXED_ZSWAP_LEDGER_EVENTS_QUERY, ZSWAP_LEDGER_EVENTS_QUERY,
         decode_zswap_event,
@@ -141,11 +141,16 @@ async fn synchronize_shielded_with_limits(
         let mut replayed_events = 0_usize;
         loop {
             ensure_active(cancellation)?;
-            let starting_id = match durable_cursor {
-                Some(cursor) => cursor
+            // Public streams include the requested event. Reconfirm a
+            // checkpoint that looked complete using that event's live watermark.
+            let mut anchor = durable_cursor
+                .filter(|cursor| route.mixed_eras() && Some(*cursor) == target_cursor);
+            let starting_id = match (anchor, durable_cursor) {
+                (Some(cursor), _) => cursor,
+                (None, Some(cursor)) => cursor
                     .checked_add(1)
                     .ok_or(ShieldedTransportError::InvalidData)?,
-                None => 0,
+                (None, None) => 0,
             };
             let starting_id =
                 i64::try_from(starting_id).map_err(|_| ShieldedTransportError::InvalidData)?;
@@ -251,6 +256,24 @@ async fn synchronize_shielded_with_limits(
                                     .ok_or(ShieldedTransportError::InvalidData)?;
                                 let decoded = decode_zswap_event(data, route.mixed_eras())
                                     .map_err(|_| ShieldedTransportError::InvalidData)?;
+                                if let Some(saved) = anchor.take() {
+                                    let matches_era = state.as_ref().is_some_and(|state| {
+                                        state.current().is_some()
+                                            == (decoded.event.era() == LedgerEra::V9)
+                                    });
+                                    if decoded.cursor != saved
+                                        || decoded.target_cursor < saved
+                                        || !matches_era
+                                    {
+                                        return Err(ShieldedTransportError::InvalidData);
+                                    }
+                                    target_cursor = Some(decoded.target_cursor);
+                                    if decoded.target_cursor == saved {
+                                        break ShieldedReceiveOutcome::TargetReached;
+                                    }
+                                    // The anchor was already applied. Replay only the new events.
+                                    continue;
+                                }
                                 let sequence_valid = match received_cursor {
                                     // Zswap IDs are sparse global indexer cursors:
                                     // unrelated ledger activity can create gaps.
@@ -334,6 +357,9 @@ async fn synchronize_shielded_with_limits(
                     if window.renew(durable_cursor) {
                         continue;
                     }
+                    return Err(ShieldedTransportError::Timeout);
+                }
+                if route.mixed_eras() && outcome != ShieldedReceiveOutcome::TargetReached {
                     return Err(ShieldedTransportError::Timeout);
                 }
                 let current_cursor = durable_cursor.ok_or(ShieldedTransportError::InvalidData)?;
@@ -591,6 +617,16 @@ mod tests {
         events: Vec<Value>,
         mixed_eras: bool,
     ) -> (String, thread::JoinHandle<()>) {
+        server_for_eras_with_completion(expected_start, events, mixed_eras, true)
+    }
+
+    #[allow(clippy::result_large_err)]
+    fn server_for_eras_with_completion(
+        expected_start: i64,
+        events: Vec<Value>,
+        mixed_eras: bool,
+        send_completion: bool,
+    ) -> (String, thread::JoinHandle<()>) {
         let listener = TcpListener::bind("127.0.0.1:0").expect("loopback binds");
         listener
             .set_nonblocking(true)
@@ -654,14 +690,16 @@ mod tests {
                         .await
                         .expect("event sends");
                 }
-                socket
-                    .send(Message::Text(
-                        json!({ "type": "complete", "id": SUBSCRIPTION_ID })
-                            .to_string()
-                            .into(),
-                    ))
-                    .await
-                    .expect("completion sends");
+                if send_completion {
+                    socket
+                        .send(Message::Text(
+                            json!({ "type": "complete", "id": SUBSCRIPTION_ID })
+                                .to_string()
+                                .into(),
+                        ))
+                        .await
+                        .expect("completion sends");
+                }
                 let _ = socket.next().await;
             });
         });
@@ -1154,7 +1192,7 @@ mod tests {
         current_message["payload"]["data"]["zswapLedgerEvents"]["protocolVersion"] =
             json!(2_001_100);
         let network = ChainNetworkId::parse("preview").unwrap();
-        let directory = crate::legacy_replay_compatibility::private_checkpoint_directory();
+        let directory = crate::legacy_replay_tests::private_checkpoint_directory();
         let config =
             MidnightShieldedCheckpointConfig::new(directory.path().join("shielded.bin")).unwrap();
         let source = source_fingerprint("wss://fixture.example", true);
@@ -1211,7 +1249,7 @@ mod tests {
         let checkpoint = store.load(&network, &keys, &source).unwrap().unwrap();
         assert!(checkpoint.state.current().is_none());
         cancel.store(false, Ordering::Release);
-        let (endpoint, server) = server_for_eras(3, vec![current_message], true);
+        let (endpoint, server) = server_for_eras(3, vec![current_message.clone()], true);
         let actual = runtime
             .block_on(synchronize_shielded_with_control(
                 MidnightTransportRoute::new(&endpoint, None).with_mixed_eras(true),
@@ -1245,7 +1283,22 @@ mod tests {
         assert_eq!(projection.balances[0].atomic_units, 126);
 
         let current_checkpoint = store.load(&network, &keys, &source).unwrap().unwrap();
-        let (endpoint, server) = server_for_eras(11, Vec::new(), true);
+        let (endpoint, server) = server_for_eras_with_completion(10, Vec::new(), true, false);
+        assert_eq!(
+            runtime
+                .block_on(synchronize_shielded_with_control(
+                    MidnightTransportRoute::new(&endpoint, None).with_mixed_eras(true),
+                    &replay_keys,
+                    Some(current_checkpoint),
+                    &cancel,
+                    &mut |_| panic!("a public checkpoint needs a live watermark"),
+                ))
+                .err(),
+            Some(ShieldedTransportError::Timeout)
+        );
+        server.join().unwrap();
+        let current_checkpoint = store.load(&network, &keys, &source).unwrap().unwrap();
+        let (endpoint, server) = server_for_eras(10, vec![current_message], true);
         let resumed = runtime
             .block_on(synchronize_shielded_with_control(
                 MidnightTransportRoute::new(&endpoint, None).with_mixed_eras(true),
@@ -1273,9 +1326,9 @@ mod tests {
 
         let current_checkpoint = store.load(&network, &keys, &source).unwrap().unwrap();
         let mut regression = old_message;
-        regression["payload"]["data"]["zswapLedgerEvents"]["id"] = json!(11);
-        regression["payload"]["data"]["zswapLedgerEvents"]["maxId"] = json!(11);
-        let (endpoint, server) = server_for_eras(11, vec![regression], true);
+        regression["payload"]["data"]["zswapLedgerEvents"]["id"] = json!(10);
+        regression["payload"]["data"]["zswapLedgerEvents"]["maxId"] = json!(10);
+        let (endpoint, server) = server_for_eras(10, vec![regression], true);
         assert_eq!(
             runtime
                 .block_on(synchronize_shielded_with_control(

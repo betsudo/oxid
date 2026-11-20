@@ -52,11 +52,15 @@
             pkgs.buildPackages.runCommand name attrs (
               script
               + pkgs.lib.optionalString (name == "midnight-transient-crypto-2.2.0") ''
-                parameter=bls_midnight_2p14
-                install -D -m 444 "$tree/../transient-crypto/static/$parameter" "$out/static/$parameter"
-                chmod u+w "$out/src"
-                substituteInPlace "$out/src/proofs.rs" \
-                  --replace-fail "../../transient-crypto/static/$parameter" "../static/$parameter"
+                # The crates.io package has the same name and version. Only
+                # the Git vendor recipe sets tree to the crate source path.
+                if [[ -v tree ]]; then
+                  parameter=bls_midnight_2p14
+                  install -D -m 444 "$tree/../transient-crypto/static/$parameter" "$out/static/$parameter"
+                  chmod u+w "$out/src"
+                  substituteInPlace "$out/src/proofs.rs" \
+                    --replace-fail "../../transient-crypto/static/$parameter" "../static/$parameter"
+                fi
               ''
             );
           # Compact's retained CI evidence mentions Nix store paths. Fetch the

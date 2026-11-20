@@ -1,9 +1,12 @@
 // SPDX-License-Identifier: Apache-2.0
 
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, Mutex};
 
 use dioxus::{mobile::tao::event::Event, prelude::*};
-use oxid_composition::{ApplicationServices, ProductionDeploymentCompositionError as StartupError};
+use oxid_composition::{
+    ApplicationServices, ProductionDeploymentCompositionError as StartupError,
+    PublicPortalStartupLinks,
+};
 
 #[cfg(feature = "preview-portal")]
 const NETWORK: &str = "Preview";
@@ -11,7 +14,11 @@ const NETWORK: &str = "Preview";
 const NETWORK: &str = "PreProd";
 
 #[derive(Clone, Default)]
-struct Startup(Arc<OnceLock<Arc<ApplicationServices>>>);
+struct Startup(Arc<Mutex<PublicPortalStartupLinks<Arc<ApplicationServices>>>>);
+
+fn forward_link(application: &Arc<ApplicationServices>, link: String) {
+    let _ = application.identity_link_ingress().capture(link);
+}
 
 #[derive(Clone)]
 struct ReadyWallet(Arc<ApplicationServices>);
@@ -34,16 +41,23 @@ pub(super) fn launch() {
     let config = dioxus::mobile::Config::new()
         .with_custom_index(include_str!("../assets/index.html").to_owned())
         .with_custom_event_handler(move |event, _target| {
-            let Some(application) = events.0.get() else {
+            if let Event::Opened { urls } = event {
+                if let Ok(mut links) = events.0.lock() {
+                    for url in urls {
+                        links.receive(url.as_str(), forward_link);
+                    }
+                }
+                return;
+            }
+            let Some(application) = events
+                .0
+                .lock()
+                .ok()
+                .and_then(|links| links.application().cloned())
+            else {
                 return;
             };
             match event {
-                Event::Opened { urls } => {
-                    let ingress = application.identity_link_ingress();
-                    for url in urls {
-                        let _ = ingress.capture(url.as_str().to_owned());
-                    }
-                }
                 Event::Suspended => {
                     let _ = application
                         .set_credential_presentation_foreground()
@@ -69,10 +83,15 @@ async fn connect(startup: Startup) -> StartupState {
     let worker = std::thread::Builder::new()
         .name("oxid-public-portal-startup".to_owned())
         .spawn(move || {
-            let application = compose_from_embedded_profile().map(Arc::new);
-            if let Ok(ready) = &application {
-                let _ = startup.0.set(Arc::clone(ready));
-            }
+            let application = compose_from_embedded_profile().and_then(|application| {
+                let ready = Arc::new(application);
+                startup
+                    .0
+                    .lock()
+                    .map_err(|_| StartupError::PublicPortalRuntimeUnavailable)?
+                    .publish(Arc::clone(&ready), forward_link);
+                Ok(ready)
+            });
             let _ = done.send(application);
         });
     if worker.is_err() {

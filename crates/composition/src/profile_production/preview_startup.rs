@@ -200,8 +200,12 @@ mod tests {
         );
         let trust = std::str::from_utf8(TRUST).unwrap();
         let rolled_back = trust.replace(
-            "\"minimumProfileSequence\":3",
-            "\"minimumProfileSequence\":4",
+            "\"minimumProfileSequence\": 3",
+            "\"minimumProfileSequence\": 4",
+        );
+        assert_ne!(
+            rolled_back, trust,
+            "the negative case must change the trust root"
         );
         assert_eq!(
             check(rolled_back.as_bytes(), PROFILE, MANIFEST, NOW),

@@ -15,7 +15,7 @@ mod dust_sync;
 #[cfg(not(target_arch = "wasm32"))]
 mod indexer;
 #[cfg(all(test, not(target_arch = "wasm32"), feature = "mixed-era-replay"))]
-mod legacy_replay_compatibility;
+mod legacy_replay_tests;
 #[cfg(not(target_arch = "wasm32"))]
 mod local_proving;
 #[cfg(not(target_arch = "wasm32"))]

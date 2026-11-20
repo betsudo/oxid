@@ -65,11 +65,19 @@ pub struct AuthenticatedProductionDeployment {
     any(test, target_os = "ios", target_os = "android")
 ))]
 mod preview_startup;
-#[cfg(all(
-    feature = "public-portal",
-    any(target_os = "ios", target_os = "android")
+#[cfg(any(
+    test,
+    all(
+        feature = "public-portal",
+        any(target_os = "ios", target_os = "android")
+    )
 ))]
 mod public_portal;
+#[cfg(test)]
+use public_portal::public_portal_state_root;
+
+#[cfg(any(test, feature = "public-portal"))]
+mod startup_links;
 #[cfg(all(
     feature = "public-portal",
     any(target_os = "ios", target_os = "android")
@@ -77,6 +85,8 @@ mod public_portal;
 pub use preview_startup::compose_embedded_preview_portal;
 #[cfg(all(feature = "preprod-portal", target_os = "ios"))]
 pub use preview_startup::{begin_preprod_project_id_setup, compose_embedded_preprod_portal};
+#[cfg(feature = "public-portal")]
+pub use startup_links::PublicPortalStartupLinks;
 
 #[cfg(test)]
 #[path = "profile_production/tests.rs"]
@@ -125,30 +135,6 @@ pub(super) fn authenticate_public_portal_manifest(
         ssi.did_resolver_url(),
     )
     .map_err(|_| ProductionDeploymentCompositionError::InvalidSsiProfile)
-}
-
-/// Public mobile state must never be reopened against a different genesis.
-#[cfg(any(
-    test,
-    all(
-        feature = "public-portal",
-        any(target_os = "ios", target_os = "android")
-    )
-))]
-pub(super) fn public_portal_state_root(
-    platform_profile_path: &std::path::Path,
-    network: oxid_identity_application::MidnightNetwork,
-    genesis: &[u8; 32],
-) -> Option<std::path::PathBuf> {
-    platform_profile_path
-        .parent()
-        .filter(|parent| parent.is_absolute())
-        .map(|parent| {
-            parent
-                .join("public-networks")
-                .join(network.as_str())
-                .join(hex::encode(genesis))
-        })
 }
 
 /// Payload-free failures from the production deployment composition gate.
