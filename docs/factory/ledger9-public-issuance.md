@@ -166,3 +166,56 @@ composition, actual service readiness, and completion of the full journey
 determine demo readiness. Track Preview in
 [#1201](https://github.com/betsudo/oxid/issues/1201) and PreProd in
 [#1202](https://github.com/betsudo/oxid/issues/1202).
+
+## Prepare the physical Android Preview demo
+
+Finish the Preview and PreProd simulator qualifications first. Use Preview
+for the Android handoff in [#1203](https://github.com/betsudo/oxid/issues/1203).
+Use the same reviewed Preview trust root, signed profile, Portal manifest,
+and independent digests as the simulator qualification. On a clean checkout
+of the approved Oxid commit, build the ARM64 test APK without connecting a
+device.
+
+```bash
+OXID_MOBILE_PORTAL_PROFILE=preview ./bootstrap.sh -- just android-release-build
+```
+
+The command builds only the protected Preview composition. Cargo verifies
+the signed profile, audience, network, and Portal manifest digest. The build
+then checks the packaged ABI, 16 KiB alignment, and exactly one APK signer,
+and writes both files under `target/android-release-candidate/preview/`
+with their own receipt schema. The receipt binds the signed inputs, native
+DID artifact manifest, and signer fingerprint. Compare the Gradle test
+signer's fingerprint with the installed Oxid APK's signer before authorizing
+an in-place update.
+
+Check the receipt and artifact immediately before handing them to the device
+operator.
+
+```bash
+candidate=target/android-release-candidate/preview
+apk="$candidate/oxid-app-arm64-v8a-release.apk"
+receipt="$candidate/receipt.json"
+jq -e '.schema == "oxid-android-preview-candidate-receipt-v1"
+  and .preview.network == "preview" and .preview.features == "preview-portal"' "$receipt"
+test "$(git rev-parse HEAD)" = "$(jq -er '.source.head' "$receipt")"
+test "$OXID_BUILD_PREVIEW_SIGNED_PROFILE_SHA256" = "$(jq -er '.preview.signedProfileSha256' "$receipt")"
+test "$OXID_BUILD_PREVIEW_TRUST_ROOT_SHA256" = "$(jq -er '.preview.trustRootSha256' "$receipt")"
+test "$OXID_BUILD_PORTAL_DEPLOYMENT_MANIFEST_SHA256" = "$(jq -er '.preview.portalManifestSha256' "$receipt")"
+test "$(shasum -a 256 "$apk" | cut -d' ' -f1)" = "$(jq -er '.artifact.sha256' "$receipt")"
+```
+
+When the owner authorizes the exact physical device and confirms signer
+continuity, install with `adb -s "$AUTHORIZED_DEVICE" install -r "$apk"`.
+If Android rejects the signature or version, resolve the signing or version
+issue before proceeding. Preserve the owner's wallet data throughout the
+demo. Use a separate protected test wallet for the public journey.
+
+Follow the public qualification steps with a fresh Portal QR displayed on a
+separate screen. After issuance, terminate and relaunch the app with its
+data intact and verify the restored credential against the public resolver.
+Record the verified source and APK digests, signer fingerprint, chain
+identity, and non-sensitive outcomes. The handoff is `READY` when the
+simulator qualifications, approved signed install, physical scan, issuance,
+encrypted restart, and fresh reverification all pass. Record `NOT_READY`
+with the first unmet prerequisite otherwise.

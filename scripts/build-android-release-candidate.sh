@@ -4,6 +4,7 @@
 # Build and statically certify an arm64 Android release candidate. This command
 # deliberately never queries adb or selects a device/AVD.
 set -euo pipefail
+umask 077
 
 repository_root="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$repository_root"
@@ -16,10 +17,8 @@ build_tools_version="${OXID_ANDROID_BUILD_TOOLS_VERSION:-35.0.0}"
 ndk_version="${OXID_ANDROID_NDK_VERSION:-27.0.12077973}"
 application_compile_sdk="34"
 plugin_compile_sdk="35"
-artifact_directory="$repository_root/target/android-release-candidate"
-artifact="$artifact_directory/oxid-app-arm64-v8a-release.apk"
-receipt="$artifact_directory/receipt.json"
-lock_directory="$artifact_directory/.build.lock"
+candidate_directory="$repository_root/target/android-release-candidate"
+lock_directory="$candidate_directory/.build.lock"
 raw_artifact="$repository_root/target/dx/oxid-app/release/android/app/app/build/outputs/apk/debug/app-debug.apk"
 gradle_build_file="$repository_root/target/dx/oxid-app/release/android/app/build.gradle.kts"
 gradle_wrapper_properties="$repository_root/target/dx/oxid-app/release/android/app/gradle/wrapper/gradle-wrapper.properties"
@@ -28,6 +27,33 @@ fail() {
   echo "android release candidate: $*" >&2
   exit 1
 }
+
+validate_preview_input() {
+  local label="$1" path="$2" digest="$3"
+  [[ "$path" = /* && -f "$path" && ! -L "$path" && "$digest" =~ ^[0-9a-f]{64}$ ]] \
+    && [ "$(shasum -a 256 "$path" | awk '{print $1}')" = "$digest" ] \
+    || fail "Preview $label path or digest is invalid"
+}
+
+portal_profile="${OXID_MOBILE_PORTAL_PROFILE:-unavailable}"
+mobile_features="mobile,standalone-development"
+artifact_directory="$candidate_directory"
+receipt_schema="oxid-android-release-candidate-receipt-v1"
+case "$portal_profile" in
+  unavailable) ;;
+  preview)
+    command -v shasum >/dev/null 2>&1 || fail "required command 'shasum' is missing"
+    validate_preview_input "trust root" "${OXID_BUILD_PREVIEW_TRUST_ROOT_PATH:-}" "${OXID_BUILD_PREVIEW_TRUST_ROOT_SHA256:-}"
+    validate_preview_input "signed profile" "${OXID_BUILD_PREVIEW_SIGNED_PROFILE_PATH:-}" "${OXID_BUILD_PREVIEW_SIGNED_PROFILE_SHA256:-}"
+    validate_preview_input "Portal manifest" "${OXID_BUILD_PORTAL_DEPLOYMENT_MANIFEST_PATH:-}" "${OXID_BUILD_PORTAL_DEPLOYMENT_MANIFEST_SHA256:-}"
+    mobile_features="preview-portal"
+    artifact_directory="$candidate_directory/preview"
+    receipt_schema="oxid-android-preview-candidate-receipt-v1"
+    ;;
+  *) fail "OXID_MOBILE_PORTAL_PROFILE must be 'unavailable' or 'preview' for Android candidate builds" ;;
+esac
+artifact="$artifact_directory/oxid-app-arm64-v8a-release.apk"
+receipt="$artifact_directory/receipt.json"
 
 # Cargo honors these ambient settings ahead of the certified rustup toolchain
 # and fixed linker flags, so their presence makes the build non-hermetic.
@@ -82,6 +108,10 @@ plugin_sdk_platform_revision="$(platform_revision "$plugin_compile_sdk" native-p
 aapt="$android_sdk/build-tools/$build_tools_version/aapt"
 zipalign="$android_sdk/build-tools/$build_tools_version/zipalign"
 [ -x "$aapt" ] && [ -x "$zipalign" ] || fail "Android build-tools $build_tools_version with aapt and zipalign is not installed"
+apksigner="$android_sdk/build-tools/$build_tools_version/apksigner"
+if [ "$portal_profile" = preview ] && [ ! -x "$apksigner" ]; then
+  fail "Android build-tools $build_tools_version with apksigner is required for Preview"
+fi
 build_tools_properties="$android_sdk/build-tools/$build_tools_version/source.properties"
 [ -f "$build_tools_properties" ] || fail "Android build-tools $build_tools_version has no package revision"
 [ "$(awk -F= '$1 ~ /^[[:space:]]*Pkg.Revision[[:space:]]*$/ { value=$2; gsub(/^[[:space:]]+|[[:space:]]+$/, "", value); print value; exit }' "$build_tools_properties")" = "$build_tools_version" ] \
@@ -107,6 +137,13 @@ dioxus_output="$(nix build .#dioxus-cli --no-link --print-out-paths)"
 dioxus_cli="$dioxus_output/bin/dx"
 [ -x "$dioxus_cli" ] || fail "Nix dioxus-cli output has no dx executable"
 
+if [ "$portal_profile" = preview ]; then
+  did_artifacts_dir="$(nix build .#midnight-did-ledger9-zkir --no-link --print-out-paths)"
+  [ -f "$did_artifacts_dir/manifest.json" ] || fail "signed Preview candidate is missing the native DID artifact manifest"
+  did_manifest_sha256="$(shasum -a 256 "$did_artifacts_dir/manifest.json" | awk '{print $1}')"
+  export OXID_MIDNIGHT_DID_ARTIFACTS_DIR="$did_artifacts_dir"
+fi
+
 build() {
   local rustflags="${1:-}"
   ANDROID_HOME="$android_sdk" \
@@ -125,7 +162,7 @@ build() {
       --release \
       --package oxid-app \
       --no-default-features \
-      --features mobile,standalone-development \
+      --features "$mobile_features" \
       --target aarch64-linux-android \
       --locked
 }
@@ -133,6 +170,9 @@ build() {
 # The measured NDK r27 build requires both documented flags for 16 KiB ELF
 # LOAD alignment. Build exactly once with the permanent configuration.
 linker_flags="-C link-arg=-Wl,-z,max-page-size=16384 -C link-arg=-Wl,-z,common-page-size=16384"
+# Both profiles use the same Dioxus output path. Require this invocation to
+# produce the APK before taking the private snapshot.
+rm -f -- "$raw_artifact"
 build "$linker_flags"
 [ -f "$raw_artifact" ] || fail "Dioxus did not create the release APK"
 
@@ -143,6 +183,20 @@ chmod 600 "$artifact"
 
 node scripts/android-verify-16k.mjs "$artifact"
 "$zipalign" -c -P 16 -v 4 "$artifact"
+preview_binding=null
+if [ "$portal_profile" = preview ]; then
+  signature_report="$("$apksigner" verify --print-certs "$artifact")" || fail "Preview APK signature verification failed"
+  signer_sha256="$(printf '%s\n' "$signature_report" | awk '/^Signer #[0-9]+ certificate SHA-256 digest: / { print $NF }')"
+  [[ "$signer_sha256" =~ ^[0-9a-f]{64}$ ]] || fail "Preview APK must have exactly one SHA-256 signer fingerprint"
+  preview_binding="$(jq -cn \
+    --arg features "$mobile_features" \
+    --arg trustRootSha256 "$OXID_BUILD_PREVIEW_TRUST_ROOT_SHA256" \
+    --arg signedProfileSha256 "$OXID_BUILD_PREVIEW_SIGNED_PROFILE_SHA256" \
+    --arg portalManifestSha256 "$OXID_BUILD_PORTAL_DEPLOYMENT_MANIFEST_SHA256" \
+    --arg didArtifactManifestSha256 "$did_manifest_sha256" \
+    --arg signerSha256 "$signer_sha256" \
+    '{network:"preview",features:$features,trustRootSha256:$trustRootSha256,signedProfileSha256:$signedProfileSha256,portalManifestSha256:$portalManifestSha256,didArtifactManifestSha256:$didArtifactManifestSha256,signerSha256:$signerSha256}')"
+fi
 apk_badging="$("$aapt" dump badging "$artifact")" || fail "could not inspect APK badging"
 apk_package="$(printf '%s\n' "$apk_badging" | awk -F"'" '/^package: / { print $2; exit }')"
 mapfile -t apk_abis < <(printf '%s\n' "$apk_badging" | awk -F"'" '/^native-code: / { for (field = 2; field <= NF; field += 2) print $field; exit }')
@@ -173,8 +227,8 @@ source_worktree_is_clean \
 [ "$(git rev-parse 'HEAD^{tree}')" = "$tree" ] \
   || fail "source tree changed during build; refusing to publish receipt"
 
-umask 077
 jq -n \
+  --arg schema "$receipt_schema" --argjson preview "$preview_binding" \
   --arg head "$head" --arg tree "$tree" \
   --arg artifactSha256 "$artifact_sha256" --argjson artifactBytes "$artifact_bytes" \
   --arg nix "$nix_version" --arg nixpkgsRevision "$nixpkgs_revision" \
@@ -187,9 +241,9 @@ jq -n \
   --arg apkMinSdk "$apk_min_sdk" --arg apkTargetSdk "$apk_target_sdk" \
   --arg linkerFlags "$linker_flags" --arg rustProfile "android-release" \
   --arg gradleVariant "debug" --arg signing "generated-debug" \
-  '{schema:"oxid-android-release-candidate-receipt-v1",source:{head:$head,tree:$tree},artifact:{name:"oxid-app-arm64-v8a-release.apk",sha256:$artifactSha256,bytes:$artifactBytes,abis:$apkAbis},tools:{nix:$nix,nixpkgsRevision:$nixpkgsRevision,rustc:$rustc,cargo:$cargo,java:$java,javaMajor:$javaMajor,gradle:$gradle,android:{platforms:{application:{api:$applicationCompileSdk,revision:$applicationSdkPlatformRevision},nativePlugin:{api:$pluginCompileSdk,revision:$pluginSdkPlatformRevision}},inspectionBuildTools:$inspectionBuildTools,ndk:$ndk}},apk:{package:$apkPackage,abis:$apkAbis,compileSdk:$apkCompileSdk,minSdk:$apkMinSdk,targetSdk:$apkTargetSdk},build:{dioxus:{release:true,rustProfile:$rustProfile},androidWrapper:{gradleVariant:$gradleVariant,signing:$signing,androidGradlePlugin:$androidGradlePlugin,buildToolsSelection:$packagingBuildToolsSelection},linkerFlags:$linkerFlags},checks:{androidVerify16k:"pass",zipalignPage16k:"pass",apkBadging:"pass"}}' \
+  '{schema:$schema,source:{head:$head,tree:$tree},artifact:{name:"oxid-app-arm64-v8a-release.apk",sha256:$artifactSha256,bytes:$artifactBytes,abis:$apkAbis},tools:{nix:$nix,nixpkgsRevision:$nixpkgsRevision,rustc:$rustc,cargo:$cargo,java:$java,javaMajor:$javaMajor,gradle:$gradle,android:{platforms:{application:{api:$applicationCompileSdk,revision:$applicationSdkPlatformRevision},nativePlugin:{api:$pluginCompileSdk,revision:$pluginSdkPlatformRevision}},inspectionBuildTools:$inspectionBuildTools,ndk:$ndk}},apk:{package:$apkPackage,abis:$apkAbis,compileSdk:$apkCompileSdk,minSdk:$apkMinSdk,targetSdk:$apkTargetSdk},build:{dioxus:{release:true,rustProfile:$rustProfile},androidWrapper:{gradleVariant:$gradleVariant,signing:$signing,androidGradlePlugin:$androidGradlePlugin,buildToolsSelection:$packagingBuildToolsSelection},linkerFlags:$linkerFlags},checks:{androidVerify16k:"pass",zipalignPage16k:"pass",apkBadging:"pass"}} | if $preview == null then . else . + {preview:$preview} end' \
   >"$receipt.tmp"
 chmod 600 "$receipt.tmp"
 mv "$receipt.tmp" "$receipt"
 
-echo "android-release-candidate: PASS artifact=target/android-release-candidate/oxid-app-arm64-v8a-release.apk receipt=target/android-release-candidate/receipt.json"
+echo "android-release-candidate: PASS artifact=${artifact#"$repository_root/"} receipt=${receipt#"$repository_root/"}"
