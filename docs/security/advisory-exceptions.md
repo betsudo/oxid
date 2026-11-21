@@ -62,16 +62,17 @@ its owning upstream graph drops the crate.
 ## Midnight ledger maintenance advisory
 
 - `RUSTSEC-2025-0141` classifies `bincode 2.0.1` as unmaintained and reports no
-  vulnerability or patched version. The immutable Midnight ledger revision
-  `b85f5d8e503fd1d7a1b128bbc1d7156baf823a65` pulls it through
-  `midnight-zk-stdlib -> midnight-transient-crypto`.
-- Oxid does not call `bincode` directly. Replacing a serialization dependency
-  inside the consensus/proof dependency graph locally would create a larger
-  compatibility risk than this development-only exception.
-- Issue #10 tracks moving to an upstream Midnight revision or compatible graph
-  that removes `bincode`. This exception blocks production custody/release until
-  it is re-reviewed, and must be removed as soon as the selected upstream graph
-  no longer resolves the crate.
+  vulnerability or patched version. The 2026-11-20 Ledger 9 review used a
+  locked normal-edge inverse tree for the `preview-portal` iOS Simulator
+  target at `a9a953ed3fe85ab960ac66b17fa36d319db0c039`. It found
+  `midnight-zk-stdlib 1.3.0` in the mixed-era replay cohort and
+  `midnight-zk-stdlib 2.4.0` in the current proof cohort. Both depend on
+  `bincode 2.0.1`. It is present in the app's runtime dependency graph.
+- Keep the exception limited to development qualification pending a
+  production release decision. [#10](https://github.com/betsudo/oxid/issues/10)
+  tracks upstream replacement. Before dropping the exception, verify the old
+  dependency is absent and compare encoded historical replay state and native
+  Ledger 9 proof interoperability against the current pins.
 
 ## Subxt submission-graph advisories
 
@@ -112,6 +113,14 @@ its owning upstream graph drops the crate.
   is repaired. [Oxid #1197](https://github.com/betsudo/oxid/issues/1197) tracks
   compatible upstream pins, focused cryptographic regression tests, and
   removal of the exception.
+- The locked graph still reaches `elliptic-curve 0.13.8` through
+  `midnight-curves 0.3.1` and Compact's `p256 0.13.2` pin. The advisory's
+  fixed range starts at `crypto-bigint 0.7.6`, outside the current
+  `crypto-bigint 0.5` requirement. A compatible upgrade must cover Compact,
+  the pinned Midnight ZK/Ledger cohort, and legacy replay dependencies.
+  The currently selected Subxt light-client cohort still resolves
+  `ruzstd 0.8.3` in the lockfile. Keep its graph-reachability guard until
+  the selected Subxt release resolves the patched decompressor.
 
 ## Yanked crate versions
 
