@@ -1313,6 +1313,11 @@ impl ComposedDustRegistrationExecutor {
                     bound.revision,
                 ));
             }
+            Err(oxid_wallet_application::WalletDustRegistrationError::Operation(
+                oxid_wallet_application::WalletDustRegistrationPortError::AccountNotSynchronized
+                | oxid_wallet_application::WalletDustRegistrationPortError::NoEligibleNight
+                | oxid_wallet_application::WalletDustRegistrationPortError::InsufficientRegistrationAllowance,
+            )) => return Err(WalletDustRegistrationExecutorFailure::PreparationPending),
             Err(error) => return Err(map_registration_failure(error)),
         };
         if preview.network_id != identity.realm.as_str() {

@@ -330,6 +330,21 @@ impl WalletDustRegistrationRuntime {
         true
     }
 
+    /// Records a pre-draft wait and leaves preparation available to the next
+    /// reconciliation. No draft, transaction, or recovery state is advanced.
+    pub(crate) fn defer_preparation(
+        &mut self,
+        token: WalletDustRegistrationRuntimeAdmissionToken,
+    ) -> bool {
+        if !matches!(self.admitted_effect.as_ref(), Some((WalletDustRegistrationEffect::Prepare { .. }, admitted)) if *admitted == token)
+        {
+            return false;
+        }
+        self.admitted_effect = None;
+        self.record_code(WalletDustRegistrationTimelineCode::PreparationPending, None);
+        true
+    }
+
     fn record_restore(&mut self) {
         let Some(identity) = self.coordinator.projection().identity.clone() else {
             return;

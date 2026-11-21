@@ -319,6 +319,34 @@ fn automatic_capability_with_store(
 }
 
 #[test]
+fn automatic_registration_resumes_on_a_later_refresh_when_preparation_is_pending() {
+    use oxid_wallet_application::WalletDustRegistrationSettlementState as State;
+
+    for error in [
+        WalletDustRegistrationPortError::AccountNotSynchronized,
+        WalletDustRegistrationPortError::NoEligibleNight,
+        WalletDustRegistrationPortError::InsufficientRegistrationAllowance,
+    ] {
+        let fake = Arc::new(FakeServices::new());
+        let capability = automatic_capability(&fake);
+        *fake.registration_prepare_failure.lock().unwrap() = Some(error);
+
+        let pending = block_on(capability.refresh("profile_test".to_owned())).unwrap();
+        assert_eq!(pending.state, State::ActionRequired, "{error}");
+        assert!(pending.registration.is_none());
+        assert_eq!(*fake.calls.lock().unwrap(), ["prepare"]);
+
+        // The fee allowance can mature while the account projection stays the same.
+        *fake.registration_prepare_failure.lock().unwrap() = None;
+        let ready = block_on(capability.refresh("profile_test".to_owned())).unwrap();
+        assert_eq!(ready.state, State::Ready);
+        let calls = fake.calls.lock().unwrap();
+        assert_eq!(calls.iter().filter(|call| **call == "prepare").count(), 2);
+        assert_eq!(calls.iter().filter(|call| **call == "submit").count(), 1);
+    }
+}
+
+#[test]
 fn funding_wakes_automatic_registration_and_restart_finishes_the_same_attempt() {
     use oxid_wallet_application::WalletDustRegistrationSettlementState as State;
 

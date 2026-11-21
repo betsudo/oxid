@@ -60,6 +60,11 @@ DID artifacts, creates a fresh holder wallet, receives the fixed local grant,
 waits for positive DUST, deploys all eight holder-DID effects, and requires live
 resolution. It owns and removes only its temporary wallet/faucet state.
 
+The wallet keeps registration pending while the funded NIGHT output or its
+fee allowance settles. Normal foreground reconciliation tries preparation
+again. This transition occurs before draft creation. Recovery of a retained
+submission follows its transaction journal.
+
 Run the protocol/store matrix separately from the live DID publication lane:
 
 ```sh

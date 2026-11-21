@@ -264,6 +264,7 @@ impl WalletOperationResourceMeasurements {
 pub enum WalletDustRegistrationTimelineCode {
     EligibilityObserved,
     RegistrationAlreadyCurrent,
+    PreparationPending,
     Prepared,
     AuthorizationSucceeded,
     AuthorizationRejected,

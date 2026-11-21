@@ -47,6 +47,7 @@ pub enum WalletDustRegistrationExecutorFailure {
     Offline,
     TimedOut,
     Cancelled,
+    PreparationPending,
     ProtectionNotInitialized,
     ProtectionLocked,
     Degraded,
@@ -59,6 +60,7 @@ impl fmt::Display for WalletDustRegistrationExecutorFailure {
             Self::Offline => "DUST registration operation is offline",
             Self::TimedOut => "DUST registration operation timed out",
             Self::Cancelled => "DUST registration operation was cancelled",
+            Self::PreparationPending => "DUST registration inputs are still settling",
             Self::ProtectionNotInitialized => {
                 "DUST registration requires wallet recovery or initialization"
             }
@@ -455,6 +457,18 @@ impl WalletDustRegistrationDriver {
                     authorization_target = None;
                     if pause_after_completion {
                         return Ok(projection);
+                    }
+                }
+                Err(WalletDustRegistrationExecutorFailure::PreparationPending)
+                    if matches!(
+                        expected_operation,
+                        WalletDustRegistrationRuntimeOperation::Prepare(_)
+                    ) =>
+                {
+                    let deferred = runtime.defer_preparation(token);
+                    runtime_admission.disarm();
+                    if deferred {
+                        return Ok(runtime.coordinator().projection().clone());
                     }
                 }
                 Err(error) => {
