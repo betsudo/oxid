@@ -42,6 +42,7 @@ zeroize = { workspace = true, features = ["serde"] }
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 futures.workspace = true
+midnight-vc-proof.workspace = true
 midnight-zkir.workspace = true
 rand.workspace = true
 
