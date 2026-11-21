@@ -96,6 +96,11 @@ pub(super) fn GlobalApplicationMenu(
     secret_mode: SecretModeController,
     on_action: EventHandler<GlobalMenuAction>,
 ) -> Element {
+    let privacy_status = if secret_mode.is_masked() {
+        "Private values hidden"
+    } else {
+        "Private values revealed"
+    };
     rsx! {
         nav {
             id: "global-application-menu",
@@ -110,10 +115,11 @@ pub(super) fn GlobalApplicationMenu(
                         r#type: "button",
                         role: "menuitemcheckbox",
                         "data-global-action": "{action.label()}",
+                        aria_label: "{action.label()}, {privacy_status}",
                         aria_checked: if secret_mode.is_masked() { "true" } else { "false" },
                         onclick: move |_| on_action.call(action),
                         span { "{action.label()}" }
-                        small { if secret_mode.is_masked() { "Private values hidden" } else { "Private values revealed" } }
+                        small { "{privacy_status}" }
                     }
                 } else {
                     button {

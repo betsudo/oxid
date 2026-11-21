@@ -1,0 +1,11 @@
+appId: io.medianox.oxid
+name: reveal separate NIGHT and DUST status rows
+---
+- scrollUntilVisible:
+    element: "NIGHT sync"
+    direction: DOWN
+    centerElement: true
+- scrollUntilVisible:
+    element: "DUST"
+    direction: DOWN
+    centerElement: true
