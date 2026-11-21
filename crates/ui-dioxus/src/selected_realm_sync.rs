@@ -784,6 +784,13 @@ pub(super) fn selected_realm_account_state(
     family: &WalletRealmFamilyView<WalletAccountView>,
 ) -> &str {
     match family {
+        // A completed cached snapshot is still waiting for a live refresh.
+        WalletRealmFamilyView::Ready(account)
+            if account.source == WalletAccountSource::Cached
+                && account.sync.state == WalletSyncState::Synced =>
+        {
+            "cached"
+        }
         WalletRealmFamilyView::Ready(account) => account.sync.state.as_str(),
         WalletRealmFamilyView::Busy => "syncing",
         WalletRealmFamilyView::NotFound => "never_synced",

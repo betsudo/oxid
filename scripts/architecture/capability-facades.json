@@ -252,7 +252,8 @@
           "modulePathPrefixes": [
             "crates/ui-dioxus/src/selected_realm_sync",
             "crates/ui-dioxus/src/wallet_realm_lifecycle",
-            "crates/ui-dioxus/src/wallet_realm_sync_services"
+            "crates/ui-dioxus/src/wallet_realm_sync_services",
+            "crates/ui-dioxus/src/tests/wallet_status_tests"
           ]
         },
         {
@@ -268,7 +269,7 @@
           "paths": [
             "crates/ui-dioxus/src/lib.rs"
           ],
-          "extraLineCeiling": 484,
+          "extraLineCeiling": 393,
           "issue": "#757",
           "reason": "Preserves the verified post-decomposition ratchet while the remaining excess is removed.",
           "expiresOn": "2027-01-31"

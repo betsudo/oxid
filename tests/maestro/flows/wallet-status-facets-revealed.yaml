@@ -1,0 +1,12 @@
+appId: io.medianox.oxid
+name: Wallet status stays legible with private values revealed
+---
+- runFlow: ../subflows/launch-clean.yaml
+- runFlow: ../subflows/demo-profile.yaml
+- runFlow: ../subflows/open-menu.yaml
+- tapOn: "Session privacy.*Private values hidden.*"
+- runFlow: ../subflows/open-menu.yaml
+- assertVisible: "Session privacy.*Private values revealed.*"
+- tapOn: "Close global application menu"
+- tapOn: "Wallet"
+- runFlow: ../subflows/wallet-status-rows.yaml

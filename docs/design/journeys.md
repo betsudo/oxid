@@ -91,6 +91,11 @@ NIGHT**, **Registering**, **Waiting for Midnight**, or **Updating balance**.
 **0 DUST**, and an unknown amount displays **Balance unavailable**. Session
 privacy masks the amounts and leaves the status labels readable.
 
+A saved NIGHT checkpoint displays **Updating** until a live observation
+arrives. A stalled refresh displays **Needs attention**. A retained DUST amount
+is labeled **last known** and does not allow spending. A fresh DUST balance
+can remain **Ready** while the separate NIGHT row is still updating.
+
 The selected profile, realm, and generation determine which settlement
 observation is shown. The wallet automatically refreshes while it is active.
 The development realm registers eligible NIGHT automatically. If automatic
