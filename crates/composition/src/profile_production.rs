@@ -147,6 +147,10 @@ pub enum ProductionDeploymentCompositionError {
     PublicPortalRuntimeUnavailable,
     ChainIdentityUnavailable,
     ChainIdentityMismatch,
+    PreviewIndexerUnavailable,
+    PreviewIndexerWebsocketUnavailable,
+    PreviewChainViewMismatch,
+    PreviewIncompatibleRuntime,
     PreprodCredentialRequired,
     PreprodCredentialUnavailable,
     PreprodIndexerUnavailable,
@@ -177,6 +181,16 @@ impl fmt::Display for ProductionDeploymentCompositionError {
             }
             Self::ChainIdentityMismatch => {
                 "authenticated Midnight chain identity does not match the node"
+            }
+            Self::PreviewIndexerUnavailable => "authenticated Preview indexer is unavailable",
+            Self::PreviewIndexerWebsocketUnavailable => {
+                "authenticated Preview GraphQL WebSocket is unavailable"
+            }
+            Self::PreviewChainViewMismatch => {
+                "Preview node and indexer disagree on the indexed block"
+            }
+            Self::PreviewIncompatibleRuntime => {
+                "Preview runtime does not match this Ledger 9 build"
             }
             Self::PreprodCredentialRequired => {
                 "PreProd network access needs a Blockfrost project ID"

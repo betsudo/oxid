@@ -60,7 +60,8 @@ pub use local_proving::{
 pub use local_proving::{MidnightLocalProvingFixtureReport, run_local_proving_fixture};
 #[cfg(not(target_arch = "wasm32"))]
 pub use preprod_transport::{
-    MidnightPreprodCredential, MidnightPreprodPreflightError, preflight_blockfrost_preprod,
+    MidnightPreprodCredential, MidnightPreprodPreflightError, MidnightPublicChainPreflightError,
+    preflight_blockfrost_preprod,
 };
 #[cfg(all(not(target_arch = "wasm32"), feature = "proving-bench"))]
 pub use proof_benchmark::{MidnightProofBenchmark, MidnightProofBenchmarkConfig};
