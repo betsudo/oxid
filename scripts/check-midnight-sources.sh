@@ -92,7 +92,7 @@ while IFS=$'\t' read -r package rename source path; do
     midnight-compact-runtime)
       expected_source="$compact_source"
       ;;
-    midnight-did-domain|midnight-did-jubjub-schnorr|midnight-did-runtime)
+    midnight-did-domain|midnight-did-jubjub-schnorr|midnight-did-runtime|midnight-vc-proof)
       expected_source="$identity_source"
       ;;
     *)

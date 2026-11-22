@@ -17,6 +17,12 @@ process is killed and restarted without deleting its data, and a fresh resolver
 read verifies the restored credential. A synthetic DID, mock resolver success,
 or publication outside Oxid is not acceptance evidence.
 
+Native Digital Passport verification uses the immutable `midnight-vc-proof`
+crate for the Compact body root and issuance signature. The wallet applies its
+holder binding, fresh issuer resolution, issuer trust, and time policy before
+acceptance. Digital Passport uses `NoStatusBinding`, so the report leaves
+credential status unchecked.
+
 ## Ownership
 
 - The designated Midnight owner exclusively manages the shared node, indexer,

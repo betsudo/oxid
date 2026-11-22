@@ -94,7 +94,7 @@ export function auditCompatibility({ portalSource, environment = process.env } =
     version: zkir.packageVersion,
   });
   const identity = manifest.wallet.nativeIdentity;
-  for (const name of ["midnight-did-domain", "midnight-did-jubjub-schnorr", "midnight-did-runtime"]) {
+  for (const name of ["midnight-did-domain", "midnight-did-jubjub-schnorr", "midnight-did-runtime", "midnight-vc-proof"]) {
     assertDependency(cargo, name, {
       repository: identity.repository,
       revision: identity.revision,

@@ -3,8 +3,8 @@
 //! Strict native reader and issuer-proof verifier for the upstream Digital
 //! Passport `compact-value-v1.base64url` credential family.
 //!
-//! The MCV1 container and circuit arithmetic mirror the exact source pinned by
-//! the repository's Nix inputs. No generated or SDK type crosses this adapter.
+//! Native signature verification uses the pinned Midnight Identity proof crate.
+//! Wallet metadata, holder binding, and issuer policy stay in the adapter.
 
 use base64::{Engine as _, engine::general_purpose};
 use midnight_base_crypto::{hash::PersistentHashWriter, repr::BinaryHashRepr};
@@ -255,7 +255,15 @@ fn inspect_in_network(
             "issuer_method_mismatch",
         );
     }
-    if !verify_issuance_proof(&credential, &proof) {
+    #[cfg(not(target_arch = "wasm32"))]
+    let proof_valid =
+        midnight_vc_proof::digital_passport_body_root(credential_bytes).is_ok_and(|body_root| {
+            midnight_vc_proof::verify_body_root(body_root, proof_bytes).outcome
+                == midnight_vc_proof::VerificationOutcome::Valid
+        });
+    #[cfg(target_arch = "wasm32")]
+    let proof_valid = verify_issuance_proof(&credential, &proof);
+    if !proof_valid {
         return invalid(
             id,
             metadata,
@@ -1267,6 +1275,75 @@ mod tests {
                 VerificationStageStatus::NotChecked
             };
             assert_eq!(stage.status(), expected, "{:?}", stage.name());
+        }
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn pinned_proof_crate_matches_compact_credentials_and_rejects_other_issuers() {
+        use midnight_vc_proof::{
+            ResolvedIssuer, VerificationMethodRef, VerificationOutcome as NativeOutcome,
+            decode_detached_proof, digital_passport_body_root, encode_detached_proof,
+            verify_digital_passport,
+        };
+
+        let issued = issue_bound_standalone_credential(&bound_request(), 1_700_000_000)
+            .expect("bound test credential");
+        for (body, detached) in [
+            (
+                fixture(super::super::STANDALONE_COMPACT_CREDENTIAL_B64),
+                fixture(super::super::STANDALONE_COMPACT_PROOF_B64),
+            ),
+            (
+                issued.signed_bytes.to_vec(),
+                issued.detached_proof.expect("detached proof").to_vec(),
+            ),
+        ] {
+            let credential = parse_credential(&body).expect("credential");
+            let old_proof = parse_proof(&detached).expect("proof");
+            let proof = decode_detached_proof(&detached).expect("pinned proof codec");
+            let method = VerificationMethodRef {
+                controller_address: credential.issuer.did_contract_address,
+                method_id: credential.issuer.method_id,
+            };
+            let issuer = ResolvedIssuer::new(method, old_proof.public_key);
+
+            assert_eq!(proof.signer, method);
+            assert_eq!(
+                encode_detached_proof(&proof).expect("proof codec"),
+                detached
+            );
+            assert_eq!(
+                digital_passport_body_root(&body).expect("pinned body root"),
+                credential_body_root(&credential)
+            );
+            assert!(verify_issuance_proof(&credential, &old_proof));
+            assert_eq!(
+                verify_digital_passport(&body, &detached, &issuer).outcome,
+                NativeOutcome::Valid
+            );
+
+            let wrong_key = ResolvedIssuer::new(method, EmbeddedGroupAffine::generator());
+            let mut other_method = method;
+            other_method.method_id[0] ^= 1;
+            let wrong_method = ResolvedIssuer::new(other_method, issuer.public_key);
+            for (other_issuer, expected_reason) in [
+                (wrong_key, "issuer_public_key_mismatch"),
+                (wrong_method, "issuer_method_mismatch"),
+            ] {
+                let report = verify_digital_passport(&body, &detached, &other_issuer);
+                assert_eq!(report.outcome, NativeOutcome::Invalid);
+                assert!(
+                    report
+                        .stages
+                        .iter()
+                        .any(|stage| stage.reason == Some(expected_reason))
+                );
+            }
+            assert_eq!(
+                verify_digital_passport(&body, &detached[..detached.len() - 1], &issuer).outcome,
+                NativeOutcome::Invalid
+            );
         }
     }
 
