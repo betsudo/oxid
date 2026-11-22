@@ -47,6 +47,7 @@ pub enum WalletDustRegistrationExecutorFailure {
     Offline,
     TimedOut,
     Cancelled,
+    PreparationBlocked(crate::WalletDustRegistrationPreparationBlocker),
     ProtectionNotInitialized,
     ProtectionLocked,
     Degraded,
@@ -59,6 +60,12 @@ impl fmt::Display for WalletDustRegistrationExecutorFailure {
             Self::Offline => "DUST registration operation is offline",
             Self::TimedOut => "DUST registration operation timed out",
             Self::Cancelled => "DUST registration operation was cancelled",
+            Self::PreparationBlocked(
+                crate::WalletDustRegistrationPreparationBlocker::InputsSettling,
+            ) => "DUST registration inputs are still settling",
+            Self::PreparationBlocked(
+                crate::WalletDustRegistrationPreparationBlocker::InsufficientNight,
+            ) => "more eligible NIGHT is needed for DUST registration",
             Self::ProtectionNotInitialized => {
                 "DUST registration requires wallet recovery or initialization"
             }
@@ -454,6 +461,24 @@ impl WalletDustRegistrationDriver {
                     }
                     authorization_target = None;
                     if pause_after_completion {
+                        return Ok(projection);
+                    }
+                }
+                Err(WalletDustRegistrationExecutorFailure::PreparationBlocked(blocker))
+                    if matches!(
+                        expected_operation,
+                        WalletDustRegistrationRuntimeOperation::Prepare(_)
+                    ) =>
+                {
+                    let previous = runtime.coordinator().projection().clone();
+                    let deferred = runtime.defer_preparation(token, blocker);
+                    runtime_admission.disarm();
+                    if deferred {
+                        let projection = runtime.coordinator().projection().clone();
+                        drop(runtime);
+                        if projection != previous {
+                            self.publish(&projection);
+                        }
                         return Ok(projection);
                     }
                 }

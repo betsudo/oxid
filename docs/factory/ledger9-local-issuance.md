@@ -66,6 +66,13 @@ DID artifacts, creates a fresh holder wallet, receives the fixed local grant,
 waits for positive DUST, deploys all eight holder-DID effects, and requires live
 resolution. It owns and removes only its temporary wallet/faucet state.
 
+The local development wallet uses the bounded settlement worker to retry
+preparation while the funded NIGHT output or fee allowance settles. A wallet
+whose eligible outputs cannot cover the fee shows **Add more NIGHT to enable
+DUST** and waits for the next wallet observation. Both outcomes occur before
+draft creation. Recovery of a retained submission follows its transaction
+journal.
+
 Run the protocol/store matrix separately from the live DID publication lane:
 
 ```sh

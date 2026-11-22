@@ -6,12 +6,12 @@ use std::time::Instant;
 
 use crate::{
     MAX_WALLET_OPERATION_ATTEMPT, WalletDustRegistrationCoordinator, WalletDustRegistrationEffect,
-    WalletDustRegistrationSettlementEvent, WalletDustRegistrationSettlementReconciliation,
-    WalletDustRegistrationSettlementState, WalletDustRegistrationTimelineCode,
-    WalletOperationAttempt, WalletOperationCausationId, WalletOperationCorrelationId,
-    WalletOperationDurationMillis, WalletOperationEvent, WalletOperationId, WalletOperationOutcome,
-    WalletOperationResource, WalletOperationResourceIdentity, WalletOperationTimeline,
-    WalletOperationTrigger,
+    WalletDustRegistrationPreparationBlocker, WalletDustRegistrationSettlementEvent,
+    WalletDustRegistrationSettlementReconciliation, WalletDustRegistrationSettlementState,
+    WalletDustRegistrationTimelineCode, WalletOperationAttempt, WalletOperationCausationId,
+    WalletOperationCorrelationId, WalletOperationDurationMillis, WalletOperationEvent,
+    WalletOperationId, WalletOperationOutcome, WalletOperationResource,
+    WalletOperationResourceIdentity, WalletOperationTimeline, WalletOperationTrigger,
 };
 
 /// An exact operation handed to an application or protected-custody boundary.
@@ -327,6 +327,33 @@ impl WalletDustRegistrationRuntime {
             return false;
         }
         self.admitted_effect = None;
+        true
+    }
+
+    /// Records the pre-draft blocker and releases the exact preparation.
+    pub(crate) fn defer_preparation(
+        &mut self,
+        token: WalletDustRegistrationRuntimeAdmissionToken,
+        blocker: WalletDustRegistrationPreparationBlocker,
+    ) -> bool {
+        if !matches!(
+            self.admitted_effect.as_ref(),
+            Some((effect @ WalletDustRegistrationEffect::Prepare { .. }, admitted))
+                if *admitted == token && self.coordinator.active_effect() == Some(effect)
+        ) {
+            return false;
+        }
+        self.admitted_effect = None;
+        self.coordinator.record_preparation_blocker(blocker);
+        let code = match blocker {
+            WalletDustRegistrationPreparationBlocker::InputsSettling => {
+                WalletDustRegistrationTimelineCode::PreparationPending
+            }
+            WalletDustRegistrationPreparationBlocker::InsufficientNight => {
+                WalletDustRegistrationTimelineCode::PreparationRequiresFunding
+            }
+        };
+        self.record_code(code, None);
         true
     }
 

@@ -65,6 +65,13 @@ impl WalletDustRegistrationCoordinator {
         self.active_effect.as_ref()
     }
 
+    pub(crate) fn record_preparation_blocker(
+        &mut self,
+        blocker: crate::WalletDustRegistrationPreparationBlocker,
+    ) {
+        self.projection.preparation_blocker = Some(blocker);
+    }
+
     /// Applies one policy event and projects its single next external effect.
     #[must_use]
     pub fn reduce(mut self, event: Event) -> Self {
@@ -83,6 +90,15 @@ impl WalletDustRegistrationCoordinator {
             eligibility_permits_prepare,
             authorization_stopped,
         );
+        if accepted
+            && (self.projection.identity != previous.identity
+                || !matches!(
+                    self.active_effect,
+                    Some(WalletDustRegistrationEffect::Prepare { .. })
+                ))
+        {
+            self.projection.preparation_blocker = None;
+        }
         self
     }
 }

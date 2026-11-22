@@ -149,6 +149,12 @@ const fn operation_outcome_label(outcome: WalletOperationOutcome) -> &'static st
 const fn dust_registration_code_label(code: WalletDustRegistrationTimelineCode) -> &'static str {
     match code {
         WalletDustRegistrationTimelineCode::EligibilityObserved => "eligibility observed",
+        WalletDustRegistrationTimelineCode::PreparationPending => {
+            "registration preparation pending"
+        }
+        WalletDustRegistrationTimelineCode::PreparationRequiresFunding => {
+            "registration needs more NIGHT"
+        }
         WalletDustRegistrationTimelineCode::RegistrationAlreadyCurrent => {
             "registration already current"
         }

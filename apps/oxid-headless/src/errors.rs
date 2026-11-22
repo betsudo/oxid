@@ -648,6 +648,7 @@ pub(super) fn dust_registration_port_error(
         | WalletDustRegistrationPortError::AccountNotDerived
         | WalletDustRegistrationPortError::AccountNotSynchronized
         | WalletDustRegistrationPortError::NoEligibleNight
+        | WalletDustRegistrationPortError::InsufficientNightForRegistration
         | WalletDustRegistrationPortError::InsufficientRegistrationAllowance => {
             "failed_precondition"
         }

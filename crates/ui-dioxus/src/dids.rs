@@ -49,9 +49,11 @@ fn did_realm_preflight_status(realm: &SelectedWalletRealmSyncView) -> String {
         family => (family.state_name(), false, String::new()),
     };
     format!(
-        "Preparing the Midnight wallet automatically: account {account}; DUST {dust}{dust_progress}{}.",
+        "NIGHT account {account}. DUST {dust}{dust_progress}{}.",
         if has_dust {
             " with spendable balance"
+        } else if dust == "synced" {
+            " while waiting for a spendable balance"
         } else {
             ""
         }
@@ -78,7 +80,9 @@ async fn await_did_realm_prerequisites(
         Ok(Ok(projection)) if did_realm_prerequisites_ready(&projection.view) => return Ok(()),
         Ok(Ok(projection)) => {
             let status = did_realm_preflight_status(&projection.view);
-            notice.set(Some(status.clone()));
+            notice.set(Some(format!(
+                "Preparing the Midnight wallet automatically. {status}"
+            )));
             last_status = Some(status);
         }
         Ok(Err(error)) => last_error = Some(error),
@@ -96,7 +100,9 @@ async fn await_did_realm_prerequisites(
             Ok(Ok(projection)) if did_realm_prerequisites_ready(&projection.view) => return Ok(()),
             Ok(Ok(projection)) => {
                 let status = did_realm_preflight_status(&projection.view);
-                notice.set(Some(status.clone()));
+                notice.set(Some(format!(
+                    "Preparing the Midnight wallet automatically. {status}"
+                )));
                 last_status = Some(status);
                 last_error = None;
             }
@@ -104,10 +110,12 @@ async fn await_did_realm_prerequisites(
             Err(error) => last_error = Some(error.to_string()),
         }
     }
-    Err(last_error.or(last_status).unwrap_or_else(|| {
-        "The Midnight wallet did not finish NIGHT and DUST synchronization before the deployment deadline. Progress is retained and will resume automatically."
-            .to_owned()
-    }))
+    let detail = last_error.or(last_status).unwrap_or_default();
+    Err(
+        format!("Wallet readiness timed out before DID publication. {detail}")
+            .trim_end()
+            .to_owned(),
+    )
 }
 
 #[derive(Clone, PartialEq)]
@@ -603,7 +611,7 @@ pub(super) fn DidsPage(
                                     did_creation_notice.set(None);
                                 }
                             },
-                            "Create another DID"
+                            if creation == DidCreationState::Failed { "Retry DID creation" } else { "Create another DID" }
                         }
                     }
                     if let Some(message) = did_creation_notice.read().as_deref() {
@@ -1612,7 +1620,16 @@ mod tests {
                 "synced",
                 Some("1"),
             )),
-            "Preparing the Midnight wallet automatically: account synced; DUST synced 2/2 with spendable balance."
+            "NIGHT account synced. DUST synced 2/2 with spendable balance."
+        );
+        assert_eq!(
+            did_realm_preflight_status(&did_realm_preflight_fixture(
+                WalletAccountSource::Live,
+                WalletSyncState::Synced,
+                "synced",
+                Some("0"),
+            )),
+            "NIGHT account synced. DUST synced 2/2 while waiting for a spendable balance."
         );
         assert_eq!(
             did_realm_preflight_status(&did_realm_preflight_fixture(
@@ -1621,7 +1638,7 @@ mod tests {
                 "never_synced",
                 None,
             )),
-            "Preparing the Midnight wallet automatically: account syncing; DUST never_synced 2/2."
+            "NIGHT account syncing. DUST never_synced 2/2."
         );
     }
 }
