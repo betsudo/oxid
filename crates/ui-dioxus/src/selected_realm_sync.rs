@@ -351,6 +351,12 @@ pub(super) fn wallet_dust_status(
         Some(DustSettlement::NotEligible) if live_balance.unwrap_or(0) == 0 => {
             ("Waiting for eligible NIGHT", "never_synced")
         }
+        Some(DustSettlement::ActionRequired)
+            if settlement.preparation_blocker()
+                == Some(oxid_wallet_application::WalletDustRegistrationPreparationBlocker::InsufficientNight) =>
+        {
+            ("Add more NIGHT to enable DUST", "stalled")
+        }
         Some(DustSettlement::ActionRequired) => ("Registration pending", "syncing"),
         Some(DustSettlement::AwaitingAuthorization | DustSettlement::Submitting) => {
             ("Registering", "syncing")

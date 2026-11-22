@@ -152,6 +152,9 @@ const fn dust_registration_code_label(code: WalletDustRegistrationTimelineCode) 
         WalletDustRegistrationTimelineCode::PreparationPending => {
             "registration preparation pending"
         }
+        WalletDustRegistrationTimelineCode::PreparationRequiresFunding => {
+            "registration needs more NIGHT"
+        }
         WalletDustRegistrationTimelineCode::RegistrationAlreadyCurrent => {
             "registration already current"
         }

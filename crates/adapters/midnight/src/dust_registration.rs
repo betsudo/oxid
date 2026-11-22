@@ -80,6 +80,33 @@ struct PlannedRegistration {
     registered_night: u128,
     input_count: u16,
     maximum_fee_allowance: u128,
+    matured_fee_allowance_cap: u128,
+}
+
+impl PlannedRegistration {
+    fn validate_fee_allowance(
+        &self,
+        network: &oxid_wallet_domain::ChainNetworkId,
+        context: &MidnightRegistrationContext,
+    ) -> Result<(), WalletDustRegistrationPortError> {
+        let intents = LedgerHashMap::new().insert(DUST_REGISTRATION_SEGMENT, self.intent.clone());
+        let transaction = Transaction::Standard(StandardTransaction::new(
+            network.as_str(),
+            intents,
+            None,
+            LedgerHashMap::new(),
+        ));
+        let fee = transaction
+            .fees(&context.parameters, false)
+            .map_err(|_| WalletDustRegistrationPortError::InvalidChainState)?;
+        if fee > self.matured_fee_allowance_cap {
+            return Err(WalletDustRegistrationPortError::InsufficientNightForRegistration);
+        }
+        if fee > self.maximum_fee_allowance || self.maximum_fee_allowance == 0 {
+            return Err(WalletDustRegistrationPortError::InsufficientRegistrationAllowance);
+        }
+        Ok(())
+    }
 }
 
 impl<S, D> WalletDustRegistrationPort for MidnightWalletAdapter<S, D>
@@ -127,20 +154,7 @@ where
                 &context,
                 request.expires_at.value() / 1_000,
             )?;
-            let mut intents = LedgerHashMap::new();
-            intents = intents.insert(DUST_REGISTRATION_SEGMENT, plan.intent.clone());
-            let transaction = Transaction::Standard(StandardTransaction::new(
-                selected.as_str(),
-                intents,
-                None,
-                LedgerHashMap::new(),
-            ));
-            let fee = transaction
-                .fees(&context.parameters, false)
-                .map_err(|_| WalletDustRegistrationPortError::InvalidChainState)?;
-            if fee > plan.maximum_fee_allowance {
-                return Err(WalletDustRegistrationPortError::InsufficientRegistrationAllowance);
-            }
+            plan.validate_fee_allowance(&selected, &context)?;
 
             let draft_id = registration_id(&plan.signing_payload)?;
             let authorization_challenge = registration_challenge(&draft_id, &plan.signing_payload)?;
@@ -638,9 +652,13 @@ fn plan_registration(
     });
     let eligibility_fingerprint = registration_eligibility_fingerprint(&eligible);
     let maximum_fee_allowance = eligible[0].1;
-    if maximum_fee_allowance == 0 {
-        return Err(WalletDustRegistrationPortError::InsufficientRegistrationAllowance);
-    }
+    // One guaranteed input pays the fee. A different eligible output may
+    // become the largest as it matures, so consider each cap, never their sum.
+    let matured_fee_allowance_cap = eligible
+        .iter()
+        .map(|(utxo, _)| dust_generation_cap(utxo, context))
+        .max()
+        .unwrap_or_default();
     let registered_night = eligible.iter().try_fold(0_u128, |total, (utxo, _)| {
         total
             .checked_add(utxo.value)
@@ -679,6 +697,7 @@ fn plan_registration(
         input_count: u16::try_from(eligible.len())
             .map_err(|_| WalletDustRegistrationPortError::InvalidData)?,
         maximum_fee_allowance,
+        matured_fee_allowance_cap,
     })
 }
 
@@ -689,13 +708,19 @@ fn generated_dust(
 ) -> Result<u128, WalletDustRegistrationPortError> {
     let now = context.timestamp.to_secs();
     let elapsed = now.saturating_sub(created_at_seconds) as u128;
-    let cap = utxo
-        .value
-        .saturating_mul(context.parameters.dust.night_dust_ratio as u128);
+    let cap = dust_generation_cap(utxo, context);
     let rate = utxo
         .value
         .saturating_mul(context.parameters.dust.generation_decay_rate as u128);
     Ok(elapsed.saturating_mul(rate).min(cap))
+}
+
+fn dust_generation_cap(
+    utxo: &MidnightSpendableUtxo,
+    context: &MidnightRegistrationContext,
+) -> u128 {
+    utxo.value
+        .saturating_mul(context.parameters.dust.night_dust_ratio as u128)
 }
 
 fn offer(
@@ -1342,6 +1367,60 @@ mod tests {
         assert_eq!(
             generated_dust(&utxo(2, 1, Some(1_000_001), false), 1_000_001, &context),
             Ok(0)
+        );
+    }
+
+    #[test]
+    fn registration_fee_distinguishes_maturing_and_underfunded_outputs() {
+        use WalletDustRegistrationPortError as Error;
+
+        let timestamp = 1_700_000_100;
+        let context = MidnightRegistrationContext {
+            timestamp: Timestamp::from_secs(timestamp),
+            parameters: INITIAL_PARAMETERS,
+        };
+        let network = oxid_wallet_domain::ChainNetworkId::parse("undeployed").unwrap();
+        let night_key = SignatureVerifyingKey::Schnorr(
+            midnight_base_crypto::schnorr::SigningKey::from_bytes(&[3; 32])
+                .unwrap()
+                .verifying_key(),
+        );
+        let dust = midnight_ledger::dust::DustSecretKey::derive_secret_key(&[4; 32]);
+        let plan = |outputs| {
+            plan_registration(
+                &network,
+                night_key.clone(),
+                DustPublicKey::from(dust.clone()),
+                outputs,
+                &context,
+                timestamp + 3_600,
+            )
+            .unwrap()
+        };
+
+        let matured_small = utxo(1, 1, Some(0), false);
+        let underfunded = plan(vec![matured_small.clone()]);
+        assert_eq!(
+            underfunded.maximum_fee_allowance,
+            underfunded.matured_fee_allowance_cap
+        );
+        assert_eq!(
+            underfunded.validate_fee_allowance(&network, &context),
+            Err(Error::InsufficientNightForRegistration)
+        );
+        let young_large = utxo(50_000_000_000, 2, Some(timestamp), false);
+        assert_eq!(
+            plan(vec![matured_small.clone(), young_large.clone()])
+                .validate_fee_allowance(&network, &context),
+            Err(Error::InsufficientRegistrationAllowance)
+        );
+        assert!(
+            plan(vec![
+                matured_small,
+                utxo(young_large.value, 2, Some(0), false)
+            ])
+            .validate_fee_allowance(&network, &context)
+            .is_ok()
         );
     }
 

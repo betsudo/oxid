@@ -1400,6 +1400,156 @@ fn automatic_reconciler_continues_a_pending_settlement_without_another_realm_tic
 }
 
 #[test]
+fn automatic_reconciler_retries_preparation_without_another_realm_tick() {
+    use oxid_wallet_application::WalletDustRegistrationPreparationBlocker as Blocker;
+    use oxid_wallet_application::WalletDustRegistrationSettlementState as State;
+
+    let fake = Arc::new(FakeServices::new());
+    *fake.registration_prepare_failure.lock().unwrap() =
+        Some(WalletDustRegistrationPortError::InsufficientRegistrationAllowance);
+    let capability = Arc::new(automatic_capability(&fake));
+    let reconciler = AutomaticDustRealmReconciler::new(
+        fake.clone(),
+        fake.clone(),
+        fake.clone(),
+        Arc::clone(&capability),
+    );
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_time()
+        .build()
+        .expect("test runtime builds");
+
+    runtime.block_on(async {
+        let mut projected = capability.subscribe();
+        ReconcileSelectedWalletRealmUseCase::execute(
+            &reconciler,
+            SelectedWalletRealmSyncCommand {
+                profile_id: "profile_test".to_owned(),
+            },
+            WalletRealmReconciliationTrigger::Initial,
+        )
+        .await
+        .unwrap();
+        assert_eq!(projected.borrow().state, State::ActionRequired);
+        assert_eq!(
+            projected.borrow().preparation_blocker(),
+            Some(Blocker::InputsSettling)
+        );
+        assert_eq!(*fake.calls.lock().unwrap(), ["refresh", "prepare"]);
+
+        *fake.registration_prepare_failure.lock().unwrap() = None;
+        tokio::time::timeout(Duration::from_millis(250), async {
+            loop {
+                if projected.borrow_and_update().state == State::Ready {
+                    break;
+                }
+                projected.changed().await.unwrap();
+            }
+        })
+        .await
+        .expect("preparation retries without a second realm reconciliation");
+    });
+
+    let calls = fake.calls.lock().unwrap();
+    assert_eq!(calls.iter().filter(|call| **call == "prepare").count(), 2);
+    assert_eq!(calls.iter().filter(|call| **call == "submit").count(), 1);
+    assert_eq!(capability.projection().unwrap().preparation_blocker(), None);
+}
+
+#[test]
+fn underfunded_registration_waits_for_a_new_realm_observation() {
+    use oxid_wallet_application::WalletDustRegistrationPreparationBlocker as Blocker;
+    use oxid_wallet_application::WalletDustRegistrationSettlementState as State;
+
+    let fake = Arc::new(FakeServices::new());
+    *fake.registration_prepare_failure.lock().unwrap() =
+        Some(WalletDustRegistrationPortError::InsufficientNightForRegistration);
+    let capability = Arc::new(automatic_capability(&fake));
+    let reconciler = AutomaticDustRealmReconciler::new(
+        fake.clone(),
+        fake.clone(),
+        fake.clone(),
+        Arc::clone(&capability),
+    );
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_time()
+        .build()
+        .unwrap();
+    let reconcile = || {
+        ReconcileSelectedWalletRealmUseCase::execute(
+            &reconciler,
+            SelectedWalletRealmSyncCommand {
+                profile_id: "profile_test".to_owned(),
+            },
+            WalletRealmReconciliationTrigger::Initial,
+        )
+    };
+    runtime.block_on(async {
+        reconcile().await.unwrap();
+        let underfunded = capability.projection().unwrap();
+        assert_eq!(underfunded.state, State::ActionRequired);
+        assert_eq!(
+            underfunded.preparation_blocker(),
+            Some(Blocker::InsufficientNight)
+        );
+        assert!(!reconciler.continuation_running.load(Ordering::Acquire));
+        assert_eq!(*fake.calls.lock().unwrap(), ["refresh", "prepare"]);
+
+        *fake.registration_prepare_failure.lock().unwrap() = None;
+        reconcile().await.unwrap();
+        let ready = capability.projection().unwrap();
+        assert_eq!(ready.state, State::Ready);
+        assert_eq!(ready.preparation_blocker(), None);
+    });
+    let calls = fake.calls.lock().unwrap();
+    assert_eq!(calls.iter().filter(|call| **call == "submit").count(), 1);
+}
+
+#[test]
+fn preparation_continuation_does_not_bind_a_new_realm_generation() {
+    let fake = Arc::new(FakeServices::new());
+    *fake.registration_prepare_failure.lock().unwrap() =
+        Some(WalletDustRegistrationPortError::AccountNotSynchronized);
+    let capability = Arc::new(automatic_capability(&fake));
+    let reconciler = AutomaticDustRealmReconciler::new(
+        fake.clone(),
+        fake.clone(),
+        fake.clone(),
+        Arc::clone(&capability),
+    );
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_time()
+        .build()
+        .unwrap();
+
+    runtime.block_on(async {
+        ReconcileSelectedWalletRealmUseCase::execute(
+            &reconciler,
+            SelectedWalletRealmSyncCommand {
+                profile_id: "profile_test".to_owned(),
+            },
+            WalletRealmReconciliationTrigger::Initial,
+        )
+        .await
+        .unwrap();
+        assert!(reconciler.continuation_running.load(Ordering::Acquire));
+
+        let previous = capability.projection().unwrap().identity.unwrap();
+        fake.selected.lock().unwrap().generation += 1;
+        *fake.registration_prepare_failure.lock().unwrap() = None;
+        tokio::time::timeout(Duration::from_millis(250), async {
+            while reconciler.continuation_running.load(Ordering::Acquire) {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("the old continuation stops after selection changes");
+        assert_eq!(capability.projection().unwrap().identity, Some(previous));
+        assert_eq!(*fake.calls.lock().unwrap(), ["refresh", "prepare"]);
+    });
+}
+
+#[test]
 fn refresh_failure_retains_the_included_registration_for_retry() {
     let fake = Arc::new(FakeServices::new());
     fake.selected.lock().unwrap().view.dust = WalletRealmFamilyView::Ready(dust_view("syncing"));

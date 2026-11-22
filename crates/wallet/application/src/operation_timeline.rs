@@ -265,6 +265,7 @@ pub enum WalletDustRegistrationTimelineCode {
     EligibilityObserved,
     RegistrationAlreadyCurrent,
     PreparationPending,
+    PreparationRequiresFunding,
     Prepared,
     AuthorizationSucceeded,
     AuthorizationRejected,

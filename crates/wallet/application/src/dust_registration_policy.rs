@@ -78,6 +78,13 @@ pub enum WalletDustRegistrationSettlementState {
     Suspended,
 }
 
+/// Why a preparation attempt stopped before producing a registration draft.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WalletDustRegistrationPreparationBlocker {
+    InputsSettling,
+    InsufficientNight,
+}
+
 use WalletDustRegistrationSettlementState as State;
 
 /// One complete presentation-neutral settlement projection.
@@ -90,6 +97,8 @@ pub struct WalletDustRegistrationSettlementProjection {
     pub preparation_revision: u64,
     /// Monotonic sequence shared by every recoverable-status event.
     pub recovery_revision: u64,
+    // A live observation. Recovery re-evaluates it without changing its format.
+    pub(crate) preparation_blocker: Option<WalletDustRegistrationPreparationBlocker>,
     abandoned_registration: Option<WalletDustRegistrationSettlementRegistration>,
     resume_state: Option<WalletDustRegistrationSettlementState>,
     pending_retry_revision: Option<u64>,
@@ -104,6 +113,7 @@ impl Default for WalletDustRegistrationSettlementProjection {
             checkpoint: None,
             preparation_revision: 0,
             recovery_revision: 0,
+            preparation_blocker: None,
             abandoned_registration: None,
             resume_state: None,
             pending_retry_revision: None,
@@ -127,6 +137,7 @@ pub(crate) fn recovered_dust_registration_projection(
         checkpoint: Some(checkpoint),
         preparation_revision,
         recovery_revision,
+        preparation_blocker: None,
         abandoned_registration: None,
         resume_state: None,
         pending_retry_revision: None,
@@ -134,6 +145,11 @@ pub(crate) fn recovered_dust_registration_projection(
 }
 
 impl WalletDustRegistrationSettlementProjection {
+    #[must_use]
+    pub fn preparation_blocker(&self) -> Option<WalletDustRegistrationPreparationBlocker> {
+        self.preparation_blocker
+    }
+
     /// A replacement registration parked while an older transaction is reconciled.
     ///
     /// This stays crate-private so presentation adapters cannot couple to the

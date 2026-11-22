@@ -647,12 +647,23 @@ impl WalletDustSettlementCapability {
         &self,
         profile_id: String,
     ) -> Result<WalletDustRegistrationSettlementProjection, WalletDustSettlementError> {
+        self.refresh_selected(profile_id, None).await
+    }
+
+    async fn refresh_selected(
+        &self,
+        profile_id: String,
+        expected_identity: Option<&WalletDustRegistrationSettlementIdentity>,
+    ) -> Result<WalletDustRegistrationSettlementProjection, WalletDustSettlementError> {
         let selected = self
             .selected_realm
             .execute(SelectedWalletRealmSyncCommand { profile_id })
             .map_err(|_| WalletDustSettlementError::SelectedRealmUnavailable)?;
         let eligible = selected_realm_is_eligible(&selected);
         let identity = settlement_identity(&selected);
+        if expected_identity.is_some_and(|expected| expected != &identity) {
+            return Err(WalletDustSettlementError::StaleRealm);
+        }
         let current = self.projection()?;
         if let Some(active) = current
             .identity
@@ -959,7 +970,8 @@ impl AutomaticDustRealmReconciler {
         profile_id: String,
         projection: &WalletDustRegistrationSettlementProjection,
     ) {
-        if !settlement_needs_continuation(projection)
+        let authority = self.dust.authority;
+        if !settlement_needs_continuation(projection, authority)
             || tokio::runtime::Handle::try_current().is_err()
             || self
                 .continuation_running
@@ -982,12 +994,18 @@ impl AutomaticDustRealmReconciler {
                     return;
                 };
                 if current.identity.as_ref() != Some(&identity)
-                    || !settlement_needs_continuation(&current)
+                    || !settlement_needs_continuation(&current, authority)
                 {
                     return;
                 }
-                match dust.refresh(profile_id.clone()).await {
-                    Ok(refreshed) if !settlement_needs_continuation(&refreshed) => return,
+                match dust
+                    .refresh_selected(profile_id.clone(), Some(&identity))
+                    .await
+                {
+                    Ok(refreshed) if !settlement_needs_continuation(&refreshed, authority) => {
+                        return;
+                    }
+                    Err(WalletDustSettlementError::StaleRealm) => return,
                     Ok(_) | Err(_) => {}
                 }
             }
@@ -995,12 +1013,27 @@ impl AutomaticDustRealmReconciler {
     }
 }
 
-fn settlement_needs_continuation(projection: &WalletDustRegistrationSettlementProjection) -> bool {
-    matches!(
-        projection.state,
-        oxid_wallet_application::WalletDustRegistrationSettlementState::Confirming
-            | oxid_wallet_application::WalletDustRegistrationSettlementState::Reconciling
-    )
+fn settlement_needs_continuation(
+    projection: &WalletDustRegistrationSettlementProjection,
+    authority: DustSettlementAuthority,
+) -> bool {
+    use oxid_wallet_application::{
+        WalletDustRegistrationPreparationBlocker as Blocker,
+        WalletDustRegistrationSettlementState as State,
+    };
+
+    match projection.state {
+        State::Confirming | State::Reconciling => true,
+        State::ActionRequired => {
+            authority == DustSettlementAuthority::AutomaticDevelopment
+                && projection
+                    .identity
+                    .as_ref()
+                    .is_some_and(|identity| identity.realm.as_str() == "undeployed")
+                && projection.preparation_blocker() == Some(Blocker::InputsSettling)
+        }
+        _ => false,
+    }
 }
 
 impl SyncSelectedWalletRealmUseCase for AutomaticDustRealmReconciler {
@@ -1317,7 +1350,18 @@ impl ComposedDustRegistrationExecutor {
                 oxid_wallet_application::WalletDustRegistrationPortError::AccountNotSynchronized
                 | oxid_wallet_application::WalletDustRegistrationPortError::NoEligibleNight
                 | oxid_wallet_application::WalletDustRegistrationPortError::InsufficientRegistrationAllowance,
-            )) => return Err(WalletDustRegistrationExecutorFailure::PreparationPending),
+            )) => {
+                return Err(WalletDustRegistrationExecutorFailure::PreparationBlocked(
+                    oxid_wallet_application::WalletDustRegistrationPreparationBlocker::InputsSettling,
+                ));
+            }
+            Err(oxid_wallet_application::WalletDustRegistrationError::Operation(
+                oxid_wallet_application::WalletDustRegistrationPortError::InsufficientNightForRegistration,
+            )) => {
+                return Err(WalletDustRegistrationExecutorFailure::PreparationBlocked(
+                    oxid_wallet_application::WalletDustRegistrationPreparationBlocker::InsufficientNight,
+                ));
+            }
             Err(error) => return Err(map_registration_failure(error)),
         };
         if preview.network_id != identity.realm.as_str() {

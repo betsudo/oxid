@@ -31,6 +31,7 @@ pub enum WalletDustRegistrationPortError {
     NoEligibleNight,
     RegistrationAlreadyCurrent,
     InsufficientRegistrationAllowance,
+    InsufficientNightForRegistration,
     DraftNotFound,
     DraftExpired,
     DraftConflict,
@@ -60,6 +61,9 @@ impl fmt::Display for WalletDustRegistrationPortError {
             }
             Self::InsufficientRegistrationAllowance => {
                 "generated DUST cannot yet cover the registration fee"
+            }
+            Self::InsufficientNightForRegistration => {
+                "more eligible NIGHT is needed to cover the DUST registration fee"
             }
             Self::DraftNotFound => "DUST registration draft was not found",
             Self::DraftExpired => "DUST registration draft has expired",
