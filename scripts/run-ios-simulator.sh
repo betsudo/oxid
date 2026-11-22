@@ -141,7 +141,7 @@ portal_manifest_path=""
 portal_manifest_sha256=""
 portal_profile_authority_path=""
 portal_profile_authority_sha256=""
-public_portal_artifact_binding=""
+portal_artifact_binding=""
 case "$portal_profile" in
   unavailable)
     ;;
@@ -158,6 +158,7 @@ case "$portal_profile" in
         exit 1
       fi
       mobile_features="$mobile_features,standalone-portal"
+      portal_artifact_binding="|portal_manifest=$portal_manifest_sha256"
     else
       if [ "$mobile_custody" != "native" ] || [ "$standalone_network_profile" != "simulated" ] || \
         [ "${OXID_UI_PROFILE:-user}" != "user" ] || \
@@ -177,7 +178,7 @@ case "$portal_profile" in
         echo "The signed $portal_profile deployment profile or trust root path or digest is invalid." >&2
         exit 1
       fi
-      public_portal_artifact_binding="|$portal_profile=$signed_profile_digest/$trust_digest/$portal_manifest_sha256"
+      portal_artifact_binding="|$portal_profile=$signed_profile_digest/$trust_digest/$portal_manifest_sha256"
       mobile_features="$portal_profile-portal"
     fi
     ;;
@@ -298,7 +299,7 @@ fi
 
 app_bundle="$repository_root/target/dx/oxid-app/debug/ios/OxidApp.app"
 artifact_receipt="$repository_root/target/dx/oxid-app/debug/ios/oxid-app-artifact-receipt.json"
-artifact_configuration="$mobile_features|ui=$ui_profile|custody=$mobile_custody|network=$standalone_network_profile|tailnet=$tailnet_artifact_binding|portal=$portal_profile|proving=$mobile_presentation_proving$public_portal_artifact_binding"
+artifact_configuration="$mobile_features|ui=$ui_profile|custody=$mobile_custody|network=$standalone_network_profile|tailnet=$tailnet_artifact_binding|portal=$portal_profile|proving=$mobile_presentation_proving$portal_artifact_binding"
 
 artifact_verified=0
 if [ "$operation" = "ensure" ]; then
