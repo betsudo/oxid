@@ -12,13 +12,16 @@ import { artifactSha256, sourceSha256 } from "./app-artifact-receipt.mjs";
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const script = path.join(root, "scripts", "app-artifact-receipt.mjs");
+const localPortalConfiguration = "mobile,standalone-development,standalone-local,standalone-portal"
+  + "|ui=user|custody=development|network=local|tailnet=none|portal=local|proving=unavailable"
+  + `|portal_manifest=${"a".repeat(64)}`;
 
 function invoke(operation, temporaryRoot, overrides = {}) {
   const values = {
     platform: "ios-simulator",
     artifact: path.join(temporaryRoot, "OxidApp.app"),
     target: "aarch64-apple-ios-sim",
-    configuration: "mobile,standalone-development|user|development|simulated|unavailable",
+    configuration: localPortalConfiguration,
     receipt: path.join(temporaryRoot, "receipt.json"),
     ...overrides,
   };
@@ -60,7 +63,9 @@ test("receipt binds a private manifest to the exact source, configuration, and b
     assert.match(modifiedResult.stderr, /does not match/);
 
     await writeFile(path.join(bundle, "Frameworks", "library"), "library-one");
-    const wrongConfiguration = invoke("verify", temporaryRoot, { configuration: "different" });
+    const wrongConfiguration = invoke("verify", temporaryRoot, {
+      configuration: localPortalConfiguration.replace("a".repeat(64), "b".repeat(64)),
+    });
     assert.notEqual(wrongConfiguration.status, 0);
     assert.match(wrongConfiguration.stderr, /does not match/);
 
@@ -87,6 +92,16 @@ test("directory hashing is deterministic and observes executable mode", async ()
   } finally {
     await rm(temporaryRoot, { recursive: true, force: true });
   }
+});
+
+test("Local iOS Portal launcher and diagnostic cache include the reviewed manifest digest", async () => {
+  const [launcher, diagnostic] = await Promise.all([
+    readFile(path.join(root, "scripts", "run-ios-simulator.sh"), "utf8"),
+    readFile(path.join(root, "scripts", "test-ios-portal-exact-sequence-simulator.sh"), "utf8"),
+  ]);
+  assert.match(launcher, /mobile_features="\$mobile_features,standalone-portal"\s+portal_artifact_binding="\|portal_manifest=\$portal_manifest_sha256"/);
+  assert.match(launcher, /artifact_configuration="[^"\n]*\$portal_artifact_binding"/);
+  assert.match(diagnostic, /diagnostic_artifact_configuration\(\) \{[^}]*\|portal_manifest=\$manifest_sha"/);
 });
 
 test("Maestro wrappers ensure exact artifacts before deploy and expose phase metrics", async () => {

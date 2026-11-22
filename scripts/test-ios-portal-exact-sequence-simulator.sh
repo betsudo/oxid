@@ -276,7 +276,7 @@ diagnostic_rust_target() {
 }
 
 diagnostic_artifact_configuration() {
-  printf '%s\n' 'mobile,standalone-development,standalone-local,standalone-portal|ui=user|custody=development|network=local|tailnet=none|portal=local|proving=unavailable'
+  printf '%s\n' "mobile,standalone-development,standalone-local,standalone-portal|ui=user|custody=development|network=local|tailnet=none|portal=local|proving=unavailable|portal_manifest=$manifest_sha"
 }
 
 diagnostic_artifact_valid() {

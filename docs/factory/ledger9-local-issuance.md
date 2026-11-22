@@ -122,15 +122,15 @@ esac
 bundle_root="$root/target/dx/oxid-app/debug/ios"
 app="$bundle_root/OxidApp.app"
 artifact_receipt="$bundle_root/oxid-app-artifact-receipt.json"
-app_config='mobile,standalone-development,standalone-local,standalone-portal|ui=user|custody=development|network=local|tailnet=none|portal=local|proving=unavailable'
+app_config="mobile,standalone-development,standalone-local,standalone-portal|ui=user|custody=development|network=local|tailnet=none|portal=local|proving=unavailable|portal_manifest=$OXID_BUILD_PORTAL_DEPLOYMENT_MANIFEST_SHA256"
 node scripts/app-artifact-receipt.mjs verify --platform ios-simulator \
   --artifact "$app" --target "$rust_target" --configuration "$app_config" \
   --receipt "$artifact_receipt"
 cp "$artifact_receipt" "$run_dir/app-artifact-receipt.json"
 ```
 
-Build again when the local Portal manifest changes. Record its reviewed digest
-separately alongside the app receipt.
+The app receipt binds the reviewed Portal manifest digest. Build again when
+the manifest changes or a previously built app has an older receipt format.
 
 Choose an installed iOS runtime and iPhone device type. Export their full IDs
 as `OXID_IOS_RUNTIME_ID` and `OXID_IOS_DEVICE_TYPE_ID`. The qualification used
