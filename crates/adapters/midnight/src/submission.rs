@@ -74,7 +74,8 @@ const CHAIN_TIP_QUERY: &str = include_str!("../queries/chain_tip.graphql");
 const DUST_BALANCE_SEGMENT: u16 = 0xFEED;
 use crate::preprod_transport::{
     INDEXER_ROUTE, INDEXER_SOCKET_ROUTE, MidnightPreprodCredential, MidnightPreprodPreflightError,
-    MidnightTransportRoute, is_preprod_node_route, preflight_blockfrost_preprod,
+    MidnightPublicChainPreflightError, MidnightTransportRoute, is_preprod_node_route,
+    preflight_blockfrost_preprod, verify_public_chain,
 };
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
@@ -281,6 +282,28 @@ impl MidnightStandaloneConfig {
             self.indexer().websocket_url(),
             genesis_hash,
             credential,
+        )
+        .await
+    }
+
+    /// Authenticates a signed Preview profile's node and both indexer transports.
+    pub async fn verify_preview_chain(
+        &self,
+        genesis_hash: &[u8; 32],
+    ) -> Result<u64, MidnightPublicChainPreflightError> {
+        if self.indexer.network_id().as_str() != "preview"
+            || !self.node_websocket_url().starts_with("wss://")
+            || !self.indexer_http_url().starts_with("https://")
+            || !self.indexer.websocket_url().starts_with("wss://")
+        {
+            return Err(MidnightPublicChainPreflightError::InvalidRoute);
+        }
+        verify_public_chain(
+            self.node_websocket_url(),
+            self.indexer_http_url(),
+            self.indexer.websocket_url(),
+            genesis_hash,
+            None,
         )
         .await
     }
@@ -3574,6 +3597,148 @@ mod tests {
             )),
             Err(MidnightChainIdentityError::InvalidNodeEndpoint)
         );
+    }
+
+    #[test]
+    fn preview_chain_rejects_insecure_or_cross_network_routes() {
+        for (network, indexer_ws, indexer_http, node) in [
+            (
+                "preprod",
+                "wss://indexer.example.test/graphql",
+                "https://indexer.example.test/graphql",
+                "wss://node.example.test",
+            ),
+            (
+                "preview",
+                "ws://127.0.0.1:80/graphql",
+                "https://indexer.example.test/graphql",
+                "wss://node.example.test",
+            ),
+            (
+                "preview",
+                "wss://indexer.example.test/graphql",
+                "http://127.0.0.1:80/graphql",
+                "wss://node.example.test",
+            ),
+            (
+                "preview",
+                "wss://indexer.example.test/graphql",
+                "https://indexer.example.test/graphql",
+                "ws://127.0.0.1:80",
+            ),
+        ] {
+            let config = MidnightStandaloneConfig::new_without_unshielded_address(
+                network,
+                indexer_ws,
+                indexer_http,
+                node,
+                "https://proof.example.test",
+            )
+            .unwrap();
+            assert_eq!(
+                runtime().block_on(config.verify_preview_chain(&[0; 32])),
+                Err(MidnightPublicChainPreflightError::InvalidRoute)
+            );
+        }
+    }
+
+    #[test]
+    #[allow(clippy::result_large_err)] // tungstenite's test-server callback owns the error type.
+    fn public_chain_rejects_an_indexed_block_from_another_node() {
+        use tokio::io::{AsyncBufReadExt as _, AsyncReadExt as _, AsyncWriteExt as _, BufReader};
+
+        runtime().block_on(async {
+            let node = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+                .await
+                .unwrap();
+            let node_url = format!("ws://{}", node.local_addr().unwrap());
+            let indexed = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+                .await
+                .unwrap();
+            let indexer_url = format!("http://{}/graphql", indexed.local_addr().unwrap());
+            let node_fixture = tokio::spawn(async move {
+                let (stream, _) = node.accept().await.unwrap();
+                let mut socket =
+                    accept_hdr_async(stream, |request: &Request, response: Response| {
+                        assert!(!request.headers().contains_key("project_id"));
+                        Ok(response)
+                    })
+                    .await
+                    .unwrap();
+                for (height, hash) in [(0, [1; 32]), (50, [2; 32])] {
+                    let request = socket.next().await.unwrap().unwrap();
+                    let request: Value = serde_json::from_str(request.to_text().unwrap()).unwrap();
+                    assert_eq!(request["method"], "chain_getBlockHash");
+                    assert_eq!(request["params"], json!([height]));
+                    socket
+                        .send(Message::Text(
+                            json!({
+                                "jsonrpc": "2.0",
+                                "id": request["id"],
+                                "result": format!("0x{}", hex::encode(hash))
+                            })
+                            .to_string()
+                            .into(),
+                        ))
+                        .await
+                        .unwrap();
+                }
+            });
+            let indexer_fixture = tokio::spawn(async move {
+                let (stream, _) = indexed.accept().await.unwrap();
+                let mut request = BufReader::new(stream);
+                let mut length = 0;
+                loop {
+                    let mut line = String::new();
+                    assert_ne!(request.read_line(&mut line).await.unwrap(), 0);
+                    if line == "\r\n" {
+                        break;
+                    }
+                    if let Some((name, value)) = line.split_once(':') {
+                        assert!(!name.eq_ignore_ascii_case("project_id"));
+                        if name.eq_ignore_ascii_case("content-length") {
+                            length = value.trim().parse().unwrap();
+                        }
+                    }
+                }
+                let mut body = vec![0; length];
+                request.read_exact(&mut body).await.unwrap();
+                let request_body: Value = serde_json::from_slice(&body).unwrap();
+                assert_eq!(request_body["query"], CHAIN_TIP_QUERY);
+                let mut parameters = Vec::new();
+                midnight_serialize::tagged_serialize(&INITIAL_PARAMETERS, &mut parameters).unwrap();
+                let response = json!({"data": {"block": {
+                    "height": 50,
+                    "timestamp": 1_750_000_000_000_i64,
+                    "hash": hex::encode([3; 32]),
+                    "protocolVersion": 2_001_100,
+                    "ledgerParameters": hex::encode(parameters)
+                }}})
+                .to_string();
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{response}",
+                    response.len()
+                );
+                request
+                    .get_mut()
+                    .write_all(response.as_bytes())
+                    .await
+                    .unwrap();
+            });
+
+            let result = timeout(
+                Duration::from_secs(5),
+                verify_public_chain(&node_url, &indexer_url, "ws://127.0.0.1:1", &[1; 32], None),
+            )
+            .await
+            .expect("loopback preflight must settle");
+            assert_eq!(
+                result,
+                Err(MidnightPublicChainPreflightError::ChainViewMismatch)
+            );
+            node_fixture.await.unwrap();
+            indexer_fixture.await.unwrap();
+        });
     }
 
     #[test]

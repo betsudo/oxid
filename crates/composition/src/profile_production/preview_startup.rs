@@ -8,9 +8,11 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use oxid_adapter_deployment_profile::{
     AuthenticatedDeploymentProfile, DeploymentProfileVerifier, DeploymentTrustRoot,
 };
+use oxid_adapter_midnight::MidnightPublicChainPreflightError;
 
 use super::{
-    ProductionDeploymentCompositionError as StartupError, authenticate_public_portal_manifest,
+    AuthenticatedProductionDeployment, ProductionDeploymentCompositionError as StartupError,
+    authenticate_public_portal_manifest, production_midnight_config,
 };
 use crate::portal::PortalIdentityConfiguration;
 
@@ -62,9 +64,30 @@ pub fn compose_embedded_preview_portal(
         .enable_all()
         .build()
         .map_err(|_| StartupError::PublicPortalRuntimeUnavailable)?;
-    let deployment = runtime.block_on(super::authenticate_production_deployment(profile))?;
+    let deployment = runtime.block_on(authenticate_preview_deployment(profile))?;
     runtime.block_on(verify_public_prover(&deployment))?;
     super::public_portal::compose_authenticated_public_portal(deployment, portal)
+}
+
+async fn authenticate_preview_deployment(
+    profile: AuthenticatedDeploymentProfile,
+) -> Result<AuthenticatedProductionDeployment, StartupError> {
+    use MidnightPublicChainPreflightError as Error;
+
+    let midnight = production_midnight_config(&profile)?;
+    midnight
+        .verify_preview_chain(profile.midnight().genesis_hash())
+        .await
+        .map_err(|error| match error {
+            Error::InvalidCredential | Error::InvalidRoute => StartupError::InvalidMidnightProfile,
+            Error::NodeUnavailable => StartupError::ChainIdentityUnavailable,
+            Error::GenesisMismatch => StartupError::ChainIdentityMismatch,
+            Error::IndexerUnavailable => StartupError::PreviewIndexerUnavailable,
+            Error::IndexerWebsocketUnavailable => StartupError::PreviewIndexerWebsocketUnavailable,
+            Error::ChainViewMismatch => StartupError::PreviewChainViewMismatch,
+            Error::IncompatibleRuntime => StartupError::PreviewIncompatibleRuntime,
+        })?;
+    Ok(AuthenticatedProductionDeployment { profile, midnight })
 }
 
 /// Startup for a signed PreProd Portal profile and its device-local access credential.
@@ -158,6 +181,10 @@ mod tests {
         assert_eq!(profile.midnight().network_id(), "preprod");
         assert!(portal.client_factory.deployment().is_public_network());
         assert!(portal.test_ingress.is_none());
+        assert_eq!(
+            futures::executor::block_on(authenticate_preview_deployment(profile)).err(),
+            Some(StartupError::InvalidMidnightProfile),
+        );
         assert_eq!(
             admit_public_inputs(TRUST, PROFILE, MANIFEST, NOW, "preprod").err(),
             Some(StartupError::InvalidMidnightProfile),

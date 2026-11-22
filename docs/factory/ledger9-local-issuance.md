@@ -132,9 +132,12 @@ The repository-owned XCTest selector is
 is `testPrepareHolder`. Run `testFundedWalletRecoversAcrossRestart` next, on the
 same simulator and profile, to observe DUST readiness and the unchanged public
 NIGHT address after a process restart. Create the offer after that check to
-preserve its lifetime for issuance. The post-issuance restart selector is
-`testRestored`. Build the XCTest bundle once and reuse it with
-`test-without-building`. Preserve app data throughout the sequence.
+preserve its lifetime for issuance. The issuance selector verifies that the
+synthetic Passport's names start hidden, reveals and hides only the first
+name, and leaves it visible for the restart check. `testRestored` requires the
+names to be hidden when the credential is reopened. Build the XCTest bundle
+once and reuse it with `test-without-building`. Preserve app data throughout
+the sequence.
 
 ### Restart and protected-store checks
 

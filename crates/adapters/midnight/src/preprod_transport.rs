@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 
-//! Read-only verification of signed PreProd routes with native Blockfrost authentication.
+//! Public Midnight chain verification and native PreProd Blockfrost authentication.
 
 use std::{fmt, time::Duration};
 
@@ -122,7 +122,7 @@ impl<'a> MidnightTransportRoute<'a> {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum MidnightPreprodPreflightError {
+pub enum MidnightPublicChainPreflightError {
     InvalidCredential,
     InvalidRoute,
     NodeUnavailable,
@@ -133,26 +133,29 @@ pub enum MidnightPreprodPreflightError {
     IncompatibleRuntime,
 }
 
-impl fmt::Display for MidnightPreprodPreflightError {
+/// Preserves the error type used by the Blockfrost PreProd entry point.
+pub use MidnightPublicChainPreflightError as MidnightPreprodPreflightError;
+
+impl fmt::Display for MidnightPublicChainPreflightError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str(match self {
             Self::InvalidCredential => "Blockfrost PreProd project ID is invalid",
-            Self::InvalidRoute => "Blockfrost PreProd route is invalid",
-            Self::NodeUnavailable => "authenticated PreProd node is unavailable",
-            Self::GenesisMismatch => "PreProd node genesis differs from the signed profile",
-            Self::IndexerUnavailable => "authenticated PreProd indexer is unavailable",
+            Self::InvalidRoute => "authenticated Midnight route is invalid",
+            Self::NodeUnavailable => "authenticated Midnight node is unavailable",
+            Self::GenesisMismatch => "Midnight node genesis differs from the signed profile",
+            Self::IndexerUnavailable => "authenticated Midnight indexer is unavailable",
             Self::IndexerWebsocketUnavailable => {
-                "authenticated PreProd GraphQL WebSocket is unavailable"
+                "authenticated Midnight GraphQL WebSocket is unavailable"
             }
-            Self::ChainViewMismatch => "PreProd node and indexer disagree on the indexed block",
+            Self::ChainViewMismatch => "Midnight node and indexer disagree on the indexed block",
             Self::IncompatibleRuntime => {
-                "PreProd runtime does not match the supported Ledger 9 release"
+                "Midnight runtime does not match the supported Ledger 9 release"
             }
         })
     }
 }
 
-impl std::error::Error for MidnightPreprodPreflightError {}
+impl std::error::Error for MidnightPublicChainPreflightError {}
 
 /// Checks the signed node genesis and compares the indexer tip to the node's
 /// canonical hash. The caller supplies public routes from a verified profile.
@@ -169,55 +172,75 @@ pub async fn preflight_blockfrost_preprod(
     {
         return Err(MidnightPreprodPreflightError::InvalidRoute);
     }
-    let client = timeout(
-        PREFLIGHT_TIMEOUT,
-        connect_json_rpc_websocket_with_headers(node_url, credential.headers()?),
+    verify_public_chain(
+        node_url,
+        indexer_url,
+        indexer_websocket_url,
+        genesis_hash,
+        Some(credential),
     )
     .await
-    .map_err(|_| MidnightPreprodPreflightError::NodeUnavailable)?
-    .map_err(|_| MidnightPreprodPreflightError::NodeUnavailable)?;
+}
+
+pub(crate) async fn verify_public_chain(
+    node_url: &str,
+    indexer_url: &str,
+    indexer_websocket_url: &str,
+    genesis_hash: &[u8; 32],
+    credential: Option<&MidnightPreprodCredential>,
+) -> Result<u64, MidnightPublicChainPreflightError> {
+    use MidnightPublicChainPreflightError as Error;
+
+    let node_headers = MidnightTransportRoute::new(node_url, credential).headers()?;
+    let client = timeout(
+        PREFLIGHT_TIMEOUT,
+        connect_json_rpc_websocket_with_headers(node_url, node_headers),
+    )
+    .await
+    .map_err(|_| Error::NodeUnavailable)?
+    .map_err(|_| Error::NodeUnavailable)?;
     let node = LegacyRpcMethods::<SubstrateConfig>::new(RpcClient::new(client));
     let genesis = timeout(
         PREFLIGHT_TIMEOUT,
         node.chain_get_block_hash(Some(0_u64.into())),
     )
     .await
-    .map_err(|_| MidnightPreprodPreflightError::NodeUnavailable)?
-    .map_err(|_| MidnightPreprodPreflightError::NodeUnavailable)?
-    .ok_or(MidnightPreprodPreflightError::NodeUnavailable)?;
+    .map_err(|_| Error::NodeUnavailable)?
+    .map_err(|_| Error::NodeUnavailable)?
+    .ok_or(Error::NodeUnavailable)?;
     if genesis.0 != *genesis_hash {
-        return Err(MidnightPreprodPreflightError::GenesisMismatch);
+        return Err(Error::GenesisMismatch);
     }
     let (height, indexed_hash, indexed_runtime) =
-        fetch_identified_chain_tip(MidnightTransportRoute::new(indexer_url, Some(credential)))
+        fetch_identified_chain_tip(MidnightTransportRoute::new(indexer_url, credential))
             .await
-            .map_err(|_| MidnightPreprodPreflightError::IndexerUnavailable)?;
+            .map_err(|_| Error::IndexerUnavailable)?;
     let node_hash = timeout(
         PREFLIGHT_TIMEOUT,
         node.chain_get_block_hash(Some(height.into())),
     )
     .await
-    .map_err(|_| MidnightPreprodPreflightError::NodeUnavailable)?
-    .map_err(|_| MidnightPreprodPreflightError::NodeUnavailable)?
+    .map_err(|_| Error::NodeUnavailable)?
+    .map_err(|_| Error::NodeUnavailable)?
     .filter(|hash| hash.0 == indexed_hash)
-    .ok_or(MidnightPreprodPreflightError::ChainViewMismatch)?;
+    .ok_or(Error::ChainViewMismatch)?;
     let node_runtime = timeout(
         PREFLIGHT_TIMEOUT,
         node.state_get_runtime_version(Some(node_hash)),
     )
     .await
-    .map_err(|_| MidnightPreprodPreflightError::NodeUnavailable)?
-    .map_err(|_| MidnightPreprodPreflightError::NodeUnavailable)?;
+    .map_err(|_| Error::NodeUnavailable)?
+    .map_err(|_| Error::NodeUnavailable)?;
     if node_runtime.spec_version != LEDGER9_RUNTIME_SPEC || indexed_runtime != LEDGER9_RUNTIME_SPEC
     {
-        return Err(MidnightPreprodPreflightError::IncompatibleRuntime);
+        return Err(Error::IncompatibleRuntime);
     }
     verify_graphql_transport(MidnightTransportRoute::new(
         indexer_websocket_url,
-        Some(credential),
+        credential,
     ))
     .await
-    .map_err(|_| MidnightPreprodPreflightError::IndexerWebsocketUnavailable)?;
+    .map_err(|_| Error::IndexerWebsocketUnavailable)?;
     Ok(height)
 }
 
@@ -241,6 +264,8 @@ mod tests {
 
     #[test]
     fn malformed_or_cross_network_credentials_are_rejected() {
+        use crate::MidnightPreprodPreflightError::InvalidCredential;
+
         for candidate in [
             String::new(),
             format!("nightpreview{}", "A".repeat(32)),
@@ -249,7 +274,7 @@ mod tests {
         ] {
             assert_eq!(
                 MidnightPreprodCredential::new(candidate).unwrap_err(),
-                MidnightPreprodPreflightError::InvalidCredential
+                InvalidCredential
             );
         }
     }

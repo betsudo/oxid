@@ -57,11 +57,13 @@ OXID_MOBILE_CUSTODY=native OXID_MOBILE_PORTAL_PROFILE=preview \
 
 The build verifies the signed profile with the independent trust root and
 requires its Portal digest to match. The artifact receipt binds all three
-digests. Startup rechecks signature and time validity, admits the exact
-HTTPS Portal configuration and issuer key, then authenticates node genesis
-and checks the private HTTPS proof server's `/version` for the Ledger 9
-release paired with the app. The version check sends no witnesses or
-provider credentials. If a required service cannot be reached, the app stays
+digests. Startup rechecks signature and time validity and admits the exact
+HTTPS Portal configuration and issuer key. It checks node genesis, compares
+the HTTPS indexer's latest block hash with the node at the same height,
+requires both runtimes to match the pinned Ledger 9 release, and waits for
+GraphQL WebSocket acknowledgement. It then checks the private HTTPS proof
+server's `/version` for the release paired with the app. The version check
+sends no witnesses or provider credentials. If a required service cannot be reached, the app stays
 on **Preview access**. Use
 **Retry connection** after restoring connectivity. The wallet remains gated
 until the signed deployment passes startup checks.
