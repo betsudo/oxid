@@ -134,7 +134,7 @@ pub enum MidnightPublicChainPreflightError {
 }
 
 /// Preserves the error type used by the Blockfrost PreProd entry point.
-pub type MidnightPreprodPreflightError = MidnightPublicChainPreflightError;
+pub use MidnightPublicChainPreflightError as MidnightPreprodPreflightError;
 
 impl fmt::Display for MidnightPublicChainPreflightError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -264,6 +264,8 @@ mod tests {
 
     #[test]
     fn malformed_or_cross_network_credentials_are_rejected() {
+        use crate::MidnightPreprodPreflightError::InvalidCredential;
+
         for candidate in [
             String::new(),
             format!("nightpreview{}", "A".repeat(32)),
@@ -272,7 +274,7 @@ mod tests {
         ] {
             assert_eq!(
                 MidnightPreprodCredential::new(candidate).unwrap_err(),
-                MidnightPreprodPreflightError::InvalidCredential
+                InvalidCredential
             );
         }
     }
