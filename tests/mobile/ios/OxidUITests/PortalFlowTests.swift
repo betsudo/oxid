@@ -42,6 +42,35 @@ final class PortalFlowTests: XCTestCase {
     }
 
     @MainActor
+    private func assertLocalPortalNamesHidden(in application: XCUIApplication) {
+        let maskedFirstName = application.buttons["Reveal First name locally"]
+        XCTAssertTrue(maskedFirstName.waitForExistence(timeout: 10))
+        XCTAssertFalse(application.staticTexts["John"].exists)
+        XCTAssertFalse(application.staticTexts["Doe"].exists)
+    }
+
+    @MainActor
+    private func exerciseLocalPortalNameReveal(in application: XCUIApplication) {
+        assertLocalPortalNamesHidden(in: application)
+        let reveal = application.buttons["Reveal First name locally"]
+        scrollTo(reveal, in: application)
+        reveal.tap()
+        XCTAssertTrue(application.staticTexts["John"].waitForExistence(timeout: 10))
+        XCTAssertFalse(application.staticTexts["Doe"].exists)
+
+        let hide = application.buttons["Hide First name"]
+        XCTAssertTrue(hide.waitForExistence(timeout: 10))
+        hide.tap()
+        XCTAssertTrue(application.staticTexts["John"].waitForNonExistence(timeout: 10))
+        assertLocalPortalNamesHidden(in: application)
+
+        // Leave the fixture claim visible so the restart test checks fresh masking.
+        reveal.tap()
+        XCTAssertTrue(application.staticTexts["John"].waitForExistence(timeout: 10))
+        XCTAssertFalse(application.staticTexts["Doe"].exists)
+    }
+
+    @MainActor
     private func application() -> XCUIApplication {
         let application = XCUIApplication(bundleIdentifier: applicationIdentifier)
         let springboard = XCUIApplication(bundleIdentifier: "com.apple.springboard")
@@ -511,6 +540,7 @@ final class PortalFlowTests: XCTestCase {
         ].waitForExistence(timeout: 100))
         XCTAssertTrue(application.staticTexts["Saved to your wallet"].waitForExistence(timeout: 20))
         assertSingleValidCredentialDetails(in: application)
+        exerciseLocalPortalNameReveal(in: application)
     }
 
     @MainActor
@@ -530,6 +560,7 @@ final class PortalFlowTests: XCTestCase {
         application.buttons["Documents"].tap()
         restoredStatePhase("documents-selected")
         openSingleValidCredentialDetails(in: application)
+        assertLocalPortalNamesHidden(in: application)
         restoredStatePhase("restored-credential-visible")
         let marker = application.staticTexts["Credential reverification applied"]
         XCTAssertFalse(marker.exists)
