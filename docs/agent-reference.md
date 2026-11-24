@@ -544,6 +544,12 @@ The host supplies the same bundle's deactivation proving material and owns
 authorization, acknowledgement and finality. The standard Oxid bootstrap
 constructor continues to install its verifier keys through maintenance.
 
+Native DID hosts bind an existing method through
+`MidnightDidCallOperation::BindVerificationMethod` with authentication, assertion,
+capability invocation, or key agreement. The same controller-signed ledger
+circuit enforces method compatibility. Key agreement requires an installed
+X25519 method. Ed25519 and Schnorr-Jubjub support the three signing relationships.
+
 [Issue #21](https://github.com/MediaNoxLabs/oxid/issues/21) and ADR-0036 begin
 the peer identity capability with profile-scoped DID inventory and resolution.
 `identity/domain` and `identity/application` have no external dependencies and

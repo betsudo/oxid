@@ -32,8 +32,8 @@ mod publication;
 #[cfg(not(target_arch = "wasm32"))]
 pub use call::{
     MidnightDidBootstrapCall, MidnightDidCallCompositionFuture, MidnightDidCallCompositionPort,
-    MidnightDidCallContext, MidnightDidCallOperation, NativeMidnightDidCallComposer,
-    NativeMidnightDidCallPlan, NativeMidnightDidCallRequest,
+    MidnightDidCallContext, MidnightDidCallOperation, MidnightDidVerificationMethodRelation,
+    NativeMidnightDidCallComposer, NativeMidnightDidCallPlan, NativeMidnightDidCallRequest,
 };
 #[cfg(not(target_arch = "wasm32"))]
 pub use compact_artifacts::{

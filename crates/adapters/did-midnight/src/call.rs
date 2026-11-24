@@ -137,6 +137,37 @@ pub enum MidnightDidCallOperation {
     AddAssertionRelationship {
         method_id: String,
     },
+    /// Bind an existing method to an explicit on-chain relationship.
+    BindVerificationMethod {
+        method_id: String,
+        relation: MidnightDidVerificationMethodRelation,
+    },
+}
+
+/// Relationships exposed by the native DID Manager binding operation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MidnightDidVerificationMethodRelation {
+    Authentication,
+    AssertionMethod,
+    CapabilityInvocation,
+    /// Requires an existing X25519 verification method.
+    KeyAgreement,
+}
+
+impl MidnightDidVerificationMethodRelation {
+    fn bind(self, method_id: String) -> RuntimeDidOperation {
+        let relation = match self {
+            Self::Authentication => types::VerificationMethodRelation::Authentication,
+            Self::AssertionMethod => types::VerificationMethodRelation::AssertionMethod,
+            Self::CapabilityInvocation => types::VerificationMethodRelation::CapabilityInvocation,
+            Self::KeyAgreement => types::VerificationMethodRelation::KeyAgreement,
+        };
+        RuntimeDidOperation::SetVerificationMethodRelation {
+            relation,
+            method_id: runtime::OpaqueString::from(method_id),
+            mutation: types::SetMutation::Insert,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -155,7 +186,9 @@ impl MidnightDidCallOperation {
             Self::AddAssertionMethod { .. } => {
                 MidnightDidBootstrapCircuit::SchnorrJubjubVerificationMethod
             }
-            Self::AddAuthenticationRelationship { .. } | Self::AddAssertionRelationship { .. } => {
+            Self::AddAuthenticationRelationship { .. }
+            | Self::AddAssertionRelationship { .. }
+            | Self::BindVerificationMethod { .. } => {
                 MidnightDidBootstrapCircuit::VerificationMethodRelation
             }
         }
@@ -171,7 +204,8 @@ impl MidnightDidCallOperation {
                 method_id
             }
             Self::AddAuthenticationRelationship { method_id }
-            | Self::AddAssertionRelationship { method_id } => method_id,
+            | Self::AddAssertionRelationship { method_id }
+            | Self::BindVerificationMethod { method_id, .. } => method_id,
             Self::AddAssertionMethod { method_id, x, y } => {
                 if *x == [0; 32] || *y == [0; 32] {
                     return Err(DidLifecyclePortError::InvalidOperation);
@@ -210,11 +244,7 @@ impl MidnightDidCallOperation {
                 }
             }
             Self::AddAuthenticationRelationship { method_id } => {
-                RuntimeDidOperation::SetVerificationMethodRelation {
-                    relation: types::VerificationMethodRelation::Authentication,
-                    method_id: runtime::OpaqueString::from(method_id),
-                    mutation: types::SetMutation::Insert,
-                }
+                MidnightDidVerificationMethodRelation::Authentication.bind(method_id)
             }
             Self::AddAssertionMethod { method_id, x, y } => {
                 RuntimeDidOperation::SetSchnorrJubjubVerificationMethod {
@@ -226,12 +256,12 @@ impl MidnightDidCallOperation {
                 }
             }
             Self::AddAssertionRelationship { method_id } => {
-                RuntimeDidOperation::SetVerificationMethodRelation {
-                    relation: types::VerificationMethodRelation::AssertionMethod,
-                    method_id: runtime::OpaqueString::from(method_id),
-                    mutation: types::SetMutation::Insert,
-                }
+                MidnightDidVerificationMethodRelation::AssertionMethod.bind(method_id)
             }
+            Self::BindVerificationMethod {
+                method_id,
+                relation,
+            } => relation.bind(method_id),
         })
     }
 }
@@ -963,6 +993,66 @@ mod tests {
     }
 
     #[test]
+    fn binds_each_typed_relation_and_preserves_legacy_defaults() {
+        use MidnightDidVerificationMethodRelation as Relation;
+        use types::VerificationMethodRelation as CompactRelation;
+
+        let cases = [
+            (Relation::Authentication, CompactRelation::Authentication),
+            (Relation::AssertionMethod, CompactRelation::AssertionMethod),
+            (
+                Relation::CapabilityInvocation,
+                CompactRelation::CapabilityInvocation,
+            ),
+            (Relation::KeyAgreement, CompactRelation::KeyAgreement),
+        ];
+        let assert_binding = |operation: MidnightDidCallOperation, expected| {
+            assert!(operation.validate().is_ok());
+            assert_eq!(
+                operation.circuit(),
+                MidnightDidBootstrapCircuit::VerificationMethodRelation
+            );
+            assert!(matches!(
+                operation.into_runtime().unwrap(),
+                RuntimeDidOperation::SetVerificationMethodRelation {
+                    relation,
+                    method_id,
+                    mutation: types::SetMutation::Insert,
+                } if relation == expected && method_id == runtime::OpaqueString::from("#method")
+            ));
+        };
+        for (relation, expected) in cases {
+            assert_binding(
+                MidnightDidCallOperation::BindVerificationMethod {
+                    method_id: "#method".to_owned(),
+                    relation,
+                },
+                expected,
+            );
+        }
+        assert_binding(
+            MidnightDidCallOperation::AddAuthenticationRelationship {
+                method_id: "#method".to_owned(),
+            },
+            CompactRelation::Authentication,
+        );
+        assert_binding(
+            MidnightDidCallOperation::AddAssertionRelationship {
+                method_id: "#method".to_owned(),
+            },
+            CompactRelation::AssertionMethod,
+        );
+        assert_eq!(
+            MidnightDidCallOperation::BindVerificationMethod {
+                method_id: "method".to_owned(),
+                relation: Relation::KeyAgreement,
+            }
+            .validate(),
+            Err(DidLifecyclePortError::InvalidOperation),
+        );
+    }
+
+    #[test]
     fn validates_bootstrap_operations_and_rejects_invalid_curve_points() {
         let operations = [
             MidnightDidCallOperation::AddAuthenticationMethod {
@@ -1185,7 +1275,7 @@ mod tests {
 
     #[test]
     #[ignore = "midnight-did-conformance: requires Nix-packaged DID artifacts"]
-    fn preinstalled_verifier_deploys_and_composes_native_deactivation() {
+    fn preinstalled_verifiers_support_typed_binding_and_deactivation() {
         use crate::{
             NativeMidnightDidDeploymentComposer, NativeMidnightDidDeploymentRequest,
             compact_artifacts::NATIVE_DID_CIRCUITS,
@@ -1232,7 +1322,7 @@ mod tests {
             tagged_deserialize(plan.into_transaction().as_slice()).expect("decode deploy");
         let (_, deploy) = transaction.deploys().next().expect("deploy action");
         let contract_address = deploy.address().0.0;
-        let contract = deploy.initial_state;
+        let mut contract = deploy.initial_state;
         assert_eq!(
             contract.operations.iter().count(),
             NATIVE_DID_CIRCUITS.len()
@@ -1242,73 +1332,143 @@ mod tests {
         let (_, mut pilot_deploy) = legacy_tx.deploys().next().expect("legacy deploy action");
         pilot_deploy.initial_state.operations = contract.operations.clone();
         assert_eq!(pilot_deploy.address().0.0, contract_address);
+
+        use MidnightDidVerificationMethodRelation as Relation;
+        use midnight_did_runtime::{ledger_slots, state_decode::decode_ledger_snapshot};
+
+        let observation = runtime::transaction::Observation {
+            transaction_hash: [7; 32],
+            block_hash: [8; 32],
+            block_height: 1,
+        };
+        let address = runtime::ledger::ContractAddress(HashOutput(contract_address));
+        let observed = runtime::transaction::ObservedContractState::new(
+            address,
+            contract.clone(),
+            observation,
+        );
+        let mut fixture = observed.circuit_context(());
+        // Model pre-existing verification methods before exercising the binding circuit.
+        for (fragment, curve) in [
+            ("#ed25519", types::CurveType::Ed25519),
+            ("#x25519", types::CurveType::X25519),
+        ] {
+            let id = runtime::OpaqueString::from(fragment);
+            fixture = ledger_slots::verificationMethods
+                .insert(
+                    fixture,
+                    id.clone(),
+                    types::VerificationMethod {
+                        id,
+                        typ: types::VerificationMethodType::JsonWebKey,
+                        publicKeyJwk: types::PublicKeyJwk {
+                            kty: types::KeyType::OKP,
+                            crv: curve,
+                            x: runtime::OpaqueString::from(URL_SAFE_NO_PAD.encode([3; 32])),
+                            y: runtime::OpaqueString::from(""),
+                        },
+                    },
+                )
+                .expect("fixture JWK")
+                .context;
+        }
+        let id = runtime::OpaqueString::from("#jubjub");
+        let point = derive_public_key_from_seed(&[11; 32]);
+        fixture = ledger_slots::schnorrJubjubVerificationMethods
+            .insert(
+                fixture,
+                id.clone(),
+                types::SchnorrJubjubVerificationMethod {
+                    id,
+                    publicKey: point.into(),
+                },
+            )
+            .expect("fixture Jubjub method")
+            .context;
+        contract.data = fixture.query.state;
+
         let mut contract_state = Vec::new();
         tagged_serialize(&contract, &mut contract_state).expect("serialize contract state");
         let mut ledger_parameters = Vec::new();
         tagged_serialize(&INITIAL_PARAMETERS, &mut ledger_parameters)
             .expect("serialize ledger parameters");
-        let plan = NativeMidnightDidCallComposer::new(custody, security, artifacts)
-            .compose(&NativeMidnightDidCallRequest {
-                profile_id,
+        let composer = NativeMidnightDidCallComposer::new(custody, security, artifacts);
+        let compose = |operation| {
+            composer.compose(&NativeMidnightDidCallRequest {
+                profile_id: profile_id.clone(),
                 account_index: 0,
                 controller_index: 7,
                 context: MidnightDidCallContext {
-                    contract_state,
+                    contract_state: contract_state.clone(),
                     contract_address,
                     observation_transaction_hash: [7; 32],
                     observation_block_hash: [8; 32],
                     observation_block_height: 1,
                     zswap_chain_state: None,
-                    ledger_parameters: Some(ledger_parameters),
+                    ledger_parameters: Some(ledger_parameters.clone()),
                     network_id: "undeployed".to_owned(),
                     timestamp_millis: 11_000,
                     expires_at_millis: 3_611_000,
                     coin_public_key: [3; 32],
                     encryption_public_key: [4; 32],
                 },
-                operation: MidnightDidCallOperation::Deactivate,
+                operation,
                 replay_recipe: [9; 32],
             })
-            .expect("compose deactivation against installed verifier");
-        let transaction: UnprovenTransaction =
-            tagged_deserialize(plan.transaction.as_slice()).expect("decode deactivation");
-        let (_, ContractAction::Call(call)) =
-            transaction.actions().next().expect("deactivation action")
-        else {
-            panic!("expected a contract call");
         };
-        assert_eq!(call.entry_point.0, b"deactivate");
-        let observed = runtime::transaction::ObservedContractState::new(
-            runtime::ledger::ContractAddress(HashOutput(contract_address)),
-            contract,
-            runtime::transaction::Observation {
-                transaction_hash: [7; 32],
-                block_hash: [8; 32],
-                block_height: 1,
-            },
-        );
-        let mut state = observed.circuit_context(()).query;
-        for transcript in [
-            call.guaranteed_transcript.as_deref(),
-            call.fallible_transcript.as_deref(),
-        ]
-        .into_iter()
-        .flatten()
-        {
-            let program: Vec<_> = transcript.program.iter_deref().cloned().collect();
-            state = state
-                .query(
-                    &program,
-                    Some(transcript.gas),
-                    &INITIAL_PARAMETERS.cost_model.runtime_cost_model,
-                )
-                .expect("replay protected deactivation")
-                .context;
+        let observed =
+            runtime::transaction::ObservedContractState::new(address, contract, observation);
+        let replay = |operation: MidnightDidCallOperation| {
+            let circuit = operation.circuit();
+            let plan = compose(operation).expect("compose against installed verifier");
+            let transaction: UnprovenTransaction =
+                tagged_deserialize(plan.transaction.as_slice()).expect("decode call");
+            let (_, ContractAction::Call(call)) =
+                transaction.actions().next().expect("call action")
+            else {
+                panic!("expected a contract call");
+            };
+            assert_eq!(call.entry_point.0, circuit.artifact_id().as_bytes());
+            let mut state = observed.circuit_context(()).query;
+            for transcript in [
+                call.guaranteed_transcript.as_deref(),
+                call.fallible_transcript.as_deref(),
+            ]
+            .into_iter()
+            .flatten()
+            {
+                let program: Vec<_> = transcript.program.iter_deref().cloned().collect();
+                state = state
+                    .query(
+                        &program,
+                        Some(transcript.gas),
+                        &INITIAL_PARAMETERS.cost_model.runtime_cost_model,
+                    )
+                    .expect("replay controller-signed call")
+                    .context;
+            }
+            decode_ledger_snapshot(&state.state).expect("decode replayed DID state")
+        };
+        let bind = |fragment: &str, relation| MidnightDidCallOperation::BindVerificationMethod {
+            method_id: fragment.to_owned(),
+            relation,
+        };
+        for fragment in ["#ed25519", "#jubjub"] {
+            let signed = replay(bind(fragment, Relation::CapabilityInvocation));
+            assert_eq!(signed.capability_invocation_relation, [fragment]);
+            assert!(signed.key_agreement_relation.is_empty());
+            assert!(matches!(
+                compose(bind(fragment, Relation::KeyAgreement)),
+                Err(DidLifecyclePortError::InvalidOperation)
+            ));
         }
-        assert!(
-            midnight_did_runtime::ledger_slots::deactivated
-                .inspect(state.state.get_ref())
-                .unwrap()
-        );
+        let agreement = replay(bind("#x25519", Relation::KeyAgreement));
+        assert_eq!(agreement.key_agreement_relation, ["#x25519"]);
+        assert!(agreement.capability_invocation_relation.is_empty());
+        assert!(matches!(
+            compose(bind("#x25519", Relation::CapabilityInvocation)),
+            Err(DidLifecyclePortError::InvalidOperation)
+        ));
+        assert!(replay(MidnightDidCallOperation::Deactivate).deactivated);
     }
 }
