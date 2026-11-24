@@ -166,7 +166,7 @@ rcgen = { version = "=0.14.10", default-features = false, features = ["ring"] }
 subxt = { version = "=0.44.3" }
 tokio = { version = "=1.53.3", default-features = false, features = ["net", "rt", "time"] }
 tokio-tungstenite = { version = "=0.30.0", default-features = false, features = ["connect", "rustls-tls-webpki-roots"] }
-url = { version = "=2.5.8" }
+url = { version = "=2.5.9" }
 webpki-root-certs = "=1.0.10"
 zeroize = { version = "=1.9.0" }
 

@@ -1,12 +1,13 @@
 # url 2.5 dependency review
 
 - Project: [servo/rust-url](https://github.com/servo/rust-url)
-- Selected version: 2.5.8, exactly pinned in the workspace and `Cargo.lock`
+- Selected version: 2.5.9, exactly pinned in the workspace and `Cargo.lock`
 - License: MIT OR Apache-2.0
 - Maintenance/activity: established Rust URL implementation; upgrades remain
   explicit lockfile reviews
 - Security/audit evidence: no independent Oxid audit; repository advisory,
-  source, license, and test gates inspect every resolved update
+  source, license, and test gates inspect every resolved update. Version 2.5.9
+  addresses [RUSTSEC-2026-0592](https://rustsec.org/advisories/RUSTSEC-2026-0592.html).
 - Android, iOS, desktop, and WASM/web: portable Rust parsing; this slice uses no
   platform networking API
 - Cryptography: none
