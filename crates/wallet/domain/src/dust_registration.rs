@@ -23,7 +23,7 @@ const MIDNIGHT_DUST_DECIMALS: u8 = 15;
 /// Safe public preview of one retained DUST registration intent.
 ///
 /// The protected DUST key, registration signature, NIGHT input identities,
-/// proof material, and serialized transaction stay in the outgoing adapter.
+/// proof material, and serialized transaction are excluded from this view.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct WalletDustRegistrationPreview {
     draft_id: WalletTransactionDraftId,

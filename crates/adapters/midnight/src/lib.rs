@@ -46,6 +46,8 @@ pub use checkpoint::{MidnightAccountCheckpointConfig, MidnightAccountCheckpointC
 #[cfg(not(target_arch = "wasm32"))]
 pub use dust_checkpoint::{MidnightDustCheckpointConfig, MidnightDustCheckpointConfigError};
 #[cfg(not(target_arch = "wasm32"))]
+pub use dust_registration::{MidnightDustRegistrationInput, MidnightDustRegistrationInputs};
+#[cfg(not(target_arch = "wasm32"))]
 pub use indexer::{
     LiveMidnightAccountSource, MidnightIndexerConfig, MidnightIndexerConfigError,
     live_midnight_wallet, live_midnight_wallet_with_checkpoints, protected_live_midnight_wallet,

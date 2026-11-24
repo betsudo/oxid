@@ -521,6 +521,14 @@ the path before broadcast. The caller correlates and reconciles the exact
 attempt before replacement. Oxid keeps its existing public journal schema and
 post-broadcast recovery behavior. Existing compositions use no hook by default.
 
+The same native host can look up `MidnightWalletAdapter::dust_registration_inputs`
+using the same profile and the draft identifier returned by preparation. It projects
+the NIGHT inputs directly from the retained intent while the draft is prepared
+or authorized and unexpired. Use the returned network, draft identifier, and
+planning fingerprint to correlate the inputs with the hook. This projection
+does not replace the wallet's normal authorization or submission checks and
+is excluded from the general wallet preview.
+
 [Issue #21](https://github.com/MediaNoxLabs/oxid/issues/21) and ADR-0036 begin
 the peer identity capability with profile-scoped DID inventory and resolution.
 `identity/domain` and `identity/application` have no external dependencies and
