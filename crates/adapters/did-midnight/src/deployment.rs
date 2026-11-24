@@ -17,7 +17,8 @@ use midnight_ledger::structure::{
     ContractDeploy, Intent, ProofPreimageMarker, Signature, StandardTransaction, Transaction,
 };
 use midnight_onchain_state::state::{
-    ContractMaintenanceAuthority, ContractMaintenanceVerifyingKey, ContractState,
+    ContractMaintenanceAuthority, ContractMaintenanceVerifyingKey, ContractOperation,
+    ContractState, EntryPointBuf,
 };
 use midnight_storage::{DefaultDB, storage::HashMap as LedgerHashMap};
 use midnight_transient_crypto::{commitment::PedersenRandomness, curve::EmbeddedGroupAffine};
@@ -31,6 +32,10 @@ use sha2::{Digest, Sha256};
 use zeroize::Zeroizing;
 
 use crate::{
+    compact_artifacts::{
+        MidnightDidCompactArtifactError, MidnightDidCompactArtifacts, NATIVE_DID_CIRCUITS,
+        decode_verifier_key,
+    },
     custody::{controller_path, maintenance_path, recovery_path, replay_randomness_path},
     protected_randomness::{ProtectedDeterministicRng, derive_seed, maintenance_signing_key},
 };
@@ -41,6 +46,7 @@ const DEPLOY_NONCE_DOMAIN: &[u8] = b"oxid:did-deploy:contract-nonce:v1";
 const DEPLOY_INTENT_DOMAIN: &[u8] = b"oxid:did-deploy:intent-rng:v1";
 
 type LedgerTransaction = Transaction<Signature, ProofPreimageMarker, PedersenRandomness, DefaultDB>;
+type InitialOperations = LedgerHashMap<EntryPointBuf, ContractOperation, DefaultDB>;
 
 /// Stable inputs that must be journaled before a deployment is submitted.
 ///
@@ -178,12 +184,37 @@ impl NativeMidnightDidDeploymentPlan {
 /// Composes a contract deploy while keeping all controller material in custody.
 pub struct NativeMidnightDidDeploymentComposer {
     custody: Arc<dyn WalletDerivedSecretUsePort>,
+    initial_operations: Option<InitialOperations>,
 }
 
 impl NativeMidnightDidDeploymentComposer {
     #[must_use]
     pub const fn new(custody: Arc<dyn WalletDerivedSecretUsePort>) -> Self {
-        Self { custody }
+        Self {
+            custody,
+            initial_operations: None,
+        }
+    }
+
+    /// Installs the four native DID verifiers at construction, including deactivation.
+    /// Pin the artifact bundle alongside the replay recipe: its verifier table
+    /// contributes to the deployed address and the transaction fingerprint.
+    pub fn new_with_initial_verifiers(
+        custody: Arc<dyn WalletDerivedSecretUsePort>,
+        artifacts: &MidnightDidCompactArtifacts,
+    ) -> Result<Self, MidnightDidCompactArtifactError> {
+        let mut operations = InitialOperations::new();
+        for circuit in NATIVE_DID_CIRCUITS {
+            let verifier = decode_verifier_key(&artifacts.verifier_key(circuit)?)?;
+            operations = operations.insert(
+                EntryPointBuf(circuit.artifact_id().as_bytes().to_vec()),
+                ContractOperation::new(Some(verifier), None),
+            );
+        }
+        Ok(Self {
+            custody,
+            initial_operations: Some(operations),
+        })
     }
 
     pub fn compose(
@@ -235,6 +266,9 @@ impl NativeMidnightDidDeploymentComposer {
                     controller_public_key,
                     recovery_public_key,
                     maintenance_key.clone(),
+                    self.initial_operations
+                        .clone()
+                        .unwrap_or_else(InitialOperations::new),
                     secret,
                 ) {
                     Ok(plan) => result = Some(plan),
@@ -258,6 +292,7 @@ fn compose_with_protected_randomness(
     controller_public_key: EmbeddedGroupAffine,
     recovery_public_key: EmbeddedGroupAffine,
     maintenance_key: VerifyingKey,
+    initial_operations: InitialOperations,
     replay_secret: &[u8; 32],
 ) -> Result<NativeMidnightDidDeploymentPlan, DidLifecyclePortError> {
     let nonce = derive_seed(replay_secret, DEPLOY_NONCE_DOMAIN, &request.nonce_recipe)
@@ -276,7 +311,7 @@ fn compose_with_protected_randomness(
     .map_err(|_| DidLifecyclePortError::InvalidOperation)?;
     let contract = ContractState::new(
         initial.ledger_state.get_ref().clone(),
-        LedgerHashMap::new(),
+        initial_operations,
         ContractMaintenanceAuthority {
             threshold: 1,
             committee: vec![ContractMaintenanceVerifyingKey::Schnorr(maintenance_key)],

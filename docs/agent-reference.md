@@ -535,6 +535,15 @@ constructing the proof preimage. Compact still validates the recorded trace and
 the installed verifier. Both live proving routes use their chain tip's runtime
 cost model to account for proof padding.
 
+Native Portal hosts can opt into `NativeMidnightDidDeploymentComposer::new_with_initial_verifiers`
+with the four-circuit `midnight-did-ledger9-zkir` bundle. They record the pinned
+artifact set alongside the deploy replay recipe because the verifier table
+contributes to the contract address. The native call composer accepts
+`MidnightDidCallOperation::Deactivate` against an installed, matching verifier.
+The host supplies the same bundle's deactivation proving material and owns
+authorization, acknowledgement and finality. The standard Oxid bootstrap
+constructor continues to install its verifier keys through maintenance.
+
 [Issue #21](https://github.com/MediaNoxLabs/oxid/issues/21) and ADR-0036 begin
 the peer identity capability with profile-scoped DID inventory and resolution.
 `identity/domain` and `identity/application` have no external dependencies and

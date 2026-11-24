@@ -24,9 +24,7 @@ use midnight_ledger::{
 use midnight_serialize::{Deserializable as _, tagged_deserialize, tagged_serialize};
 use midnight_storage::{DefaultDB, storage::HashMap as LedgerHashMap};
 use midnight_transient_crypto::{
-    commitment::PedersenRandomness,
-    curve::EmbeddedGroupAffine,
-    proofs::{ProofPreimage, VerifierKey},
+    commitment::PedersenRandomness, curve::EmbeddedGroupAffine, proofs::ProofPreimage,
 };
 use oxid_identity_application::DidLifecyclePortError;
 use oxid_wallet_application::{
@@ -41,7 +39,9 @@ use sha2::{Digest, Sha256};
 use zeroize::{Zeroize, Zeroizing};
 
 use crate::{
-    compact_artifacts::{MidnightDidBootstrapCircuit, MidnightDidCompactArtifacts},
+    compact_artifacts::{
+        MidnightDidBootstrapCircuit, MidnightDidCompactArtifacts, decode_verifier_key,
+    },
     custody::{controller_path, recovery_path, replay_randomness_path},
     protected_randomness::{ProtectedDeterministicRng, derive_seed},
 };
@@ -121,6 +121,7 @@ impl MidnightDidCallContext {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum MidnightDidCallOperation {
+    Deactivate,
     AddAuthenticationMethod {
         method_id: String,
         x: [u8; 32],
@@ -149,6 +150,7 @@ pub enum MidnightDidBootstrapCall {
 impl MidnightDidCallOperation {
     fn circuit(&self) -> MidnightDidBootstrapCircuit {
         match self {
+            Self::Deactivate => MidnightDidBootstrapCircuit::Deactivation,
             Self::AddAuthenticationMethod { .. } => MidnightDidBootstrapCircuit::VerificationMethod,
             Self::AddAssertionMethod { .. } => {
                 MidnightDidBootstrapCircuit::SchnorrJubjubVerificationMethod
@@ -161,6 +163,7 @@ impl MidnightDidCallOperation {
 
     fn validate(&self) -> Result<(), DidLifecyclePortError> {
         let method_id = match self {
+            Self::Deactivate => return Ok(()),
             Self::AddAuthenticationMethod { method_id, x } => {
                 if *x == [0; 32] {
                     return Err(DidLifecyclePortError::InvalidOperation);
@@ -190,6 +193,7 @@ impl MidnightDidCallOperation {
 
     fn into_runtime(self) -> Result<RuntimeDidOperation, DidLifecyclePortError> {
         Ok(match self {
+            Self::Deactivate => RuntimeDidOperation::Deactivate,
             Self::AddAuthenticationMethod { method_id, x } => {
                 RuntimeDidOperation::SetVerificationMethod {
                     method: types::VerificationMethod {
@@ -233,6 +237,7 @@ impl MidnightDidCallOperation {
 }
 
 enum RuntimeDidOperation {
+    Deactivate,
     SetVerificationMethod {
         method: types::VerificationMethod,
         mutation: types::MapMutation,
@@ -490,6 +495,14 @@ impl NativeMidnightDidCallComposer {
         let operation = request.operation.clone().into_runtime()?;
         let contract = ledger_contract::Contract::from(NativeDidWitnesses);
         let recorded = match operation {
+            RuntimeDidOperation::Deactivate => {
+                let digest = pure_circuits::deactivateAuthorizationDigest(id, version)
+                    .map_err(|_| DidLifecyclePortError::InvalidOperation)?;
+                let signature = signer.sign(&signer.controller_path, digest.0)?;
+                contract
+                    .recording()
+                    .deactivate_call(&observed, private_state, signature, version)
+            }
             RuntimeDidOperation::SetVerificationMethod { method, mutation } => {
                 let digest = pure_circuits::setVerificationMethodAuthorizationDigest(
                     id.clone(),
@@ -559,14 +572,8 @@ impl NativeMidnightDidCallComposer {
             .artifacts
             .verifier_key(circuit)
             .map_err(|_| DidLifecyclePortError::ProtectionUnavailable)?;
-        let mut verifier_cursor = Cursor::new(verifier.as_slice());
-        let verifier_key: VerifierKey = tagged_deserialize(&mut verifier_cursor)
+        let verifier_key = decode_verifier_key(verifier.as_slice())
             .map_err(|_| DidLifecyclePortError::InvalidOperation)?;
-        if usize::try_from(verifier_cursor.position()).ok() != Some(verifier.len())
-            || verifier_key.init().is_err()
-        {
-            return Err(DidLifecyclePortError::InvalidOperation);
-        }
         let mut seeds = None;
         self.custody
             .use_derived_secret(&request.profile_id, &replay, &mut |secret| {
@@ -1073,8 +1080,7 @@ mod tests {
             .into_iter()
             .map(|circuit| {
                 let bytes = composer.artifacts.verifier_key(circuit).expect("verifier");
-                let verifier: VerifierKey =
-                    tagged_deserialize(bytes.as_slice()).expect("decode verifier");
+                let verifier = decode_verifier_key(bytes.as_slice()).expect("decode verifier");
                 (
                     EntryPointBuf(circuit.artifact_id().as_bytes().to_vec()),
                     ContractOperation::new(Some(verifier), None),
@@ -1175,5 +1181,134 @@ mod tests {
             assert!(fallible.guaranteed_transcript.is_none());
             assert!(fallible.fallible_transcript.is_some());
         }
+    }
+
+    #[test]
+    #[ignore = "midnight-did-conformance: requires Nix-packaged DID artifacts"]
+    fn preinstalled_verifier_deploys_and_composes_native_deactivation() {
+        use crate::{
+            NativeMidnightDidDeploymentComposer, NativeMidnightDidDeploymentRequest,
+            compact_artifacts::NATIVE_DID_CIRCUITS,
+        };
+        use oxid_identity_domain::MidnightNetwork;
+
+        let root = std::env::var_os("OXID_MIDNIGHT_DID_ARTIFACTS_DIR").expect("DID artifacts");
+        let artifacts = MidnightDidCompactArtifacts::load(root).expect("authenticated artifacts");
+        let profile_id = WalletProfileId::parse("native-did-deactivation-test").unwrap();
+        let security = Arc::new(DevelopmentWalletSecurity::new(
+            Arc::new(SystemClock),
+            Arc::new(OsRandom),
+        ));
+        security
+            .initialize(&profile_id)
+            .expect("initialize custody");
+        let custody: Arc<dyn WalletDerivedSecretUsePort> = security.clone();
+        let deployment = NativeMidnightDidDeploymentComposer::new_with_initial_verifiers(
+            Arc::clone(&custody),
+            &artifacts,
+        )
+        .expect("load initial verifiers");
+        let request = NativeMidnightDidDeploymentRequest::new(
+            profile_id.clone(),
+            MidnightNetwork::Undeployed,
+            "undeployed",
+            0,
+            7,
+            10_000,
+            3_610_000,
+            [5; 32],
+            [6; 32],
+        )
+        .expect("deployment request");
+        let plan = deployment.compose(&request).expect("compose deploy");
+        let replay = deployment.compose(&request).expect("replay deploy");
+        assert_eq!(plan.did(), replay.did());
+        assert_eq!(plan.planning_fingerprint(), replay.planning_fingerprint());
+        let legacy = NativeMidnightDidDeploymentComposer::new(Arc::clone(&custody))
+            .compose(&request)
+            .expect("compose deploy for maintenance");
+        assert_ne!(plan.did(), legacy.did());
+        let transaction: UnprovenTransaction =
+            tagged_deserialize(plan.into_transaction().as_slice()).expect("decode deploy");
+        let (_, deploy) = transaction.deploys().next().expect("deploy action");
+        let contract_address = deploy.address().0.0;
+        let contract = deploy.initial_state;
+        assert_eq!(
+            contract.operations.iter().count(),
+            NATIVE_DID_CIRCUITS.len()
+        );
+        let legacy_tx: UnprovenTransaction =
+            tagged_deserialize(legacy.into_transaction().as_slice()).expect("decode legacy deploy");
+        let (_, mut pilot_deploy) = legacy_tx.deploys().next().expect("legacy deploy action");
+        pilot_deploy.initial_state.operations = contract.operations.clone();
+        assert_eq!(pilot_deploy.address().0.0, contract_address);
+        let mut contract_state = Vec::new();
+        tagged_serialize(&contract, &mut contract_state).expect("serialize contract state");
+        let mut ledger_parameters = Vec::new();
+        tagged_serialize(&INITIAL_PARAMETERS, &mut ledger_parameters)
+            .expect("serialize ledger parameters");
+        let plan = NativeMidnightDidCallComposer::new(custody, security, artifacts)
+            .compose(&NativeMidnightDidCallRequest {
+                profile_id,
+                account_index: 0,
+                controller_index: 7,
+                context: MidnightDidCallContext {
+                    contract_state,
+                    contract_address,
+                    observation_transaction_hash: [7; 32],
+                    observation_block_hash: [8; 32],
+                    observation_block_height: 1,
+                    zswap_chain_state: None,
+                    ledger_parameters: Some(ledger_parameters),
+                    network_id: "undeployed".to_owned(),
+                    timestamp_millis: 11_000,
+                    expires_at_millis: 3_611_000,
+                    coin_public_key: [3; 32],
+                    encryption_public_key: [4; 32],
+                },
+                operation: MidnightDidCallOperation::Deactivate,
+                replay_recipe: [9; 32],
+            })
+            .expect("compose deactivation against installed verifier");
+        let transaction: UnprovenTransaction =
+            tagged_deserialize(plan.transaction.as_slice()).expect("decode deactivation");
+        let (_, ContractAction::Call(call)) =
+            transaction.actions().next().expect("deactivation action")
+        else {
+            panic!("expected a contract call");
+        };
+        assert_eq!(call.entry_point.0, b"deactivate");
+        let observed = runtime::transaction::ObservedContractState::new(
+            runtime::ledger::ContractAddress(HashOutput(contract_address)),
+            contract,
+            runtime::transaction::Observation {
+                transaction_hash: [7; 32],
+                block_hash: [8; 32],
+                block_height: 1,
+            },
+        );
+        let mut state = observed.circuit_context(()).query;
+        for transcript in [
+            call.guaranteed_transcript.as_deref(),
+            call.fallible_transcript.as_deref(),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            let program: Vec<_> = transcript.program.iter_deref().cloned().collect();
+            state = state
+                .query(
+                    &program,
+                    Some(transcript.gas),
+                    &INITIAL_PARAMETERS.cost_model.runtime_cost_model,
+                )
+                .expect("replay protected deactivation")
+                .context;
+        }
+        assert!(
+            midnight_did_runtime::ledger_slots::deactivated
+                .inspect(state.state.get_ref())
+                .unwrap()
+        );
     }
 }
