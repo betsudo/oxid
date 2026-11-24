@@ -15,8 +15,11 @@ use midnight_did_jubjub_schnorr::{
     derive_public_key_from_seed, field_from_scalar, sign_authorization_digest_from_seed,
 };
 use midnight_did_runtime::{ledger_contract, pure_circuits, types};
-use midnight_ledger::structure::{
-    Intent, ProofPreimageMarker, Signature, StandardTransaction, Transaction,
+use midnight_ledger::{
+    construct::{PreTranscript, partition_transcripts},
+    structure::{
+        Intent, LedgerParameters, ProofPreimageMarker, Signature, StandardTransaction, Transaction,
+    },
 };
 use midnight_serialize::{Deserializable as _, tagged_deserialize, tagged_serialize};
 use midnight_storage::{DefaultDB, storage::HashMap as LedgerHashMap};
@@ -99,6 +102,20 @@ impl MidnightDidCallContext {
             return Err(DidLifecyclePortError::InvalidOperation);
         }
         Ok(())
+    }
+
+    fn decode_ledger_parameters(&self) -> Result<LedgerParameters, DidLifecyclePortError> {
+        let bytes = self
+            .ledger_parameters
+            .as_deref()
+            .ok_or(DidLifecyclePortError::InvalidOperation)?;
+        let mut cursor = Cursor::new(bytes);
+        let parameters =
+            tagged_deserialize(&mut cursor).map_err(|_| DidLifecyclePortError::InvalidOperation)?;
+        if usize::try_from(cursor.position()).ok() != Some(bytes.len()) {
+            return Err(DidLifecyclePortError::InvalidOperation);
+        }
+        Ok(parameters)
     }
 }
 
@@ -427,6 +444,7 @@ impl NativeMidnightDidCallComposer {
         request: &NativeMidnightDidCallRequest,
     ) -> Result<NativeMidnightDidCallPlan, DidLifecyclePortError> {
         request.context.validate()?;
+        let ledger_parameters = request.context.decode_ledger_parameters()?;
         request.operation.validate()?;
         if request.account_index > WalletHdPathComponent::MAX_INDEX
             || request.controller_index > WalletHdPathComponent::MAX_INDEX
@@ -566,9 +584,46 @@ impl NativeMidnightDidCallComposer {
         let communication_commitment_rand = runtime::Field::from_le_bytes(&communication_bytes)
             .ok_or(DidLifecyclePortError::InvalidOperation)?;
         communication_bytes.zeroize();
-        let call = recorded
+        let public = &recorded.recorded().public;
+        let transcript = PreTranscript {
+            context: public.initial().clone(),
+            program: public.verify_ops().to_vec(),
+            comm_comm: None,
+        };
+        let mut call = recorded
             .prepare(verifier_key, communication_commitment_rand)
             .map_err(|_| DidLifecyclePortError::InvalidOperation)?;
+        // Compact's checked preparation currently partitions with genesis
+        // parameters. Keep its verifier and trace validation, then size the
+        // guaranteed/fallible transcripts for the observed finalized ledger
+        // before add_call binds them into the proof preimage.
+        let mut partitions = partition_transcripts(&[transcript], &ledger_parameters)
+            .map_err(|_| DidLifecyclePortError::InvalidOperation)?;
+        let (guaranteed, fallible) = partitions
+            .pop()
+            .ok_or(DidLifecyclePortError::InvalidOperation)?;
+        let no_effects = Default::default();
+        let unchanged = |before: Option<&_>, after: Option<&_>| {
+            before.unwrap_or(&no_effects) == after.unwrap_or(&no_effects)
+        };
+        if (guaranteed.is_none() && fallible.is_none())
+            || !unchanged(
+                call.guaranteed_public_transcript
+                    .as_ref()
+                    .map(|trace| &trace.effects),
+                guaranteed.as_ref().map(|trace| &trace.effects),
+            )
+            || !unchanged(
+                call.fallible_public_transcript
+                    .as_ref()
+                    .map(|trace| &trace.effects),
+                fallible.as_ref().map(|trace| &trace.effects),
+            )
+        {
+            return Err(DidLifecyclePortError::InvalidOperation);
+        }
+        call.guaranteed_public_transcript = guaranteed;
+        call.fallible_public_transcript = fallible;
         let mut intent_rng = ProtectedDeterministicRng::new(intent_seed);
         let intent: Intent<Signature, ProofPreimageMarker, PedersenRandomness, DefaultDB> =
             Intent::empty(
@@ -814,6 +869,8 @@ const fn map_security_error(error: WalletSecurityPortError) -> DidLifecyclePortE
 #[cfg(test)]
 mod tests {
     use super::*;
+    use midnight_base_crypto::cost_model::CostDuration;
+    use midnight_ledger::structure::{ContractAction, INITIAL_PARAMETERS};
     use midnight_onchain_state::state::{
         ContractMaintenanceAuthority, ContractOperation, ContractState, EntryPointBuf,
     };
@@ -844,6 +901,8 @@ mod tests {
     }
     #[test]
     fn rejects_wrong_network_and_key_contexts() {
+        let mut parameter_bytes = Vec::new();
+        tagged_serialize(&INITIAL_PARAMETERS, &mut parameter_bytes).unwrap();
         let valid = MidnightDidCallContext {
             contract_state: vec![1],
             contract_address: [2; 32],
@@ -851,7 +910,7 @@ mod tests {
             observation_block_hash: [8; 32],
             observation_block_height: 1,
             zswap_chain_state: None,
-            ledger_parameters: Some(vec![1]),
+            ledger_parameters: Some(parameter_bytes.clone()),
             network_id: "undeployed".to_owned(),
             timestamp_millis: 1_000,
             expires_at_millis: 2_000,
@@ -859,6 +918,21 @@ mod tests {
             encryption_public_key: [4; 32],
         };
         assert_eq!(valid.validate(), Ok(()));
+        assert_eq!(valid.decode_ledger_parameters(), Ok(INITIAL_PARAMETERS));
+        for bytes in [
+            vec![1],
+            parameter_bytes[..parameter_bytes.len() - 1].to_vec(),
+            [parameter_bytes, vec![0]].concat(),
+        ] {
+            let context = MidnightDidCallContext {
+                ledger_parameters: Some(bytes),
+                ..valid.clone()
+            };
+            assert_eq!(
+                context.decode_ledger_parameters(),
+                Err(DidLifecyclePortError::InvalidOperation),
+            );
+        }
 
         for context in [
             MidnightDidCallContext {
@@ -991,15 +1065,21 @@ mod tests {
             &NativeDidWitnesses,
         )
         .expect("generated initial state");
-        let verifier = composer
-            .artifacts
-            .verifier_key(MidnightDidBootstrapCircuit::VerificationMethod)
-            .expect("verification method verifier");
-        let mut cursor = Cursor::new(verifier.as_slice());
-        let verifier: VerifierKey = tagged_deserialize(&mut cursor).expect("decode verifier");
-        let operations = LedgerHashMap::new().insert(
-            EntryPointBuf(b"setVerificationMethod".to_vec()),
-            ContractOperation::new(Some(verifier), None),
+        let operations = LedgerHashMap::from_iter(
+            [
+                MidnightDidBootstrapCircuit::VerificationMethod,
+                MidnightDidBootstrapCircuit::SchnorrJubjubVerificationMethod,
+            ]
+            .into_iter()
+            .map(|circuit| {
+                let bytes = composer.artifacts.verifier_key(circuit).expect("verifier");
+                let verifier: VerifierKey =
+                    tagged_deserialize(bytes.as_slice()).expect("decode verifier");
+                (
+                    EntryPointBuf(circuit.artifact_id().as_bytes().to_vec()),
+                    ContractOperation::new(Some(verifier), None),
+                )
+            }),
         );
         let contract = ContractState::new(
             initial.ledger_state.get_ref().clone(),
@@ -1010,30 +1090,90 @@ mod tests {
         let mut contract_state = Vec::new();
         tagged_serialize(&contract, &mut contract_state).expect("serialize contract state");
 
-        let plan = composer
-            .compose_bootstrap(
-                profile_id,
-                0,
-                7,
-                "native-bootstrap-call",
-                MidnightDidCallContext {
-                    contract_state,
-                    contract_address,
-                    observation_transaction_hash: [7; 32],
-                    observation_block_hash: [8; 32],
-                    observation_block_height: 1,
-                    zswap_chain_state: None,
-                    ledger_parameters: Some(vec![1]),
-                    network_id: "undeployed".to_owned(),
-                    timestamp_millis: 11_000,
-                    expires_at_millis: 3_611_000,
-                    coin_public_key: [3; 32],
-                    encryption_public_key: [4; 32],
-                },
-                MidnightDidBootstrapCall::AddAuthenticationMethod,
-            )
-            .expect("native generated call");
-        assert!(!plan.transaction.is_empty());
-        validate_transaction(&plan.transaction, "undeployed").expect("valid unproven tx");
+        let compose = |parameters: &LedgerParameters, call| {
+            let mut bytes = Vec::new();
+            tagged_serialize(parameters, &mut bytes).expect("serialize ledger parameters");
+            let plan = composer
+                .compose_bootstrap(
+                    profile_id.clone(),
+                    0,
+                    7,
+                    "native-bootstrap-call",
+                    MidnightDidCallContext {
+                        contract_state: contract_state.clone(),
+                        contract_address,
+                        observation_transaction_hash: [7; 32],
+                        observation_block_hash: [8; 32],
+                        observation_block_height: 1,
+                        zswap_chain_state: None,
+                        ledger_parameters: Some(bytes),
+                        network_id: "undeployed".to_owned(),
+                        timestamp_millis: 11_000,
+                        expires_at_millis: 3_611_000,
+                        coin_public_key: [3; 32],
+                        encryption_public_key: [4; 32],
+                    },
+                    call,
+                )
+                .expect("native generated call");
+            let transaction: UnprovenTransaction =
+                tagged_deserialize(plan.transaction.as_slice()).expect("valid unproven tx");
+            let (_, ContractAction::Call(call)) =
+                transaction.actions().next().expect("call action")
+            else {
+                panic!("expected a contract call");
+            };
+            call
+        };
+        let mut baseline = INITIAL_PARAMETERS;
+        // Exercise model changes separately from the guaranteed/fallible split.
+        baseline.limits.min_time_to_dismiss = CostDuration::from_picoseconds(1_000_000_000_000);
+        let mut live = baseline.clone();
+        live.cost_model.runtime_cost_model.push_cell +=
+            CostDuration::from_picoseconds(1_000_000_000);
+        let mut fallible_limits = live.clone();
+        fallible_limits.limits.min_time_to_dismiss = CostDuration::ZERO;
+        fallible_limits.limits.time_to_dismiss_per_byte = CostDuration::ZERO;
+        let observed = runtime::transaction::ObservedContractState::new(
+            runtime::ledger::ContractAddress(HashOutput(contract_address)),
+            contract,
+            runtime::transaction::Observation {
+                transaction_hash: [7; 32],
+                block_hash: [8; 32],
+                block_height: 1,
+            },
+        );
+        let query = observed.circuit_context(()).query;
+        for kind in [
+            MidnightDidBootstrapCall::AddAuthenticationMethod,
+            MidnightDidBootstrapCall::AddAssertionMethod,
+        ] {
+            let genesis = compose(&baseline, kind)
+                .guaranteed_transcript
+                .clone()
+                .expect("genesis guaranteed transcript");
+            let exact = compose(&live, kind)
+                .guaranteed_transcript
+                .clone()
+                .expect("live guaranteed transcript");
+            assert_eq!(genesis.program, exact.program);
+            assert_eq!(genesis.effects, exact.effects);
+            assert!(
+                exact.gas.compute_time > genesis.gas.compute_time,
+                "{kind:?}: default gas {:?}, live gas {:?}",
+                genesis.gas,
+                exact.gas,
+            );
+            let program: Vec<_> = exact.program.iter_deref().cloned().collect();
+            let model = &live.cost_model.runtime_cost_model;
+            assert!(query.query(&program, Some(genesis.gas), model).is_err());
+            query
+                .query(&program, Some(exact.gas), model)
+                .expect("live transcript fits declared gas");
+
+            let fallible = compose(&fallible_limits, kind);
+            assert!(fallible.guaranteed_transcript.is_none());
+            assert!(fallible.fallible_transcript.is_some());
+        }
     }
 }

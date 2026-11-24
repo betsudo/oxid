@@ -529,6 +529,12 @@ planning fingerprint to correlate the inputs with the hook. This projection
 does not replace the wallet's normal authorization or submission checks and
 is excluded from the general wallet preview.
 
+Native DID call composition decodes the finalized chain context's tagged
+Ledger 9 parameters and uses them for transcript partitioning and gas before
+constructing the proof preimage. Compact still validates the recorded trace and
+the installed verifier. Both live proving routes use their chain tip's runtime
+cost model to account for proof padding.
+
 [Issue #21](https://github.com/MediaNoxLabs/oxid/issues/21) and ADR-0036 begin
 the peer identity capability with profile-scoped DID inventory and resolution.
 `identity/domain` and `identity/application` have no external dependencies and

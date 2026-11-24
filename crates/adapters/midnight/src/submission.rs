@@ -25,7 +25,7 @@ use midnight_ledger::{
         Signature, StandardTransaction, Transaction,
     },
 };
-use midnight_onchain_runtime::cost_model::INITIAL_COST_MODEL;
+use midnight_onchain_runtime::cost_model::CostModel;
 use midnight_storage::{
     DefaultDB,
     arena::Sp,
@@ -837,10 +837,16 @@ where
             config.indexer.network_id().as_str(),
             required_fee,
         )?;
+        let cost_model = &chain_tip.parameters.cost_model.runtime_cost_model;
         let sealed = match config.proving() {
             MidnightProvingMode::Local(local_config) => {
-                let outcome =
-                    local_proving::prove_transaction(balanced, local_config, &cancellation).await?;
+                let outcome = local_proving::prove_transaction(
+                    balanced,
+                    local_config,
+                    cost_model,
+                    &cancellation,
+                )
+                .await?;
                 let _metrics = outcome.metrics;
                 outcome.transaction
             }
@@ -849,6 +855,7 @@ where
                     balanced,
                     proof_server_url,
                     options.remote_proving_material.clone(),
+                    cost_model,
                 )
                 .await?
             }
@@ -1853,6 +1860,7 @@ async fn prove_via_http(
     transaction: UnprovenTransaction,
     endpoint: &str,
     remote_proving_material: Option<Arc<dyn MidnightRemoteProvingMaterialSource>>,
+    cost_model: &CostModel,
 ) -> Result<
     Transaction<
         Signature,
@@ -1880,13 +1888,10 @@ async fn prove_via_http(
         endpoint: endpoint.to_owned(),
         remote_proving_material,
     };
-    let proved = timeout(
-        PROOF_TIMEOUT,
-        transaction.prove(provider, &INITIAL_COST_MODEL),
-    )
-    .await
-    .map_err(|_| WalletTransactionPortError::Timeout)?
-    .map_err(|_| WalletTransactionPortError::ProvingFailed)?;
+    let proved = timeout(PROOF_TIMEOUT, transaction.prove(provider, cost_model))
+        .await
+        .map_err(|_| WalletTransactionPortError::Timeout)?
+        .map_err(|_| WalletTransactionPortError::ProvingFailed)?;
     Ok(proved.seal(OsRng))
 }
 

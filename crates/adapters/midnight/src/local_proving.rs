@@ -213,7 +213,13 @@ pub async fn run_local_proving_fixture(
     }));
     let transaction =
         Transaction::from_intents("undeployed", LedgerHashMap::new().insert(0xFEED, intent));
-    let outcome = prove_transaction(transaction, config, cancellation).await?;
+    let outcome = prove_transaction(
+        transaction,
+        config,
+        &INITIAL_PARAMETERS.cost_model.runtime_cost_model,
+        cancellation,
+    )
+    .await?;
     let mut proof_bytes = 0_usize;
     for (_, intent) in outcome.transaction.intents() {
         if let Some(actions) = intent.dust_actions {
@@ -252,6 +258,7 @@ struct ExpectedArtifact {
 pub(crate) async fn prove_transaction(
     transaction: UnprovenTransaction,
     config: &MidnightLocalProvingConfig,
+    cost_model: &midnight_onchain_runtime::cost_model::CostModel,
     cancellation: &AtomicBool,
 ) -> Result<LocalProvingOutcome, WalletTransactionPortError> {
     ensure_not_cancelled(cancellation)?;
@@ -302,10 +309,7 @@ pub(crate) async fn prove_transaction(
     eprintln!("local proving: generating DUST proof");
     let proving_started = Instant::now();
     let proved = transaction
-        .prove(
-            provider,
-            &midnight_onchain_runtime::cost_model::INITIAL_COST_MODEL,
-        )
+        .prove(provider, cost_model)
         .await
         .map_err(|_| WalletTransactionPortError::ProvingFailed)?;
     let proving_elapsed = proving_started.elapsed();
