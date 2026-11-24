@@ -41,6 +41,7 @@ pub enum WalletDustRegistrationPortError {
     AuthorizationChallengeMismatch,
     InvalidChainState,
     ProvingFailed,
+    PreBroadcastDenied,
     SubmissionRejected,
     SubmissionOutcomeUnknown,
     Timeout,
@@ -78,6 +79,7 @@ impl fmt::Display for WalletDustRegistrationPortError {
             }
             Self::InvalidChainState => "Midnight chain state is invalid or unavailable",
             Self::ProvingFailed => "DUST registration proving failed",
+            Self::PreBroadcastDenied => "DUST registration was denied before broadcast",
             Self::SubmissionRejected => "Midnight rejected the DUST registration",
             Self::SubmissionOutcomeUnknown => "Midnight DUST registration outcome is not yet known",
             Self::Timeout => "DUST registration operation timed out",

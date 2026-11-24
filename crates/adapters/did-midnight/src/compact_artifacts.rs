@@ -2,13 +2,12 @@
 
 //! Authenticated Midnight DID 0.5.0 Compact artifacts.
 //!
-//! The release manifest is part of the trust boundary: callers select one of
-//! the three bootstrap circuits by enum, and this loader verifies the pinned
-//! release/source identity plus each verifier-key digest before returning
-//! bytes to the maintenance composer.
+//! Callers select the circuit by enum. This loader checks the pinned source
+//! identity and verifies artifact digests listed in the trusted manifest.
 
 use std::{
     fs,
+    io::Cursor,
     path::{Path, PathBuf},
 };
 
@@ -16,7 +15,8 @@ use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use zeroize::Zeroizing;
 
-use midnight_transient_crypto::proofs::ProvingKeyMaterial;
+use midnight_serialize::tagged_deserialize;
+use midnight_transient_crypto::proofs::{ProvingKeyMaterial, VerifierKey};
 
 const EXPECTED_SCHEMA: &str = "midnight-did-zk-artifacts";
 const EXPECTED_VERSION: &str = "0.5.0";
@@ -35,6 +35,7 @@ pub enum MidnightDidBootstrapCircuit {
     VerificationMethod,
     SchnorrJubjubVerificationMethod,
     VerificationMethodRelation,
+    Deactivation,
 }
 
 impl MidnightDidBootstrapCircuit {
@@ -44,6 +45,7 @@ impl MidnightDidBootstrapCircuit {
             Self::VerificationMethod => "setVerificationMethod",
             Self::SchnorrJubjubVerificationMethod => "setSchnorrJubjubVerificationMethod",
             Self::VerificationMethodRelation => "setVerificationMethodRelation",
+            Self::Deactivation => "deactivate",
         }
     }
 }
@@ -114,7 +116,10 @@ impl MidnightDidCompactArtifacts {
             source: ArtifactSource::Embedded,
             manifest,
         };
-        for circuit in bootstrap_circuits() {
+        for circuit in NATIVE_DID_CIRCUITS
+            .into_iter()
+            .filter(|circuit| *circuit != MidnightDidBootstrapCircuit::Deactivation)
+        {
             artifacts.authenticated_bytes(circuit, ArtifactKind::Prover)?;
             artifacts.authenticated_bytes(circuit, ArtifactKind::Verifier)?;
             artifacts.authenticated_bytes(circuit, ArtifactKind::Zkir)?;
@@ -142,8 +147,7 @@ impl MidnightDidCompactArtifacts {
     }
 
     /// Returns the authenticated public proving closure for one admitted DID
-    /// bootstrap circuit. Callers select circuits through the closed enum;
-    /// manifest paths never become an ambient filesystem resolver.
+    /// circuit selected by the closed enum. Paths resolve inside the artifact root.
     pub fn proving_key_material(
         &self,
         circuit: MidnightDidBootstrapCircuit,
@@ -228,28 +232,18 @@ impl MidnightDidCompactArtifacts {
         circuit: MidnightDidBootstrapCircuit,
         kind: ArtifactKind,
     ) -> Result<&'static [u8], MidnightDidCompactArtifactError> {
+        let bytes = embedded_bytes(circuit, kind)
+            .ok_or(MidnightDidCompactArtifactError::ArtifactUnavailable)?;
         let entry = self
             .manifest
             .circuits
             .iter()
             .find(|entry| entry.id == circuit.artifact_id())
             .ok_or(MidnightDidCompactArtifactError::ArtifactMismatch)?;
-        let (bytes, expected, maximum) = match kind {
-            ArtifactKind::Prover => (
-                embedded_bytes(circuit, kind),
-                entry.sha256.prover.as_str(),
-                MAX_PROVER_KEY_BYTES,
-            ),
-            ArtifactKind::Verifier => (
-                embedded_bytes(circuit, kind),
-                entry.sha256.verifier.as_str(),
-                MAX_VERIFIER_KEY_BYTES,
-            ),
-            ArtifactKind::Zkir => (
-                embedded_bytes(circuit, kind),
-                entry.sha256.zkir.as_str(),
-                MAX_ZKIR_BYTES,
-            ),
+        let (expected, maximum) = match kind {
+            ArtifactKind::Prover => (entry.sha256.prover.as_str(), MAX_PROVER_KEY_BYTES),
+            ArtifactKind::Verifier => (entry.sha256.verifier.as_str(), MAX_VERIFIER_KEY_BYTES),
+            ArtifactKind::Zkir => (entry.sha256.zkir.as_str(), MAX_ZKIR_BYTES),
         };
         if bytes.is_empty()
             || u64::try_from(bytes.len()).map_or(true, |length| length > maximum)
@@ -261,13 +255,24 @@ impl MidnightDidCompactArtifacts {
     }
 }
 
-fn bootstrap_circuits() -> [MidnightDidBootstrapCircuit; 3] {
-    [
-        MidnightDidBootstrapCircuit::VerificationMethod,
-        MidnightDidBootstrapCircuit::SchnorrJubjubVerificationMethod,
-        MidnightDidBootstrapCircuit::VerificationMethodRelation,
-    ]
+pub(crate) fn decode_verifier_key(
+    bytes: &[u8],
+) -> Result<VerifierKey, MidnightDidCompactArtifactError> {
+    let mut reader = Cursor::new(bytes);
+    let key: VerifierKey = tagged_deserialize(&mut reader)
+        .map_err(|_| MidnightDidCompactArtifactError::ArtifactMismatch)?;
+    if usize::try_from(reader.position()).ok() != Some(bytes.len()) || key.init().is_err() {
+        return Err(MidnightDidCompactArtifactError::ArtifactMismatch);
+    }
+    Ok(key)
 }
+
+pub(crate) const NATIVE_DID_CIRCUITS: [MidnightDidBootstrapCircuit; 4] = [
+    MidnightDidBootstrapCircuit::VerificationMethod,
+    MidnightDidBootstrapCircuit::SchnorrJubjubVerificationMethod,
+    MidnightDidBootstrapCircuit::VerificationMethodRelation,
+    MidnightDidBootstrapCircuit::Deactivation,
+];
 
 fn parse_manifest(bytes: &[u8]) -> Result<ArtifactManifest, MidnightDidCompactArtifactError> {
     if bytes.is_empty()
@@ -283,12 +288,21 @@ fn parse_manifest(bytes: &[u8]) -> Result<ArtifactManifest, MidnightDidCompactAr
     {
         return Err(MidnightDidCompactArtifactError::ArtifactMismatch);
     }
-    for circuit in bootstrap_circuits() {
-        let entry = manifest
+    for circuit in NATIVE_DID_CIRCUITS {
+        let mut entries = manifest
             .circuits
             .iter()
-            .find(|entry| entry.id == circuit.artifact_id())
-            .ok_or(MidnightDidCompactArtifactError::ArtifactMismatch)?;
+            .filter(|entry| entry.id == circuit.artifact_id());
+        let Some(entry) = entries.next() else {
+            // The existing bootstrap profile can still read a three-circuit bundle.
+            if circuit == MidnightDidBootstrapCircuit::Deactivation {
+                continue;
+            }
+            return Err(MidnightDidCompactArtifactError::ArtifactMismatch);
+        };
+        if entries.next().is_some() {
+            return Err(MidnightDidCompactArtifactError::ArtifactMismatch);
+        }
         validate_relative_path(&entry.files.verifier)?;
         validate_relative_path(&entry.files.prover)?;
         validate_relative_path(&entry.files.zkir)?;
@@ -303,10 +317,13 @@ fn parse_manifest(bytes: &[u8]) -> Result<ArtifactManifest, MidnightDidCompactAr
     feature = "mobile-compact-artifacts",
     any(target_os = "ios", target_os = "android")
 ))]
-fn embedded_bytes(circuit: MidnightDidBootstrapCircuit, kind: ArtifactKind) -> &'static [u8] {
+fn embedded_bytes(
+    circuit: MidnightDidBootstrapCircuit,
+    kind: ArtifactKind,
+) -> Option<&'static [u8]> {
     macro_rules! artifact {
         ($path:literal) => {
-            include_bytes!(concat!(env!("OXID_MIDNIGHT_DID_ARTIFACTS_DIR"), $path)).as_slice()
+            Some(include_bytes!(concat!(env!("OXID_MIDNIGHT_DID_ARTIFACTS_DIR"), $path)).as_slice())
         };
     }
     match (circuit, kind) {
@@ -337,6 +354,7 @@ fn embedded_bytes(circuit: MidnightDidBootstrapCircuit, kind: ArtifactKind) -> &
         (MidnightDidBootstrapCircuit::VerificationMethodRelation, ArtifactKind::Zkir) => {
             artifact!("/zkir/setVerificationMethodRelation.bzkir")
         }
+        (MidnightDidBootstrapCircuit::Deactivation, _) => None,
     }
 }
 
@@ -434,6 +452,10 @@ mod tests {
             MidnightDidBootstrapCircuit::VerificationMethodRelation.artifact_id(),
             "setVerificationMethodRelation"
         );
+        assert_eq!(
+            MidnightDidBootstrapCircuit::Deactivation.artifact_id(),
+            "deactivate"
+        );
     }
 
     #[test]
@@ -445,17 +467,49 @@ mod tests {
     }
 
     #[test]
+    fn accepts_bootstrap_manifest_and_validates_optional_deactivation_entry() {
+        let entry = |circuit: MidnightDidBootstrapCircuit| {
+            let id = circuit.artifact_id();
+            let digest = "ab".repeat(32);
+            serde_json::json!({
+                "id": id,
+                "files": {
+                    "prover": format!("keys/{id}.prover"),
+                    "verifier": format!("keys/{id}.verifier"),
+                    "zkir": format!("zkir/{id}.bzkir"),
+                },
+                "sha256": { "prover": digest, "verifier": digest, "zkir": digest },
+            })
+        };
+        let mut entries = NATIVE_DID_CIRCUITS.map(entry).to_vec();
+        let deactivate = entries.pop().unwrap();
+        let manifest = |circuits: &[serde_json::Value]| {
+            serde_json::to_vec(&serde_json::json!({
+                "schema": EXPECTED_SCHEMA,
+                "version": EXPECTED_VERSION,
+                "gitSha": EXPECTED_GIT_SHA,
+                "circuits": circuits,
+            }))
+            .unwrap()
+        };
+        assert!(parse_manifest(&manifest(&entries)).is_ok());
+        entries.push(deactivate.clone());
+        assert!(parse_manifest(&manifest(&entries)).is_ok());
+        entries.push(deactivate);
+        assert!(parse_manifest(&manifest(&entries)).is_err());
+        entries.pop();
+        entries[3]["files"]["verifier"] = serde_json::json!("../deactivate.verifier");
+        assert!(parse_manifest(&manifest(&entries)).is_err());
+    }
+
+    #[test]
     #[ignore = "midnight-did-conformance: requires Nix-packaged DID artifacts"]
     fn pinned_release_artifacts_authenticate_when_configured() {
         let Some(root) = std::env::var_os("OXID_MIDNIGHT_DID_ARTIFACTS_DIR") else {
             return;
         };
         let artifacts = MidnightDidCompactArtifacts::load(root).expect("authenticated artifacts");
-        for circuit in [
-            MidnightDidBootstrapCircuit::VerificationMethod,
-            MidnightDidBootstrapCircuit::SchnorrJubjubVerificationMethod,
-            MidnightDidBootstrapCircuit::VerificationMethodRelation,
-        ] {
+        for circuit in NATIVE_DID_CIRCUITS {
             assert!(
                 !artifacts
                     .verifier_key(circuit)

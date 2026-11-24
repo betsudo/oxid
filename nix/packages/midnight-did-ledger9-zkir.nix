@@ -7,7 +7,15 @@
   zkirCompiler,
   publicParams,
 }:
-
+let
+  circuits = [
+    "setVerificationMethod"
+    "setSchnorrJubjubVerificationMethod"
+    "setVerificationMethodRelation"
+    "deactivate"
+  ];
+  circuitNames = lib.concatStringsSep " " circuits;
+in
 stdenvNoCC.mkDerivation {
   pname = "oxid-midnight-did-ledger9-artifacts";
   version = "0.5.0-e7e28ee";
@@ -26,11 +34,7 @@ stdenvNoCC.mkDerivation {
   buildPhase = ''
     runHook preBuild
     mkdir -p build/zkir build/keys
-    for circuit in \
-      setVerificationMethod \
-      setSchnorrJubjubVerificationMethod \
-      setVerificationMethodRelation
-    do
+    for circuit in ${circuitNames}; do
       cp "crates/midnight-did-runtime/assets/keys/$circuit.zkir" build/zkir/
     done
     zkir compile-many build/zkir build/keys
@@ -47,6 +51,7 @@ stdenvNoCC.mkDerivation {
     jq -n \
       --arg gitSha "e7e28eea94515d59b5e7360a717f5c0dee3eecdf" \
       --arg version "0.5.0" \
+      --argjson circuits ${lib.escapeShellArg (builtins.toJSON circuits)} \
       '
         def entry($id): {
           id: $id,
@@ -61,19 +66,11 @@ stdenvNoCC.mkDerivation {
           schema: "midnight-did-zk-artifacts",
           version: $version,
           gitSha: $gitSha,
-          circuits: [
-            entry("setVerificationMethod"),
-            entry("setSchnorrJubjubVerificationMethod"),
-            entry("setVerificationMethodRelation")
-          ]
+          circuits: ($circuits | map(entry(.)))
         }
       ' > "$out/manifest.json"
 
-    for circuit in \
-      setVerificationMethod \
-      setSchnorrJubjubVerificationMethod \
-      setVerificationMethodRelation
-    do
+    for circuit in ${circuitNames}; do
       prover=$(sha256sum "$out/keys/$circuit.prover" | cut -d' ' -f1)
       verifier=$(sha256sum "$out/keys/$circuit.verifier" | cut -d' ' -f1)
       zkir=$(sha256sum "$out/zkir/$circuit.bzkir" | cut -d' ' -f1)
@@ -99,12 +96,8 @@ stdenvNoCC.mkDerivation {
     test "$(jq -r .compatibility.runtime_abi "$out/rust-compatibility.json")" = 54
     test "$(jq -r .compatibility.ir_schema "$out/rust-compatibility.json")" = 20
     test "$(jq -r .compatibility.rust_version "$out/rust-compatibility.json")" = 1.99
-    test "$(jq '.circuits | length' "$out/manifest.json")" = 3
-    for circuit in \
-      setVerificationMethod \
-      setSchnorrJubjubVerificationMethod \
-      setVerificationMethodRelation
-    do
+    test "$(jq '.circuits | length' "$out/manifest.json")" = ${toString (builtins.length circuits)}
+    for circuit in ${circuitNames}; do
       test -s "$out/keys/$circuit.prover"
       test -s "$out/keys/$circuit.verifier"
       test -s "$out/zkir/$circuit.bzkir"
@@ -112,7 +105,7 @@ stdenvNoCC.mkDerivation {
   '';
 
   meta = {
-    description = "Ledger 9 Midnight DID bootstrap proving closure";
+    description = "Ledger 9 Midnight DID bootstrap and deactivation proving closure";
     homepage = "https://github.com/betsudo/midnight-identity/pull/110";
     license = lib.licenses.asl20;
   };

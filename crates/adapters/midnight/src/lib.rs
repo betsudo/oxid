@@ -46,6 +46,8 @@ pub use checkpoint::{MidnightAccountCheckpointConfig, MidnightAccountCheckpointC
 #[cfg(not(target_arch = "wasm32"))]
 pub use dust_checkpoint::{MidnightDustCheckpointConfig, MidnightDustCheckpointConfigError};
 #[cfg(not(target_arch = "wasm32"))]
+pub use dust_registration::{MidnightDustRegistrationInput, MidnightDustRegistrationInputs};
+#[cfg(not(target_arch = "wasm32"))]
 pub use indexer::{
     LiveMidnightAccountSource, MidnightIndexerConfig, MidnightIndexerConfigError,
     live_midnight_wallet, live_midnight_wallet_with_checkpoints, protected_live_midnight_wallet,
@@ -71,8 +73,10 @@ pub use shielded_checkpoint::{
 };
 #[cfg(not(target_arch = "wasm32"))]
 pub use submission::{
-    MidnightChainIdentityError, MidnightProofServerVersionError, MidnightProvingMode,
-    MidnightRemoteProvingMaterialSource, MidnightStandaloneConfig, MidnightStandaloneConfigError,
+    MidnightChainIdentityError, MidnightPreBroadcast, MidnightPreBroadcastDenied,
+    MidnightPreBroadcastEvidence, MidnightPreBroadcastKind, MidnightProofServerVersionError,
+    MidnightProvingMode, MidnightRemoteProvingMaterialSource, MidnightStandaloneConfig,
+    MidnightStandaloneConfigError, MidnightStandaloneSubmissionOptions,
     authenticate_midnight_chain_identity,
 };
 #[cfg(not(target_arch = "wasm32"))]
@@ -1767,6 +1771,40 @@ where
     C: ClockPort + 'static,
     K: WalletDerivedSecretUsePort + WalletKeyDerivationPort + WalletKeyOperationPort + 'static,
 {
+    protected_standalone_midnight_wallet_with_submission_options(
+        config,
+        account_checkpoints,
+        dust_checkpoints,
+        shielded_checkpoints,
+        submission_journal,
+        MidnightStandaloneSubmissionOptions {
+            remote_proving_material,
+            ..MidnightStandaloneSubmissionOptions::default()
+        },
+        clock,
+        keys,
+    )
+}
+
+/// Composes native standalone submission with optional proving material and a
+/// caller-owned acknowledgement boundary for live transactions.
+#[cfg(not(target_arch = "wasm32"))]
+#[must_use]
+#[allow(clippy::too_many_arguments)]
+pub fn protected_standalone_midnight_wallet_with_submission_options<C, K>(
+    config: MidnightStandaloneConfig,
+    account_checkpoints: Option<MidnightAccountCheckpointConfig>,
+    dust_checkpoints: Option<MidnightDustCheckpointConfig>,
+    shielded_checkpoints: Option<MidnightShieldedCheckpointConfig>,
+    submission_journal: Option<MidnightSubmissionJournalConfig>,
+    options: MidnightStandaloneSubmissionOptions,
+    clock: Arc<C>,
+    keys: Arc<K>,
+) -> MidnightWalletAdapter<LiveMidnightAccountSource<C>, ProtectedMidnightAccountDeriver<K>>
+where
+    C: ClockPort + 'static,
+    K: WalletDerivedSecretUsePort + WalletKeyDerivationPort + WalletKeyOperationPort + 'static,
+{
     let indexer = config.indexer().clone();
     let default_network = indexer.network_id().clone();
     let source = account_checkpoints.map_or_else(
@@ -1826,12 +1864,8 @@ where
     ));
     let completer = submission::LiveMidnightTransactionCompleter::new_with_dust_store(
         config, dust_store, clock,
-    );
-    let completer = if let Some(source) = remote_proving_material {
-        completer.with_remote_proving_material(source)
-    } else {
-        completer
-    };
+    )
+    .with_submission_options(options);
     MidnightWalletAdapter::with_default_network_deriver_and_completer(
         source,
         default_network,

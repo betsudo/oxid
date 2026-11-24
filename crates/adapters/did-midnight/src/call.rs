@@ -15,15 +15,16 @@ use midnight_did_jubjub_schnorr::{
     derive_public_key_from_seed, field_from_scalar, sign_authorization_digest_from_seed,
 };
 use midnight_did_runtime::{ledger_contract, pure_circuits, types};
-use midnight_ledger::structure::{
-    Intent, ProofPreimageMarker, Signature, StandardTransaction, Transaction,
+use midnight_ledger::{
+    construct::{PreTranscript, partition_transcripts},
+    structure::{
+        Intent, LedgerParameters, ProofPreimageMarker, Signature, StandardTransaction, Transaction,
+    },
 };
 use midnight_serialize::{Deserializable as _, tagged_deserialize, tagged_serialize};
 use midnight_storage::{DefaultDB, storage::HashMap as LedgerHashMap};
 use midnight_transient_crypto::{
-    commitment::PedersenRandomness,
-    curve::EmbeddedGroupAffine,
-    proofs::{ProofPreimage, VerifierKey},
+    commitment::PedersenRandomness, curve::EmbeddedGroupAffine, proofs::ProofPreimage,
 };
 use oxid_identity_application::DidLifecyclePortError;
 use oxid_wallet_application::{
@@ -38,7 +39,9 @@ use sha2::{Digest, Sha256};
 use zeroize::{Zeroize, Zeroizing};
 
 use crate::{
-    compact_artifacts::{MidnightDidBootstrapCircuit, MidnightDidCompactArtifacts},
+    compact_artifacts::{
+        MidnightDidBootstrapCircuit, MidnightDidCompactArtifacts, decode_verifier_key,
+    },
     custody::{controller_path, recovery_path, replay_randomness_path},
     protected_randomness::{ProtectedDeterministicRng, derive_seed},
 };
@@ -100,10 +103,25 @@ impl MidnightDidCallContext {
         }
         Ok(())
     }
+
+    fn decode_ledger_parameters(&self) -> Result<LedgerParameters, DidLifecyclePortError> {
+        let bytes = self
+            .ledger_parameters
+            .as_deref()
+            .ok_or(DidLifecyclePortError::InvalidOperation)?;
+        let mut cursor = Cursor::new(bytes);
+        let parameters =
+            tagged_deserialize(&mut cursor).map_err(|_| DidLifecyclePortError::InvalidOperation)?;
+        if usize::try_from(cursor.position()).ok() != Some(bytes.len()) {
+            return Err(DidLifecyclePortError::InvalidOperation);
+        }
+        Ok(parameters)
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum MidnightDidCallOperation {
+    Deactivate,
     AddAuthenticationMethod {
         method_id: String,
         x: [u8; 32],
@@ -119,6 +137,37 @@ pub enum MidnightDidCallOperation {
     AddAssertionRelationship {
         method_id: String,
     },
+    /// Bind an existing method to an explicit on-chain relationship.
+    BindVerificationMethod {
+        method_id: String,
+        relation: MidnightDidVerificationMethodRelation,
+    },
+}
+
+/// Relationships exposed by the native DID Manager binding operation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MidnightDidVerificationMethodRelation {
+    Authentication,
+    AssertionMethod,
+    CapabilityInvocation,
+    /// Requires an existing X25519 verification method.
+    KeyAgreement,
+}
+
+impl MidnightDidVerificationMethodRelation {
+    fn bind(self, method_id: String) -> RuntimeDidOperation {
+        let relation = match self {
+            Self::Authentication => types::VerificationMethodRelation::Authentication,
+            Self::AssertionMethod => types::VerificationMethodRelation::AssertionMethod,
+            Self::CapabilityInvocation => types::VerificationMethodRelation::CapabilityInvocation,
+            Self::KeyAgreement => types::VerificationMethodRelation::KeyAgreement,
+        };
+        RuntimeDidOperation::SetVerificationMethodRelation {
+            relation,
+            method_id: runtime::OpaqueString::from(method_id),
+            mutation: types::SetMutation::Insert,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -132,11 +181,14 @@ pub enum MidnightDidBootstrapCall {
 impl MidnightDidCallOperation {
     fn circuit(&self) -> MidnightDidBootstrapCircuit {
         match self {
+            Self::Deactivate => MidnightDidBootstrapCircuit::Deactivation,
             Self::AddAuthenticationMethod { .. } => MidnightDidBootstrapCircuit::VerificationMethod,
             Self::AddAssertionMethod { .. } => {
                 MidnightDidBootstrapCircuit::SchnorrJubjubVerificationMethod
             }
-            Self::AddAuthenticationRelationship { .. } | Self::AddAssertionRelationship { .. } => {
+            Self::AddAuthenticationRelationship { .. }
+            | Self::AddAssertionRelationship { .. }
+            | Self::BindVerificationMethod { .. } => {
                 MidnightDidBootstrapCircuit::VerificationMethodRelation
             }
         }
@@ -144,6 +196,7 @@ impl MidnightDidCallOperation {
 
     fn validate(&self) -> Result<(), DidLifecyclePortError> {
         let method_id = match self {
+            Self::Deactivate => return Ok(()),
             Self::AddAuthenticationMethod { method_id, x } => {
                 if *x == [0; 32] {
                     return Err(DidLifecyclePortError::InvalidOperation);
@@ -151,7 +204,8 @@ impl MidnightDidCallOperation {
                 method_id
             }
             Self::AddAuthenticationRelationship { method_id }
-            | Self::AddAssertionRelationship { method_id } => method_id,
+            | Self::AddAssertionRelationship { method_id }
+            | Self::BindVerificationMethod { method_id, .. } => method_id,
             Self::AddAssertionMethod { method_id, x, y } => {
                 if *x == [0; 32] || *y == [0; 32] {
                     return Err(DidLifecyclePortError::InvalidOperation);
@@ -173,6 +227,7 @@ impl MidnightDidCallOperation {
 
     fn into_runtime(self) -> Result<RuntimeDidOperation, DidLifecyclePortError> {
         Ok(match self {
+            Self::Deactivate => RuntimeDidOperation::Deactivate,
             Self::AddAuthenticationMethod { method_id, x } => {
                 RuntimeDidOperation::SetVerificationMethod {
                     method: types::VerificationMethod {
@@ -189,11 +244,7 @@ impl MidnightDidCallOperation {
                 }
             }
             Self::AddAuthenticationRelationship { method_id } => {
-                RuntimeDidOperation::SetVerificationMethodRelation {
-                    relation: types::VerificationMethodRelation::Authentication,
-                    method_id: runtime::OpaqueString::from(method_id),
-                    mutation: types::SetMutation::Insert,
-                }
+                MidnightDidVerificationMethodRelation::Authentication.bind(method_id)
             }
             Self::AddAssertionMethod { method_id, x, y } => {
                 RuntimeDidOperation::SetSchnorrJubjubVerificationMethod {
@@ -205,17 +256,18 @@ impl MidnightDidCallOperation {
                 }
             }
             Self::AddAssertionRelationship { method_id } => {
-                RuntimeDidOperation::SetVerificationMethodRelation {
-                    relation: types::VerificationMethodRelation::AssertionMethod,
-                    method_id: runtime::OpaqueString::from(method_id),
-                    mutation: types::SetMutation::Insert,
-                }
+                MidnightDidVerificationMethodRelation::AssertionMethod.bind(method_id)
             }
+            Self::BindVerificationMethod {
+                method_id,
+                relation,
+            } => relation.bind(method_id),
         })
     }
 }
 
 enum RuntimeDidOperation {
+    Deactivate,
     SetVerificationMethod {
         method: types::VerificationMethod,
         mutation: types::MapMutation,
@@ -427,6 +479,7 @@ impl NativeMidnightDidCallComposer {
         request: &NativeMidnightDidCallRequest,
     ) -> Result<NativeMidnightDidCallPlan, DidLifecyclePortError> {
         request.context.validate()?;
+        let ledger_parameters = request.context.decode_ledger_parameters()?;
         request.operation.validate()?;
         if request.account_index > WalletHdPathComponent::MAX_INDEX
             || request.controller_index > WalletHdPathComponent::MAX_INDEX
@@ -472,6 +525,14 @@ impl NativeMidnightDidCallComposer {
         let operation = request.operation.clone().into_runtime()?;
         let contract = ledger_contract::Contract::from(NativeDidWitnesses);
         let recorded = match operation {
+            RuntimeDidOperation::Deactivate => {
+                let digest = pure_circuits::deactivateAuthorizationDigest(id, version)
+                    .map_err(|_| DidLifecyclePortError::InvalidOperation)?;
+                let signature = signer.sign(&signer.controller_path, digest.0)?;
+                contract
+                    .recording()
+                    .deactivate_call(&observed, private_state, signature, version)
+            }
             RuntimeDidOperation::SetVerificationMethod { method, mutation } => {
                 let digest = pure_circuits::setVerificationMethodAuthorizationDigest(
                     id.clone(),
@@ -541,14 +602,8 @@ impl NativeMidnightDidCallComposer {
             .artifacts
             .verifier_key(circuit)
             .map_err(|_| DidLifecyclePortError::ProtectionUnavailable)?;
-        let mut verifier_cursor = Cursor::new(verifier.as_slice());
-        let verifier_key: VerifierKey = tagged_deserialize(&mut verifier_cursor)
+        let verifier_key = decode_verifier_key(verifier.as_slice())
             .map_err(|_| DidLifecyclePortError::InvalidOperation)?;
-        if usize::try_from(verifier_cursor.position()).ok() != Some(verifier.len())
-            || verifier_key.init().is_err()
-        {
-            return Err(DidLifecyclePortError::InvalidOperation);
-        }
         let mut seeds = None;
         self.custody
             .use_derived_secret(&request.profile_id, &replay, &mut |secret| {
@@ -566,9 +621,46 @@ impl NativeMidnightDidCallComposer {
         let communication_commitment_rand = runtime::Field::from_le_bytes(&communication_bytes)
             .ok_or(DidLifecyclePortError::InvalidOperation)?;
         communication_bytes.zeroize();
-        let call = recorded
+        let public = &recorded.recorded().public;
+        let transcript = PreTranscript {
+            context: public.initial().clone(),
+            program: public.verify_ops().to_vec(),
+            comm_comm: None,
+        };
+        let mut call = recorded
             .prepare(verifier_key, communication_commitment_rand)
             .map_err(|_| DidLifecyclePortError::InvalidOperation)?;
+        // Compact's checked preparation currently partitions with genesis
+        // parameters. Keep its verifier and trace validation, then size the
+        // guaranteed/fallible transcripts for the observed finalized ledger
+        // before add_call binds them into the proof preimage.
+        let mut partitions = partition_transcripts(&[transcript], &ledger_parameters)
+            .map_err(|_| DidLifecyclePortError::InvalidOperation)?;
+        let (guaranteed, fallible) = partitions
+            .pop()
+            .ok_or(DidLifecyclePortError::InvalidOperation)?;
+        let no_effects = Default::default();
+        let unchanged = |before: Option<&_>, after: Option<&_>| {
+            before.unwrap_or(&no_effects) == after.unwrap_or(&no_effects)
+        };
+        if (guaranteed.is_none() && fallible.is_none())
+            || !unchanged(
+                call.guaranteed_public_transcript
+                    .as_ref()
+                    .map(|trace| &trace.effects),
+                guaranteed.as_ref().map(|trace| &trace.effects),
+            )
+            || !unchanged(
+                call.fallible_public_transcript
+                    .as_ref()
+                    .map(|trace| &trace.effects),
+                fallible.as_ref().map(|trace| &trace.effects),
+            )
+        {
+            return Err(DidLifecyclePortError::InvalidOperation);
+        }
+        call.guaranteed_public_transcript = guaranteed;
+        call.fallible_public_transcript = fallible;
         let mut intent_rng = ProtectedDeterministicRng::new(intent_seed);
         let intent: Intent<Signature, ProofPreimageMarker, PedersenRandomness, DefaultDB> =
             Intent::empty(
@@ -814,6 +906,8 @@ const fn map_security_error(error: WalletSecurityPortError) -> DidLifecyclePortE
 #[cfg(test)]
 mod tests {
     use super::*;
+    use midnight_base_crypto::cost_model::CostDuration;
+    use midnight_ledger::structure::{ContractAction, INITIAL_PARAMETERS};
     use midnight_onchain_state::state::{
         ContractMaintenanceAuthority, ContractOperation, ContractState, EntryPointBuf,
     };
@@ -844,6 +938,8 @@ mod tests {
     }
     #[test]
     fn rejects_wrong_network_and_key_contexts() {
+        let mut parameter_bytes = Vec::new();
+        tagged_serialize(&INITIAL_PARAMETERS, &mut parameter_bytes).unwrap();
         let valid = MidnightDidCallContext {
             contract_state: vec![1],
             contract_address: [2; 32],
@@ -851,7 +947,7 @@ mod tests {
             observation_block_hash: [8; 32],
             observation_block_height: 1,
             zswap_chain_state: None,
-            ledger_parameters: Some(vec![1]),
+            ledger_parameters: Some(parameter_bytes.clone()),
             network_id: "undeployed".to_owned(),
             timestamp_millis: 1_000,
             expires_at_millis: 2_000,
@@ -859,6 +955,21 @@ mod tests {
             encryption_public_key: [4; 32],
         };
         assert_eq!(valid.validate(), Ok(()));
+        assert_eq!(valid.decode_ledger_parameters(), Ok(INITIAL_PARAMETERS));
+        for bytes in [
+            vec![1],
+            parameter_bytes[..parameter_bytes.len() - 1].to_vec(),
+            [parameter_bytes, vec![0]].concat(),
+        ] {
+            let context = MidnightDidCallContext {
+                ledger_parameters: Some(bytes),
+                ..valid.clone()
+            };
+            assert_eq!(
+                context.decode_ledger_parameters(),
+                Err(DidLifecyclePortError::InvalidOperation),
+            );
+        }
 
         for context in [
             MidnightDidCallContext {
@@ -879,6 +990,66 @@ mod tests {
                 Err(DidLifecyclePortError::InvalidOperation)
             );
         }
+    }
+
+    #[test]
+    fn binds_each_typed_relation_and_preserves_legacy_defaults() {
+        use MidnightDidVerificationMethodRelation as Relation;
+        use types::VerificationMethodRelation as CompactRelation;
+
+        let cases = [
+            (Relation::Authentication, CompactRelation::Authentication),
+            (Relation::AssertionMethod, CompactRelation::AssertionMethod),
+            (
+                Relation::CapabilityInvocation,
+                CompactRelation::CapabilityInvocation,
+            ),
+            (Relation::KeyAgreement, CompactRelation::KeyAgreement),
+        ];
+        let assert_binding = |operation: MidnightDidCallOperation, expected| {
+            assert!(operation.validate().is_ok());
+            assert_eq!(
+                operation.circuit(),
+                MidnightDidBootstrapCircuit::VerificationMethodRelation
+            );
+            assert!(matches!(
+                operation.into_runtime().unwrap(),
+                RuntimeDidOperation::SetVerificationMethodRelation {
+                    relation,
+                    method_id,
+                    mutation: types::SetMutation::Insert,
+                } if relation == expected && method_id == runtime::OpaqueString::from("#method")
+            ));
+        };
+        for (relation, expected) in cases {
+            assert_binding(
+                MidnightDidCallOperation::BindVerificationMethod {
+                    method_id: "#method".to_owned(),
+                    relation,
+                },
+                expected,
+            );
+        }
+        assert_binding(
+            MidnightDidCallOperation::AddAuthenticationRelationship {
+                method_id: "#method".to_owned(),
+            },
+            CompactRelation::Authentication,
+        );
+        assert_binding(
+            MidnightDidCallOperation::AddAssertionRelationship {
+                method_id: "#method".to_owned(),
+            },
+            CompactRelation::AssertionMethod,
+        );
+        assert_eq!(
+            MidnightDidCallOperation::BindVerificationMethod {
+                method_id: "method".to_owned(),
+                relation: Relation::KeyAgreement,
+            }
+            .validate(),
+            Err(DidLifecyclePortError::InvalidOperation),
+        );
     }
 
     #[test]
@@ -991,15 +1162,20 @@ mod tests {
             &NativeDidWitnesses,
         )
         .expect("generated initial state");
-        let verifier = composer
-            .artifacts
-            .verifier_key(MidnightDidBootstrapCircuit::VerificationMethod)
-            .expect("verification method verifier");
-        let mut cursor = Cursor::new(verifier.as_slice());
-        let verifier: VerifierKey = tagged_deserialize(&mut cursor).expect("decode verifier");
-        let operations = LedgerHashMap::new().insert(
-            EntryPointBuf(b"setVerificationMethod".to_vec()),
-            ContractOperation::new(Some(verifier), None),
+        let operations = LedgerHashMap::from_iter(
+            [
+                MidnightDidBootstrapCircuit::VerificationMethod,
+                MidnightDidBootstrapCircuit::SchnorrJubjubVerificationMethod,
+            ]
+            .into_iter()
+            .map(|circuit| {
+                let bytes = composer.artifacts.verifier_key(circuit).expect("verifier");
+                let verifier = decode_verifier_key(bytes.as_slice()).expect("decode verifier");
+                (
+                    EntryPointBuf(circuit.artifact_id().as_bytes().to_vec()),
+                    ContractOperation::new(Some(verifier), None),
+                )
+            }),
         );
         let contract = ContractState::new(
             initial.ledger_state.get_ref().clone(),
@@ -1010,30 +1186,289 @@ mod tests {
         let mut contract_state = Vec::new();
         tagged_serialize(&contract, &mut contract_state).expect("serialize contract state");
 
-        let plan = composer
-            .compose_bootstrap(
-                profile_id,
-                0,
-                7,
-                "native-bootstrap-call",
-                MidnightDidCallContext {
-                    contract_state,
+        let compose = |parameters: &LedgerParameters, call| {
+            let mut bytes = Vec::new();
+            tagged_serialize(parameters, &mut bytes).expect("serialize ledger parameters");
+            let plan = composer
+                .compose_bootstrap(
+                    profile_id.clone(),
+                    0,
+                    7,
+                    "native-bootstrap-call",
+                    MidnightDidCallContext {
+                        contract_state: contract_state.clone(),
+                        contract_address,
+                        observation_transaction_hash: [7; 32],
+                        observation_block_hash: [8; 32],
+                        observation_block_height: 1,
+                        zswap_chain_state: None,
+                        ledger_parameters: Some(bytes),
+                        network_id: "undeployed".to_owned(),
+                        timestamp_millis: 11_000,
+                        expires_at_millis: 3_611_000,
+                        coin_public_key: [3; 32],
+                        encryption_public_key: [4; 32],
+                    },
+                    call,
+                )
+                .expect("native generated call");
+            let transaction: UnprovenTransaction =
+                tagged_deserialize(plan.transaction.as_slice()).expect("valid unproven tx");
+            let (_, ContractAction::Call(call)) =
+                transaction.actions().next().expect("call action")
+            else {
+                panic!("expected a contract call");
+            };
+            call
+        };
+        let mut baseline = INITIAL_PARAMETERS;
+        // Exercise model changes separately from the guaranteed/fallible split.
+        baseline.limits.min_time_to_dismiss = CostDuration::from_picoseconds(1_000_000_000_000);
+        let mut live = baseline.clone();
+        live.cost_model.runtime_cost_model.push_cell +=
+            CostDuration::from_picoseconds(1_000_000_000);
+        let mut fallible_limits = live.clone();
+        fallible_limits.limits.min_time_to_dismiss = CostDuration::ZERO;
+        fallible_limits.limits.time_to_dismiss_per_byte = CostDuration::ZERO;
+        let observed = runtime::transaction::ObservedContractState::new(
+            runtime::ledger::ContractAddress(HashOutput(contract_address)),
+            contract,
+            runtime::transaction::Observation {
+                transaction_hash: [7; 32],
+                block_hash: [8; 32],
+                block_height: 1,
+            },
+        );
+        let query = observed.circuit_context(()).query;
+        for kind in [
+            MidnightDidBootstrapCall::AddAuthenticationMethod,
+            MidnightDidBootstrapCall::AddAssertionMethod,
+        ] {
+            let genesis = compose(&baseline, kind)
+                .guaranteed_transcript
+                .clone()
+                .expect("genesis guaranteed transcript");
+            let exact = compose(&live, kind)
+                .guaranteed_transcript
+                .clone()
+                .expect("live guaranteed transcript");
+            assert_eq!(genesis.program, exact.program);
+            assert_eq!(genesis.effects, exact.effects);
+            assert!(
+                exact.gas.compute_time > genesis.gas.compute_time,
+                "{kind:?}: default gas {:?}, live gas {:?}",
+                genesis.gas,
+                exact.gas,
+            );
+            let program: Vec<_> = exact.program.iter_deref().cloned().collect();
+            let model = &live.cost_model.runtime_cost_model;
+            assert!(query.query(&program, Some(genesis.gas), model).is_err());
+            query
+                .query(&program, Some(exact.gas), model)
+                .expect("live transcript fits declared gas");
+
+            let fallible = compose(&fallible_limits, kind);
+            assert!(fallible.guaranteed_transcript.is_none());
+            assert!(fallible.fallible_transcript.is_some());
+        }
+    }
+
+    #[test]
+    #[ignore = "midnight-did-conformance: requires Nix-packaged DID artifacts"]
+    fn preinstalled_verifiers_support_typed_binding_and_deactivation() {
+        use crate::{
+            NativeMidnightDidDeploymentComposer, NativeMidnightDidDeploymentRequest,
+            compact_artifacts::NATIVE_DID_CIRCUITS,
+        };
+        use oxid_identity_domain::MidnightNetwork;
+
+        let root = std::env::var_os("OXID_MIDNIGHT_DID_ARTIFACTS_DIR").expect("DID artifacts");
+        let artifacts = MidnightDidCompactArtifacts::load(root).expect("authenticated artifacts");
+        let profile_id = WalletProfileId::parse("native-did-deactivation-test").unwrap();
+        let security = Arc::new(DevelopmentWalletSecurity::new(
+            Arc::new(SystemClock),
+            Arc::new(OsRandom),
+        ));
+        security
+            .initialize(&profile_id)
+            .expect("initialize custody");
+        let custody: Arc<dyn WalletDerivedSecretUsePort> = security.clone();
+        let deployment = NativeMidnightDidDeploymentComposer::new_with_initial_verifiers(
+            Arc::clone(&custody),
+            &artifacts,
+        )
+        .expect("load initial verifiers");
+        let request = NativeMidnightDidDeploymentRequest::new(
+            profile_id.clone(),
+            MidnightNetwork::Undeployed,
+            "undeployed",
+            0,
+            7,
+            10_000,
+            3_610_000,
+            [5; 32],
+            [6; 32],
+        )
+        .expect("deployment request");
+        let plan = deployment.compose(&request).expect("compose deploy");
+        let replay = deployment.compose(&request).expect("replay deploy");
+        assert_eq!(plan.did(), replay.did());
+        assert_eq!(plan.planning_fingerprint(), replay.planning_fingerprint());
+        let legacy = NativeMidnightDidDeploymentComposer::new(Arc::clone(&custody))
+            .compose(&request)
+            .expect("compose deploy for maintenance");
+        assert_ne!(plan.did(), legacy.did());
+        let transaction: UnprovenTransaction =
+            tagged_deserialize(plan.into_transaction().as_slice()).expect("decode deploy");
+        let (_, deploy) = transaction.deploys().next().expect("deploy action");
+        let contract_address = deploy.address().0.0;
+        let mut contract = deploy.initial_state;
+        assert_eq!(
+            contract.operations.iter().count(),
+            NATIVE_DID_CIRCUITS.len()
+        );
+        let legacy_tx: UnprovenTransaction =
+            tagged_deserialize(legacy.into_transaction().as_slice()).expect("decode legacy deploy");
+        let (_, mut pilot_deploy) = legacy_tx.deploys().next().expect("legacy deploy action");
+        pilot_deploy.initial_state.operations = contract.operations.clone();
+        assert_eq!(pilot_deploy.address().0.0, contract_address);
+
+        use MidnightDidVerificationMethodRelation as Relation;
+        use midnight_did_runtime::{ledger_slots, state_decode::decode_ledger_snapshot};
+
+        let observation = runtime::transaction::Observation {
+            transaction_hash: [7; 32],
+            block_hash: [8; 32],
+            block_height: 1,
+        };
+        let address = runtime::ledger::ContractAddress(HashOutput(contract_address));
+        let observed = runtime::transaction::ObservedContractState::new(
+            address,
+            contract.clone(),
+            observation,
+        );
+        let mut fixture = observed.circuit_context(());
+        // Model pre-existing verification methods before exercising the binding circuit.
+        for (fragment, curve) in [
+            ("#ed25519", types::CurveType::Ed25519),
+            ("#x25519", types::CurveType::X25519),
+        ] {
+            let id = runtime::OpaqueString::from(fragment);
+            fixture = ledger_slots::verificationMethods
+                .insert(
+                    fixture,
+                    id.clone(),
+                    types::VerificationMethod {
+                        id,
+                        typ: types::VerificationMethodType::JsonWebKey,
+                        publicKeyJwk: types::PublicKeyJwk {
+                            kty: types::KeyType::OKP,
+                            crv: curve,
+                            x: runtime::OpaqueString::from(URL_SAFE_NO_PAD.encode([3; 32])),
+                            y: runtime::OpaqueString::from(""),
+                        },
+                    },
+                )
+                .expect("fixture JWK")
+                .context;
+        }
+        let id = runtime::OpaqueString::from("#jubjub");
+        let point = derive_public_key_from_seed(&[11; 32]);
+        fixture = ledger_slots::schnorrJubjubVerificationMethods
+            .insert(
+                fixture,
+                id.clone(),
+                types::SchnorrJubjubVerificationMethod {
+                    id,
+                    publicKey: point.into(),
+                },
+            )
+            .expect("fixture Jubjub method")
+            .context;
+        contract.data = fixture.query.state;
+
+        let mut contract_state = Vec::new();
+        tagged_serialize(&contract, &mut contract_state).expect("serialize contract state");
+        let mut ledger_parameters = Vec::new();
+        tagged_serialize(&INITIAL_PARAMETERS, &mut ledger_parameters)
+            .expect("serialize ledger parameters");
+        let composer = NativeMidnightDidCallComposer::new(custody, security, artifacts);
+        let compose = |operation| {
+            composer.compose(&NativeMidnightDidCallRequest {
+                profile_id: profile_id.clone(),
+                account_index: 0,
+                controller_index: 7,
+                context: MidnightDidCallContext {
+                    contract_state: contract_state.clone(),
                     contract_address,
                     observation_transaction_hash: [7; 32],
                     observation_block_hash: [8; 32],
                     observation_block_height: 1,
                     zswap_chain_state: None,
-                    ledger_parameters: Some(vec![1]),
+                    ledger_parameters: Some(ledger_parameters.clone()),
                     network_id: "undeployed".to_owned(),
                     timestamp_millis: 11_000,
                     expires_at_millis: 3_611_000,
                     coin_public_key: [3; 32],
                     encryption_public_key: [4; 32],
                 },
-                MidnightDidBootstrapCall::AddAuthenticationMethod,
-            )
-            .expect("native generated call");
-        assert!(!plan.transaction.is_empty());
-        validate_transaction(&plan.transaction, "undeployed").expect("valid unproven tx");
+                operation,
+                replay_recipe: [9; 32],
+            })
+        };
+        let observed =
+            runtime::transaction::ObservedContractState::new(address, contract, observation);
+        let replay = |operation: MidnightDidCallOperation| {
+            let circuit = operation.circuit();
+            let plan = compose(operation).expect("compose against installed verifier");
+            let transaction: UnprovenTransaction =
+                tagged_deserialize(plan.transaction.as_slice()).expect("decode call");
+            let (_, ContractAction::Call(call)) =
+                transaction.actions().next().expect("call action")
+            else {
+                panic!("expected a contract call");
+            };
+            assert_eq!(call.entry_point.0, circuit.artifact_id().as_bytes());
+            let mut state = observed.circuit_context(()).query;
+            for transcript in [
+                call.guaranteed_transcript.as_deref(),
+                call.fallible_transcript.as_deref(),
+            ]
+            .into_iter()
+            .flatten()
+            {
+                let program: Vec<_> = transcript.program.iter_deref().cloned().collect();
+                state = state
+                    .query(
+                        &program,
+                        Some(transcript.gas),
+                        &INITIAL_PARAMETERS.cost_model.runtime_cost_model,
+                    )
+                    .expect("replay controller-signed call")
+                    .context;
+            }
+            decode_ledger_snapshot(&state.state).expect("decode replayed DID state")
+        };
+        let bind = |fragment: &str, relation| MidnightDidCallOperation::BindVerificationMethod {
+            method_id: fragment.to_owned(),
+            relation,
+        };
+        for fragment in ["#ed25519", "#jubjub"] {
+            let signed = replay(bind(fragment, Relation::CapabilityInvocation));
+            assert_eq!(signed.capability_invocation_relation, [fragment]);
+            assert!(signed.key_agreement_relation.is_empty());
+            assert!(matches!(
+                compose(bind(fragment, Relation::KeyAgreement)),
+                Err(DidLifecyclePortError::InvalidOperation)
+            ));
+        }
+        let agreement = replay(bind("#x25519", Relation::KeyAgreement));
+        assert_eq!(agreement.key_agreement_relation, ["#x25519"]);
+        assert!(agreement.capability_invocation_relation.is_empty());
+        assert!(matches!(
+            compose(bind("#x25519", Relation::CapabilityInvocation)),
+            Err(DidLifecyclePortError::InvalidOperation)
+        ));
+        assert!(replay(MidnightDidCallOperation::Deactivate).deactivated);
     }
 }

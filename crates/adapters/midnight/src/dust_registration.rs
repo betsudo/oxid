@@ -25,6 +25,7 @@ use midnight_storage::{
     arena::Sp,
     storage::{Array, HashMap as LedgerHashMap},
 };
+use oxid_foundation::UnixTimestampMillis;
 use oxid_wallet_application::{
     AuthorizeWalletDustRegistrationRequest, PrepareWalletDustRegistrationRequest,
     SubmitWalletDustRegistrationRequest, SubmittedWalletDustRegistration, WalletAccountPortError,
@@ -33,7 +34,7 @@ use oxid_wallet_application::{
     WalletTransactionPortError,
 };
 use oxid_wallet_domain::{
-    AssetBalance, ChainBlockId, ChainTransactionId, WalletDustRegistrationPreview,
+    AssetBalance, ChainBlockId, ChainNetworkId, ChainTransactionId, WalletDustRegistrationPreview,
     WalletDustRegistrationSubmission, WalletDustRegistrationSubmissionStatus, WalletProfileId,
     WalletTransactionAuthorizationChallenge, WalletTransactionDraftId, WalletTransactionDraftState,
     WalletTransactionFeeState, WalletTransactionSubmissionState,
@@ -46,16 +47,41 @@ use crate::{
     MidnightWalletAdapter, SPECKS_PER_DUST, STARS_PER_NIGHT, midnight_asset, network_by_id,
     submission_journal::{StoredSubmissionJournalEntry, StoredSubmissionState},
     transaction::{
-        CancelSubmissionOnDrop, LedgerIntent, LedgerTransaction, MidnightCompletionOutcome,
-        MidnightCompletionRequest, MidnightRegistrationContext, MidnightSpendableUtxo,
-        MidnightSubmissionAttempt, MidnightSubmissionControl, MidnightSubmissionReconciliation,
-        MidnightTransactionAuthorizer, MidnightTransactionSource, decode_signature,
-        decode_verifying_key, verify_signature,
+        CancelSubmissionOnDrop, LedgerIntent, LedgerTransaction, MidnightCompletionOrigin,
+        MidnightCompletionOutcome, MidnightCompletionRequest, MidnightRegistrationContext,
+        MidnightSpendableUtxo, MidnightSubmissionAttempt, MidnightSubmissionControl,
+        MidnightSubmissionReconciliation, MidnightTransactionAuthorizer, MidnightTransactionSource,
+        decode_signature, decode_verifying_key, verify_signature,
     },
 };
 
 const DUST_REGISTRATION_SEGMENT: u16 = 1;
 const DUST_REGISTRATION_COMPLETION_TIMEOUT: Duration = Duration::from_secs(5 * 60);
+
+/// One NIGHT input retained in a prepared DUST registration.
+#[non_exhaustive]
+pub struct MidnightDustRegistrationInput {
+    pub intent_hash: [u8; 32],
+    pub output_index: u32,
+    /// Raw Ledger `UserAddress` hash.
+    pub owner: [u8; 32],
+    /// Raw Ledger unshielded token hash.
+    pub token_type: [u8; 32],
+    /// Value in atomic NIGHT units.
+    pub value: u128,
+}
+
+/// Native draft evidence for trusted composition. Keep it scoped to the
+/// authenticated profile. It carries no signing data or submission authority.
+#[non_exhaustive]
+pub struct MidnightDustRegistrationInputs {
+    pub draft_id: WalletTransactionDraftId,
+    pub network_id: ChainNetworkId,
+    pub planning_fingerprint: [u8; 32],
+    pub expires_at: UnixTimestampMillis,
+    /// Guaranteed offer inputs precede fallible offer inputs.
+    pub inputs: Vec<MidnightDustRegistrationInput>,
+}
 
 pub(crate) struct RetainedMidnightDustRegistration {
     planning_fingerprint: [u8; 32],
@@ -106,6 +132,65 @@ impl PlannedRegistration {
             return Err(WalletDustRegistrationPortError::InsufficientRegistrationAllowance);
         }
         Ok(())
+    }
+}
+
+impl<S, D> MidnightWalletAdapter<S, D> {
+    /// Reads the exact input selection of an unexpired Prepared or Authorized draft.
+    ///
+    /// This is a snapshot of the retained draft, not a new account query or a
+    /// claim that the inputs are still spendable. It does not authorize or
+    /// submit the draft. The native host supplies its trusted clock and keeps
+    /// the result behind the profile's access boundary.
+    pub fn dust_registration_inputs(
+        &self,
+        profile_id: &WalletProfileId,
+        draft_id: &WalletTransactionDraftId,
+        now: UnixTimestampMillis,
+    ) -> Result<MidnightDustRegistrationInputs, WalletDustRegistrationPortError> {
+        let drafts = self
+            .dust_registration_drafts
+            .lock()
+            .map_err(|_| WalletDustRegistrationPortError::Unavailable)?;
+        let retained = drafts
+            .get(&(profile_id.clone(), draft_id.clone()))
+            .ok_or(WalletDustRegistrationPortError::DraftNotFound)?;
+        let preview = &retained.preview;
+        if preview.state() == WalletTransactionDraftState::Expired
+            || now.value() >= preview.expires_at().value()
+        {
+            return Err(WalletDustRegistrationPortError::DraftExpired);
+        }
+        match preview.state() {
+            WalletTransactionDraftState::Prepared | WalletTransactionDraftState::Authorized => {}
+            WalletTransactionDraftState::Submitting => {
+                return Err(WalletDustRegistrationPortError::SubmissionInProgress);
+            }
+            _ => return Err(WalletDustRegistrationPortError::DraftConflict),
+        }
+        let intent = &retained.unsigned_intent;
+        let inputs = [
+            intent.guaranteed_unshielded_offer.as_ref(),
+            intent.fallible_unshielded_offer.as_ref(),
+        ]
+        .into_iter()
+        .flatten()
+        .flat_map(|offer| offer.inputs.iter())
+        .map(|input| MidnightDustRegistrationInput {
+            intent_hash: input.intent_hash.0.0,
+            output_index: input.output_no,
+            owner: UserAddress::from(input.owner.clone()).0.0,
+            token_type: input.type_.0.0,
+            value: input.value,
+        })
+        .collect();
+        Ok(MidnightDustRegistrationInputs {
+            draft_id: draft_id.clone(),
+            network_id: preview.network_id().clone(),
+            planning_fingerprint: retained.planning_fingerprint,
+            expires_at: preview.expires_at(),
+            inputs,
+        })
     }
 }
 
@@ -431,6 +516,7 @@ where
                                 transaction.clone(),
                                 expires_at_seconds,
                                 Arc::clone(&worker_control),
+                                MidnightCompletionOrigin::DustRegistration,
                             ),
                             dust_seed,
                         )
@@ -1207,6 +1293,9 @@ const fn map_transaction_error(
             WalletDustRegistrationPortError::InvalidChainState
         }
         WalletTransactionPortError::ProvingFailed => WalletDustRegistrationPortError::ProvingFailed,
+        WalletTransactionPortError::PreBroadcastDenied => {
+            WalletDustRegistrationPortError::PreBroadcastDenied
+        }
         WalletTransactionPortError::SubmissionRejected => {
             WalletDustRegistrationPortError::SubmissionRejected
         }
@@ -1300,6 +1389,116 @@ mod tests {
             created_at_seconds: created,
             registered_for_dust_generation: registered,
         }
+    }
+
+    #[test]
+    fn registration_input_projection_reads_only_the_bound_unexpired_draft() {
+        let context = MidnightRegistrationContext {
+            timestamp: Timestamp::from_secs(1_000_000),
+            parameters: INITIAL_PARAMETERS,
+        };
+        let now = UnixTimestampMillis::new(1_000_000_000);
+        let expires_at = UnixTimestampMillis::new(now.value() + 60_000);
+        let network_id = ChainNetworkId::parse("undeployed").unwrap();
+        let night_key = SignatureVerifyingKey::Schnorr(
+            midnight_base_crypto::schnorr::SigningKey::from_bytes(&[3; 32])
+                .unwrap()
+                .verifying_key(),
+        );
+        let owner = UserAddress::from(night_key.clone()).0.0;
+        let dust_key = midnight_ledger::dust::DustSecretKey::derive_secret_key(&[4; 32]);
+        let guaranteed = utxo(50_000_000_000, 2, Some(0), false);
+        let fallible = MidnightSpendableUtxo {
+            output_index: 7,
+            ..utxo(10_000_000_000, 1, Some(0), false)
+        };
+        let plan = plan_registration(
+            &network_id,
+            night_key,
+            DustPublicKey::from(dust_key),
+            vec![
+                fallible.clone(),
+                utxo(100_000_000_000, 3, Some(0), true),
+                guaranteed.clone(),
+            ],
+            &context,
+            expires_at.value() / 1_000,
+        )
+        .unwrap();
+        let draft_id = registration_id(&plan.signing_payload).unwrap();
+        let preview = WalletDustRegistrationPreview::new(
+            draft_id.clone(),
+            registration_challenge(&draft_id, &plan.signing_payload).unwrap(),
+            network_id.clone(),
+            oxid_wallet_domain::ChainAccountId::parse("account-registration").unwrap(),
+            AssetBalance::new(
+                midnight_asset("midnight:night", "NIGHT", STARS_PER_NIGHT).unwrap(),
+                plan.registered_night,
+            ),
+            plan.input_count,
+            AssetBalance::new(
+                midnight_asset("midnight:dust", "DUST", SPECKS_PER_DUST).unwrap(),
+                plan.maximum_fee_allowance,
+            ),
+            WalletTransactionFeeState::RequiresBalancing,
+            expires_at,
+            WalletTransactionDraftState::Prepared,
+        )
+        .unwrap();
+        let profile_id = WalletProfileId::parse("profile-registration").unwrap();
+        let adapter = MidnightWalletAdapter::new(UnavailableMidnightAccountSource);
+        let key = (profile_id.clone(), draft_id.clone());
+        adapter.dust_registration_drafts.lock().unwrap().insert(
+            key.clone(),
+            RetainedMidnightDustRegistration {
+                planning_fingerprint: [5; 32],
+                preview: preview.clone(),
+                account_index: 0,
+                signing_payload: Zeroizing::new(plan.signing_payload),
+                unsigned_intent: plan.intent,
+                signed_transaction: None,
+                submission: None,
+                submission_state: WalletTransactionSubmissionState::NotStarted,
+                submission_control: None,
+            },
+        );
+
+        let projection = adapter
+            .dust_registration_inputs(&profile_id, &draft_id, now)
+            .unwrap();
+        assert_eq!(projection.draft_id, draft_id);
+        assert_eq!(projection.network_id, network_id);
+        assert_eq!(projection.expires_at, expires_at);
+        assert_eq!(projection.planning_fingerprint, [5; 32]);
+        assert_eq!(projection.inputs.len(), usize::from(preview.input_count()));
+        for (input, expected) in projection.inputs.iter().zip([guaranteed, fallible]) {
+            assert_eq!(input.intent_hash, expected.intent_hash);
+            assert_eq!(input.output_index, expected.output_index);
+            assert_eq!(input.owner, owner);
+            assert_eq!(input.token_type, NIGHT.0.0);
+            assert_eq!(input.value, expected.value);
+        }
+
+        let wrong_profile = WalletProfileId::parse("profile-other").unwrap();
+        assert!(matches!(
+            adapter.dust_registration_inputs(&wrong_profile, &draft_id, now),
+            Err(WalletDustRegistrationPortError::DraftNotFound)
+        ));
+        assert!(matches!(
+            adapter.dust_registration_inputs(&profile_id, &draft_id, expires_at),
+            Err(WalletDustRegistrationPortError::DraftExpired)
+        ));
+        adapter
+            .dust_registration_drafts
+            .lock()
+            .unwrap()
+            .get_mut(&key)
+            .unwrap()
+            .preview = preview.with_state(WalletTransactionDraftState::Submitting);
+        assert!(matches!(
+            adapter.dust_registration_inputs(&profile_id, &draft_id, now),
+            Err(WalletDustRegistrationPortError::SubmissionInProgress)
+        ));
     }
 
     #[test]

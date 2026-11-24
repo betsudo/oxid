@@ -43,6 +43,7 @@ pub enum WalletTransactionPortError {
     InsufficientDust,
     InvalidChainState,
     ProvingFailed,
+    PreBroadcastDenied,
     SubmissionRejected,
     SubmissionOutcomeUnknown,
     Timeout,
@@ -79,6 +80,7 @@ impl fmt::Display for WalletTransactionPortError {
             Self::InsufficientDust => "wallet has insufficient DUST for the transaction fee",
             Self::InvalidChainState => "Midnight chain state is invalid or unavailable",
             Self::ProvingFailed => "transaction proving failed",
+            Self::PreBroadcastDenied => "transaction was denied before broadcast",
             Self::SubmissionRejected => "Midnight rejected the transaction submission",
             Self::SubmissionOutcomeUnknown => {
                 "Midnight transaction submission outcome is not yet known"

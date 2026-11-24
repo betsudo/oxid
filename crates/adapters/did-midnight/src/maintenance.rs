@@ -8,7 +8,7 @@
 //! the maintenance secret inside wallet custody and returns only an unproven
 //! ledger transaction to the shared funding/proving/submission boundary.
 
-use std::{fmt, io::Cursor, sync::Arc};
+use std::{fmt, sync::Arc};
 
 use midnight_base_crypto::{hash::HashOutput, time::Timestamp};
 use midnight_coin_structure::contract::ContractAddress;
@@ -17,9 +17,8 @@ use midnight_ledger::structure::{
     Signature, SingleUpdate, StandardTransaction, Transaction,
 };
 use midnight_onchain_state::state::EntryPointBuf;
-use midnight_serialize::tagged_deserialize;
 use midnight_storage::{DefaultDB, storage::HashMap as LedgerHashMap};
-use midnight_transient_crypto::{commitment::PedersenRandomness, proofs::VerifierKey};
+use midnight_transient_crypto::commitment::PedersenRandomness;
 use oxid_identity_application::DidLifecyclePortError;
 use oxid_wallet_application::{
     WalletDerivedSecretUsePort, WalletHdPathComponent, WalletSecurityPortError,
@@ -29,6 +28,7 @@ use sha2::{Digest, Sha256};
 use zeroize::Zeroizing;
 
 use crate::{
+    compact_artifacts::decode_verifier_key,
     custody::{maintenance_path, replay_randomness_path},
     protected_randomness::{ProtectedDeterministicRng, derive_seed, maintenance_signing_key},
 };
@@ -179,14 +179,8 @@ impl NativeMidnightDidMaintenanceComposer {
         &self,
         request: &NativeMidnightDidMaintenanceRequest,
     ) -> Result<NativeMidnightDidMaintenancePlan, DidLifecyclePortError> {
-        let mut verifier_cursor = Cursor::new(request.verifier_key.as_slice());
-        let verifier_key: VerifierKey = tagged_deserialize(&mut verifier_cursor)
+        let verifier_key = decode_verifier_key(request.verifier_key.as_slice())
             .map_err(|_| DidLifecyclePortError::InvalidOperation)?;
-        if usize::try_from(verifier_cursor.position()).ok() != Some(request.verifier_key.len())
-            || verifier_key.init().is_err()
-        {
-            return Err(DidLifecyclePortError::InvalidOperation);
-        }
 
         let single = SingleUpdate::VerifierKeyInsert(
             EntryPointBuf(request.entry_point.as_bytes().to_vec()),

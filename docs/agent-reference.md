@@ -505,6 +505,51 @@ methods are `wallet.transaction.submission_history` and
 `wallet.transaction.reconcile_submission`; Dioxus shows the latest restored
 public attempt even when process-local custody is unavailable.
 
+Trusted native hosts may opt into `MidnightPreBroadcast` through
+`protected_standalone_midnight_wallet_with_submission_options`. Live wallet
+transfers, contract completion, and DUST registration share this boundary.
+It receives the exact tagged Ledger 9 payload and the canonical ledger hash
+and identifiers after proving, sealing, and final fee reconciliation.
+The same acknowledgement includes the extrinsic hash and finalized chain
+anchor. Contract callbacks receive the caller's profile and draft identifiers.
+
+The host acknowledges only after its own protected persistence succeeds.
+Denial exits before Oxid writes a broadcast entry or calls the node
+submission RPC. An acknowledgement is evidence of preparation, since
+cancellation, failure writing Oxid's journal, or termination can interrupt
+the path before broadcast. The caller correlates and reconciles the exact
+attempt before replacement. Oxid keeps its existing public journal schema and
+post-broadcast recovery behavior. Existing compositions use no hook by default.
+
+The same native host can look up `MidnightWalletAdapter::dust_registration_inputs`
+using the same profile and the draft identifier returned by preparation. It projects
+the NIGHT inputs directly from the retained intent while the draft is prepared
+or authorized and unexpired. Use the returned network, draft identifier, and
+planning fingerprint to correlate the inputs with the hook. This projection
+does not replace the wallet's normal authorization or submission checks and
+is excluded from the general wallet preview.
+
+Native DID call composition decodes the finalized chain context's tagged
+Ledger 9 parameters and uses them for transcript partitioning and gas before
+constructing the proof preimage. Compact still validates the recorded trace and
+the installed verifier. Both live proving routes use their chain tip's runtime
+cost model to account for proof padding.
+
+Native Portal hosts can opt into `NativeMidnightDidDeploymentComposer::new_with_initial_verifiers`
+with the four-circuit `midnight-did-ledger9-zkir` bundle. They record the pinned
+artifact set alongside the deploy replay recipe because the verifier table
+contributes to the contract address. The native call composer accepts
+`MidnightDidCallOperation::Deactivate` against an installed, matching verifier.
+The host supplies the same bundle's deactivation proving material and owns
+authorization, acknowledgement and finality. The standard Oxid bootstrap
+constructor continues to install its verifier keys through maintenance.
+
+Native DID hosts bind an existing method through
+`MidnightDidCallOperation::BindVerificationMethod` with authentication, assertion,
+capability invocation, or key agreement. The same controller-signed ledger
+circuit enforces method compatibility. Key agreement requires an installed
+X25519 method. Ed25519 and Schnorr-Jubjub support the three signing relationships.
+
 [Issue #21](https://github.com/MediaNoxLabs/oxid/issues/21) and ADR-0036 begin
 the peer identity capability with profile-scoped DID inventory and resolution.
 `identity/domain` and `identity/application` have no external dependencies and

@@ -937,6 +937,7 @@ const fn sync_failure(error: WalletTransactionPortError) -> WalletDustSyncFailur
         | WalletTransactionPortError::InsufficientDust
         | WalletTransactionPortError::InvalidChainState
         | WalletTransactionPortError::ProvingFailed
+        | WalletTransactionPortError::PreBroadcastDenied
         | WalletTransactionPortError::SubmissionRejected
         | WalletTransactionPortError::InvalidData => WalletDustSyncFailure::InvalidChainState,
     }
