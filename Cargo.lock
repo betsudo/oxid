@@ -5067,7 +5067,7 @@ dependencies = [
 [[package]]
 name = "midnight-did-domain"
 version = "0.5.0"
-source = "git+https://github.com/betsudo/midnight-identity?rev=e7e28eea94515d59b5e7360a717f5c0dee3eecdf#e7e28eea94515d59b5e7360a717f5c0dee3eecdf"
+source = "git+https://github.com/betsudo/midnight-identity?rev=a18fc76406db35bf38fb0618b2102ef97e31dc7c#a18fc76406db35bf38fb0618b2102ef97e31dc7c"
 dependencies = [
  "base64 0.22.1",
  "blake2",
@@ -5081,7 +5081,7 @@ dependencies = [
 [[package]]
 name = "midnight-did-jubjub-schnorr"
 version = "0.5.0"
-source = "git+https://github.com/betsudo/midnight-identity?rev=e7e28eea94515d59b5e7360a717f5c0dee3eecdf#e7e28eea94515d59b5e7360a717f5c0dee3eecdf"
+source = "git+https://github.com/betsudo/midnight-identity?rev=a18fc76406db35bf38fb0618b2102ef97e31dc7c#a18fc76406db35bf38fb0618b2102ef97e31dc7c"
 dependencies = [
  "hex",
  "midnight-transient-crypto 3.1.0",
@@ -5093,7 +5093,7 @@ dependencies = [
 [[package]]
 name = "midnight-did-method"
 version = "0.5.0"
-source = "git+https://github.com/betsudo/midnight-identity?rev=e7e28eea94515d59b5e7360a717f5c0dee3eecdf#e7e28eea94515d59b5e7360a717f5c0dee3eecdf"
+source = "git+https://github.com/betsudo/midnight-identity?rev=a18fc76406db35bf38fb0618b2102ef97e31dc7c#a18fc76406db35bf38fb0618b2102ef97e31dc7c"
 dependencies = [
  "blake2",
  "hex",
@@ -5107,7 +5107,7 @@ dependencies = [
 [[package]]
 name = "midnight-did-runtime"
 version = "0.5.0"
-source = "git+https://github.com/betsudo/midnight-identity?rev=e7e28eea94515d59b5e7360a717f5c0dee3eecdf#e7e28eea94515d59b5e7360a717f5c0dee3eecdf"
+source = "git+https://github.com/betsudo/midnight-identity?rev=a18fc76406db35bf38fb0618b2102ef97e31dc7c#a18fc76406db35bf38fb0618b2102ef97e31dc7c"
 dependencies = [
  "async-trait",
  "blake2",
@@ -5675,7 +5675,7 @@ dependencies = [
 [[package]]
 name = "midnight-vc-families"
 version = "0.5.0"
-source = "git+https://github.com/betsudo/midnight-identity?rev=e7e28eea94515d59b5e7360a717f5c0dee3eecdf#e7e28eea94515d59b5e7360a717f5c0dee3eecdf"
+source = "git+https://github.com/betsudo/midnight-identity?rev=a18fc76406db35bf38fb0618b2102ef97e31dc7c#a18fc76406db35bf38fb0618b2102ef97e31dc7c"
 dependencies = [
  "midnight-base-crypto 1.1.1",
  "midnight-compact-runtime",
@@ -5686,7 +5686,7 @@ dependencies = [
 [[package]]
 name = "midnight-vc-proof"
 version = "0.5.0"
-source = "git+https://github.com/betsudo/midnight-identity?rev=e7e28eea94515d59b5e7360a717f5c0dee3eecdf#e7e28eea94515d59b5e7360a717f5c0dee3eecdf"
+source = "git+https://github.com/betsudo/midnight-identity?rev=a18fc76406db35bf38fb0618b2102ef97e31dc7c#a18fc76406db35bf38fb0618b2102ef97e31dc7c"
 dependencies = [
  "midnight-did-jubjub-schnorr",
  "midnight-transient-crypto 3.1.0",
@@ -5699,7 +5699,7 @@ dependencies = [
 [[package]]
 name = "midnight-vc-runtime"
 version = "0.5.0"
-source = "git+https://github.com/betsudo/midnight-identity?rev=e7e28eea94515d59b5e7360a717f5c0dee3eecdf#e7e28eea94515d59b5e7360a717f5c0dee3eecdf"
+source = "git+https://github.com/betsudo/midnight-identity?rev=a18fc76406db35bf38fb0618b2102ef97e31dc7c#a18fc76406db35bf38fb0618b2102ef97e31dc7c"
 dependencies = [
  "midnight-base-crypto 1.1.1",
  "midnight-compact-runtime",

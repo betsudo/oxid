@@ -24,7 +24,7 @@ const EXPECTED_VERSION: &str = "0.5.0";
 // reviewed midnight-identity revision as the Rust adapter. The older public
 // v0.5.0 archive contains Ledger 8 verifier keys and must never be admitted by
 // this loader.
-const EXPECTED_GIT_SHA: &str = "e7e28eea94515d59b5e7360a717f5c0dee3eecdf";
+const EXPECTED_GIT_SHA: &str = "a18fc76406db35bf38fb0618b2102ef97e31dc7c";
 const MAX_MANIFEST_BYTES: u64 = 256 * 1024;
 const MAX_VERIFIER_KEY_BYTES: u64 = 16 * 1024 * 1024;
 const MAX_PROVER_KEY_BYTES: u64 = 16 * 1024 * 1024;

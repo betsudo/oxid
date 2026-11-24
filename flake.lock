@@ -115,18 +115,18 @@
     "midnight-identity-ledger9": {
       "flake": false,
       "locked": {
-        "lastModified": 1794993069,
-        "narHash": "sha256-J684SunbTIK8fblcMAtBg7lTFj0lzyzpiRNDW9w2Uv4=",
+        "lastModified": 1795539003,
+        "narHash": "sha256-Wmjac1/kVmARyAWPx3RCzA6UL+AN+KttmoTC14N/laA=",
         "ref": "develop",
-        "rev": "e7e28eea94515d59b5e7360a717f5c0dee3eecdf",
-        "revCount": 276,
+        "rev": "a18fc76406db35bf38fb0618b2102ef97e31dc7c",
+        "revCount": 294,
         "submodules": true,
         "type": "git",
         "url": "https://github.com/betsudo/midnight-identity"
       },
       "original": {
         "ref": "develop",
-        "rev": "e7e28eea94515d59b5e7360a717f5c0dee3eecdf",
+        "rev": "a18fc76406db35bf38fb0618b2102ef97e31dc7c",
         "submodules": true,
         "type": "git",
         "url": "https://github.com/betsudo/midnight-identity"
