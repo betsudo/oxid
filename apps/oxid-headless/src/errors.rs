@@ -663,6 +663,7 @@ pub(super) fn dust_registration_port_error(
         WalletDustRegistrationPortError::AuthorizationChallengeMismatch => "invalid_argument",
         WalletDustRegistrationPortError::InvalidChainState => "invalid_chain_state",
         WalletDustRegistrationPortError::ProvingFailed => "proving_failed",
+        WalletDustRegistrationPortError::PreBroadcastDenied => "pre_broadcast_denied",
         WalletDustRegistrationPortError::SubmissionRejected => "submission_rejected",
         WalletDustRegistrationPortError::SubmissionOutcomeUnknown => "submission_outcome_unknown",
         WalletDustRegistrationPortError::Timeout => "timeout",
@@ -770,6 +771,9 @@ pub(super) fn transaction_port_error(
         ),
         WalletTransactionPortError::ProvingFailed => {
             Response::error(id, "proving_failed", "transaction proof generation failed")
+        }
+        WalletTransactionPortError::PreBroadcastDenied => {
+            Response::error(id, "pre_broadcast_denied", error.to_string())
         }
         WalletTransactionPortError::SubmissionRejected => Response::error(
             id,

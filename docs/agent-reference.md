@@ -505,6 +505,22 @@ methods are `wallet.transaction.submission_history` and
 `wallet.transaction.reconcile_submission`; Dioxus shows the latest restored
 public attempt even when process-local custody is unavailable.
 
+Trusted native hosts may opt into `MidnightPreBroadcast` through
+`protected_standalone_midnight_wallet_with_submission_options`. Live wallet
+transfers, contract completion, and DUST registration share this boundary.
+It receives the exact tagged Ledger 9 payload and the canonical ledger hash
+and identifiers after proving, sealing, and final fee reconciliation.
+The same acknowledgement includes the extrinsic hash and finalized chain
+anchor. Contract callbacks receive the caller's profile and draft identifiers.
+
+The host acknowledges only after its own protected persistence succeeds.
+Denial exits before Oxid writes a broadcast entry or calls the node
+submission RPC. An acknowledgement is evidence of preparation, since
+cancellation, failure writing Oxid's journal, or termination can interrupt
+the path before broadcast. The caller correlates and reconciles the exact
+attempt before replacement. Oxid keeps its existing public journal schema and
+post-broadcast recovery behavior. Existing compositions use no hook by default.
+
 [Issue #21](https://github.com/MediaNoxLabs/oxid/issues/21) and ADR-0036 begin
 the peer identity capability with profile-scoped DID inventory and resolution.
 `identity/domain` and `identity/application` have no external dependencies and

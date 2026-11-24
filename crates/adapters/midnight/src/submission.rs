@@ -51,6 +51,7 @@ use serde_json::{Value, json};
 use subxt::{OnlineClient, SubstrateConfig, backend::rpc::RpcClient, dynamic};
 use tokio::time::timeout;
 use tokio_tungstenite::tungstenite::{Message, protocol::WebSocketConfig};
+use zeroize::Zeroizing;
 
 use crate::{
     MidnightIndexerConfig, MidnightIndexerConfigError, MidnightLocalProvingConfig,
@@ -139,6 +140,59 @@ where
 /// circuits that are not built into the standalone proof server.
 pub trait MidnightRemoteProvingMaterialSource: Send + Sync {
     fn resolve_key(&self, key_location: &str) -> io::Result<Option<ProvingKeyMaterial>>;
+}
+
+/// The native wallet operation whose finalized transaction is being submitted.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum MidnightPreBroadcastKind {
+    Transfer,
+    DustRegistration,
+    ContractCall,
+}
+
+/// Borrowed evidence from one finalized, tagged Ledger 9 transaction.
+///
+/// Keep the payload private until broadcast. The ledger hash and identifiers
+/// use the lowercase hex encoding of the Ledger 9 WASM API.
+#[non_exhaustive]
+pub struct MidnightPreBroadcastEvidence<'a> {
+    pub kind: MidnightPreBroadcastKind,
+    pub profile_id: &'a str,
+    pub network_id: &'a str,
+    pub draft_id: &'a str,
+    pub planning_fingerprint: [u8; 32],
+    pub expires_at_seconds: u64,
+    pub transaction_bytes: &'a [u8],
+    pub ledger_transaction_hash: &'a str,
+    pub ledger_identifiers: &'a [String],
+    pub extrinsic_hash: [u8; 32],
+    pub finalized_anchor: [u8; 32],
+    pub fee_specks: u128,
+}
+
+/// Safe denial from the native pre-broadcast acknowledgement boundary.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct MidnightPreBroadcastDenied;
+
+/// Trusted native composition hook for a caller-owned durable submission record.
+///
+/// Return success only after recording the evidence durably. This runs on the
+/// submission worker. Keep it bounded and avoid re-entering the wallet.
+/// Cancellation, journal failure, or process death can prevent broadcast even
+/// after acknowledgement. Reconcile an acknowledged attempt before replacing it.
+pub trait MidnightPreBroadcast: Send + Sync {
+    fn acknowledge(
+        &self,
+        evidence: MidnightPreBroadcastEvidence<'_>,
+    ) -> Result<(), MidnightPreBroadcastDenied>;
+}
+
+/// Optional native integrations for a standalone wallet's live submitter.
+#[derive(Clone, Default)]
+pub struct MidnightStandaloneSubmissionOptions {
+    pub remote_proving_material: Option<Arc<dyn MidnightRemoteProvingMaterialSource>>,
+    pub pre_broadcast: Option<Arc<dyn MidnightPreBroadcast>>,
 }
 
 /// Validated public routes for the complete standalone transaction path.
@@ -493,7 +547,7 @@ pub(crate) struct LiveMidnightTransactionCompleter<C> {
     local_proving_gate: Arc<Mutex<()>>,
     dust_checkpoints: Arc<dyn MidnightDustCheckpointStore>,
     clock: Arc<C>,
-    remote_proving_material: Option<Arc<dyn MidnightRemoteProvingMaterialSource>>,
+    options: MidnightStandaloneSubmissionOptions,
 }
 
 impl<C> LiveMidnightTransactionCompleter<C> {
@@ -503,7 +557,7 @@ impl<C> LiveMidnightTransactionCompleter<C> {
             local_proving_gate: Arc::new(Mutex::new(())),
             dust_checkpoints: Arc::new(UnavailableMidnightDustCheckpointStore),
             clock,
-            remote_proving_material: None,
+            options: MidnightStandaloneSubmissionOptions::default(),
         }
     }
 
@@ -517,15 +571,15 @@ impl<C> LiveMidnightTransactionCompleter<C> {
             local_proving_gate: Arc::new(Mutex::new(())),
             dust_checkpoints,
             clock,
-            remote_proving_material: None,
+            options: MidnightStandaloneSubmissionOptions::default(),
         }
     }
 
-    pub(crate) fn with_remote_proving_material(
+    pub(crate) fn with_submission_options(
         mut self,
-        source: Arc<dyn MidnightRemoteProvingMaterialSource>,
+        options: MidnightStandaloneSubmissionOptions,
     ) -> Self {
-        self.remote_proving_material = Some(source);
+        self.options = options;
         self
     }
 }
@@ -688,7 +742,7 @@ where
                 &keys,
                 self.dust_checkpoints.as_ref(),
                 self.clock.as_ref(),
-                self.remote_proving_material.as_ref(),
+                &self.options,
             )
             .await
         })
@@ -701,7 +755,7 @@ async fn complete_live<C>(
     keys: &DustReplayKeys<'_>,
     checkpoints: &dyn MidnightDustCheckpointStore,
     clock: &C,
-    remote_proving_material: Option<&Arc<dyn MidnightRemoteProvingMaterialSource>>,
+    options: &MidnightStandaloneSubmissionOptions,
 ) -> Result<MidnightCompletionOutcome, WalletTransactionPortError>
 where
     C: ClockPort,
@@ -791,7 +845,12 @@ where
                 outcome.transaction
             }
             MidnightProvingMode::Remote { proof_server_url } => {
-                prove_via_http(balanced, proof_server_url, remote_proving_material.cloned()).await?
+                prove_via_http(
+                    balanced,
+                    proof_server_url,
+                    options.remote_proving_material.clone(),
+                )
+                .await?
             }
         };
         ensure_submission_active(&cancellation)?;
@@ -810,15 +869,33 @@ where
         required_fee = Some(sealed_fee);
     }
     let (sealed, fee_specks) = reconciled.ok_or(WalletTransactionPortError::InvalidChainState)?;
-    let mut transaction_bytes = Vec::new();
-    midnight_serialize::tagged_serialize(&sealed, &mut transaction_bytes)
+    let mut transaction_bytes = Zeroizing::new(Vec::new());
+    midnight_serialize::tagged_serialize(&sealed, &mut *transaction_bytes)
         .map_err(|_| WalletTransactionPortError::InvalidData)?;
     if transaction_bytes.len() > MAX_TRANSACTION_BYTES {
         return Err(WalletTransactionPortError::InvalidData);
     }
     ensure_submission_active(&cancellation)?;
-    let (transaction_hash, block_hash, block_height) =
-        submit_unsigned(config.node_route(), transaction_bytes, &request, fee_specks).await?;
+    let acknowledgement = if let Some(hook) = options.pre_broadcast.as_deref() {
+        Some(PreBroadcastAcknowledgement {
+            hook,
+            ledger_transaction_hash: ledger_hex(&sealed.transaction_hash())?,
+            ledger_identifiers: sealed
+                .identifiers()
+                .map(|id| ledger_hex(&id))
+                .collect::<Result<Vec<_>, _>>()?,
+        })
+    } else {
+        None
+    };
+    let (transaction_hash, block_hash, block_height) = submit_unsigned(
+        config.node_route(),
+        &transaction_bytes,
+        &request,
+        fee_specks,
+        acknowledgement,
+    )
+    .await?;
     Ok(MidnightCompletionOutcome {
         fee_specks,
         transaction_hash,
@@ -1813,11 +1890,65 @@ async fn prove_via_http(
     Ok(proved.seal(OsRng))
 }
 
+fn ledger_hex(
+    value: &impl midnight_serialize::Serializable,
+) -> Result<String, WalletTransactionPortError> {
+    let mut bytes = Vec::new();
+    value
+        .serialize(&mut bytes)
+        .map_err(|_| WalletTransactionPortError::InvalidData)?;
+    Ok(hex::encode(bytes))
+}
+
+struct PreBroadcastAcknowledgement<'a> {
+    hook: &'a dyn MidnightPreBroadcast,
+    ledger_transaction_hash: String,
+    ledger_identifiers: Vec<String>,
+}
+
+fn acknowledge_and_begin_broadcast(
+    request: &MidnightCompletionRequest,
+    transaction_bytes: &[u8],
+    fee_specks: u128,
+    extrinsic_hash: [u8; 32],
+    finalized_anchor: [u8; 32],
+    acknowledgement: Option<PreBroadcastAcknowledgement<'_>>,
+) -> Result<(), WalletTransactionPortError> {
+    if let Some(acknowledgement) = acknowledgement {
+        ensure_submission_active(&request.cancellation_token())?;
+        let (kind, profile_id, draft_id) = request.pre_broadcast_scope();
+        acknowledgement
+            .hook
+            .acknowledge(MidnightPreBroadcastEvidence {
+                kind,
+                profile_id,
+                network_id: request.network_id(),
+                draft_id,
+                planning_fingerprint: request.planning_fingerprint(),
+                expires_at_seconds: request.expires_at_seconds,
+                transaction_bytes,
+                ledger_transaction_hash: &acknowledgement.ledger_transaction_hash,
+                ledger_identifiers: &acknowledgement.ledger_identifiers,
+                extrinsic_hash,
+                finalized_anchor,
+                fee_specks,
+            })
+            .map_err(|_| WalletTransactionPortError::PreBroadcastDenied)?;
+    }
+    request.begin_broadcast(
+        fee_specks,
+        extrinsic_hash,
+        finalized_anchor,
+        WalletTransferSubmissionMode::Live,
+    )
+}
+
 async fn submit_unsigned(
     route: MidnightTransportRoute<'_>,
-    transaction: Vec<u8>,
+    transaction: &[u8],
     request: &MidnightCompletionRequest,
     fee_specks: u128,
+    acknowledgement: Option<PreBroadcastAcknowledgement<'_>>,
 ) -> Result<([u8; 32], [u8; 32], u64), WalletTransactionPortError> {
     let client = timeout(CONNECT_TIMEOUT, connect_midnight_node(route))
         .await
@@ -1837,11 +1968,13 @@ async fn submit_unsigned(
         .map_err(|_| WalletTransactionPortError::Timeout)?
         .map_err(|_| WalletTransactionPortError::Unavailable)?;
     let transaction_hash = unsigned.hash().0;
-    request.begin_broadcast(
+    acknowledge_and_begin_broadcast(
+        request,
+        transaction,
         fee_specks,
         transaction_hash,
         anchor.hash().0,
-        WalletTransferSubmissionMode::Live,
+        acknowledgement,
     )?;
     let mut progress = timeout(SUBMISSION_TIMEOUT, unsigned.submit_and_watch())
         .await
@@ -2088,7 +2221,9 @@ mod tests {
         submission_journal::{
             MemoryMidnightSubmissionJournalStore, MidnightSubmissionJournalStore,
         },
-        transaction::{MidnightSubmissionAttempt, MidnightSubmissionControl},
+        transaction::{
+            MidnightCompletionOrigin, MidnightSubmissionAttempt, MidnightSubmissionControl,
+        },
     };
     use tokio_tungstenite::{
         accept_hdr_async,
@@ -2192,11 +2327,11 @@ mod tests {
         }
     }
 
-    #[test]
-    fn transaction_submission_connection_failure_does_not_create_a_broadcast_record() {
-        let entry = submission_entry(StoredSubmissionState::Broadcasting);
-        let journal: Arc<dyn MidnightSubmissionJournalStore> =
-            Arc::new(MemoryMidnightSubmissionJournalStore::default());
+    fn completion_request(
+        entry: &StoredSubmissionJournalEntry,
+        journal: Arc<dyn MidnightSubmissionJournalStore>,
+        origin: MidnightCompletionOrigin,
+    ) -> (MidnightCompletionRequest, Arc<MidnightSubmissionControl>) {
         let control = Arc::new(MidnightSubmissionControl::new(
             MidnightSubmissionAttempt {
                 profile_id: entry.profile_id.clone(),
@@ -2206,7 +2341,7 @@ mod tests {
                 expires_at: entry.expires_at,
                 updated_at: entry.updated_at,
             },
-            Arc::clone(&journal),
+            journal,
         ));
         let request = MidnightCompletionRequest::new(
             Transaction::Standard(StandardTransaction::new(
@@ -2217,8 +2352,21 @@ mod tests {
             )),
             2,
             Arc::clone(&control),
+            origin,
         );
+        (request, control)
+    }
 
+    #[test]
+    fn transaction_submission_connection_failure_does_not_create_a_broadcast_record() {
+        let entry = submission_entry(StoredSubmissionState::Broadcasting);
+        let journal: Arc<dyn MidnightSubmissionJournalStore> =
+            Arc::new(MemoryMidnightSubmissionJournalStore::default());
+        let (request, control) = completion_request(
+            &entry,
+            Arc::clone(&journal),
+            MidnightCompletionOrigin::Transfer,
+        );
         let result = runtime().block_on(async {
             let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
                 .await
@@ -2235,9 +2383,10 @@ mod tests {
             let (result, ()) = tokio::join!(
                 submit_unsigned(
                     MidnightTransportRoute::new(&endpoint, None),
-                    vec![0],
+                    &[0],
                     &request,
-                    entry.fee_specks
+                    entry.fee_specks,
+                    None,
                 ),
                 disconnect,
             );
@@ -2256,6 +2405,121 @@ mod tests {
             control.public_state().expect("control state reads"),
             WalletTransactionSubmissionState::Running
         );
+    }
+
+    #[test]
+    fn acknowledgement_precedes_journaling_and_denial_or_cancellation_blocks_broadcast() {
+        #[derive(Clone, Copy)]
+        enum Decision {
+            Accept,
+            Deny,
+            Cancel,
+        }
+        struct Hook<'a> {
+            entry: &'a StoredSubmissionJournalEntry,
+            journal: &'a dyn MidnightSubmissionJournalStore,
+            control: &'a MidnightSubmissionControl,
+            decision: Decision,
+            kind: MidnightPreBroadcastKind,
+        }
+        impl MidnightPreBroadcast for Hook<'_> {
+            fn acknowledge(
+                &self,
+                evidence: MidnightPreBroadcastEvidence<'_>,
+            ) -> Result<(), MidnightPreBroadcastDenied> {
+                assert_eq!(evidence.kind, self.kind);
+                let (profile_id, draft_id) = if self.kind == MidnightPreBroadcastKind::ContractCall
+                {
+                    ("profile-portal", "did-deploy-1")
+                } else {
+                    (self.entry.profile_id.as_str(), self.entry.draft_id.as_str())
+                };
+                assert_eq!(evidence.profile_id, profile_id);
+                assert_eq!(evidence.draft_id, draft_id);
+                assert_eq!(evidence.network_id, self.entry.network_id.as_str());
+                assert_eq!(
+                    evidence.planning_fingerprint,
+                    self.entry.planning_fingerprint
+                );
+                assert_eq!(evidence.expires_at_seconds, 2);
+                assert_eq!(evidence.transaction_bytes, &[7, 4, 2]);
+                assert_eq!(evidence.ledger_transaction_hash, "abcd");
+                assert_eq!(evidence.ledger_identifiers, ["1122", "3344"]);
+                assert_eq!(evidence.extrinsic_hash, self.entry.transaction_hash);
+                assert_eq!(evidence.finalized_anchor, self.entry.anchor_block_hash);
+                assert_eq!(evidence.fee_specks, self.entry.fee_specks);
+                assert!(
+                    self.journal
+                        .load(&self.entry.profile_id, &self.entry.draft_id)
+                        .unwrap()
+                        .is_none()
+                );
+                match self.decision {
+                    Decision::Accept => Ok(()),
+                    Decision::Deny => Err(MidnightPreBroadcastDenied),
+                    Decision::Cancel => {
+                        self.control.request_cancellation().unwrap();
+                        Ok(())
+                    }
+                }
+            }
+        }
+
+        for (decision, expected) in [
+            (Decision::Accept, Ok(())),
+            (
+                Decision::Deny,
+                Err(WalletTransactionPortError::PreBroadcastDenied),
+            ),
+            (
+                Decision::Cancel,
+                Err(WalletTransactionPortError::SubmissionCancelled),
+            ),
+        ] {
+            for (origin, kind) in [
+                (
+                    MidnightCompletionOrigin::ContractCall {
+                        profile_id: WalletProfileId::parse("profile-portal").unwrap(),
+                        draft_id: "did-deploy-1".to_string(),
+                    },
+                    MidnightPreBroadcastKind::ContractCall,
+                ),
+                (
+                    MidnightCompletionOrigin::DustRegistration,
+                    MidnightPreBroadcastKind::DustRegistration,
+                ),
+            ] {
+                let entry = submission_entry(StoredSubmissionState::Broadcasting);
+                let journal: Arc<dyn MidnightSubmissionJournalStore> =
+                    Arc::new(MemoryMidnightSubmissionJournalStore::default());
+                let (request, control) = completion_request(&entry, Arc::clone(&journal), origin);
+                let hook = Hook {
+                    entry: &entry,
+                    journal: journal.as_ref(),
+                    control: &control,
+                    decision,
+                    kind,
+                };
+                let result = acknowledge_and_begin_broadcast(
+                    &request,
+                    &[7, 4, 2],
+                    entry.fee_specks,
+                    entry.transaction_hash,
+                    entry.anchor_block_hash,
+                    Some(PreBroadcastAcknowledgement {
+                        hook: &hook,
+                        ledger_transaction_hash: "abcd".to_owned(),
+                        ledger_identifiers: vec!["1122".to_owned(), "3344".to_owned()],
+                    }),
+                );
+                assert_eq!(result, expected);
+                assert_eq!(
+                    journal.load(&entry.profile_id, &entry.draft_id).unwrap(),
+                    expected.is_ok().then_some(entry),
+                );
+                assert_eq!(control.broadcast_started().unwrap(), expected.is_ok());
+            }
+        }
     }
 
     #[test]

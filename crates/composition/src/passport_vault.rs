@@ -372,7 +372,9 @@ const fn map_wallet_transaction_error(
         WalletError::DraftConflict => PassportVaultCallPortError::DraftConflict,
         WalletError::SubmissionInProgress => PassportVaultCallPortError::SubmissionInProgress,
         WalletError::SubmissionNotInProgress => PassportVaultCallPortError::SubmissionNotInProgress,
-        WalletError::SubmissionCancelled => PassportVaultCallPortError::SubmissionCancelled,
+        WalletError::SubmissionCancelled | WalletError::PreBroadcastDenied => {
+            PassportVaultCallPortError::SubmissionCancelled
+        }
         WalletError::SubmissionCancellationUnsafe => {
             PassportVaultCallPortError::SubmissionCancellationUnsafe
         }

@@ -57,6 +57,7 @@ use crate::{
     SimulatedMidnightAccountSource, UnavailableMidnightAccountDeriver,
     UnavailableMidnightAccountSource, midnight_asset, network_by_id,
     shielded_sync::MidnightShieldedTransferRequest,
+    submission::MidnightPreBroadcastKind,
     submission_journal::{
         MidnightSubmissionJournalStore, StoredSubmissionJournalEntry, StoredSubmissionState,
         SubmissionJournalStoreError,
@@ -301,10 +302,21 @@ pub trait MidnightContractCallSubmissionPort: Send + Sync {
 }
 
 #[derive(Clone)]
+pub(crate) enum MidnightCompletionOrigin {
+    Transfer,
+    DustRegistration,
+    ContractCall {
+        profile_id: WalletProfileId,
+        draft_id: String,
+    },
+}
+
+#[derive(Clone)]
 pub(crate) struct MidnightCompletionRequest {
     pub(crate) transaction: LedgerTransaction,
     pub(crate) expires_at_seconds: u64,
     control: Arc<MidnightSubmissionControl>,
+    origin: MidnightCompletionOrigin,
 }
 
 impl MidnightCompletionRequest {
@@ -312,12 +324,43 @@ impl MidnightCompletionRequest {
         transaction: LedgerTransaction,
         expires_at_seconds: u64,
         control: Arc<MidnightSubmissionControl>,
+        origin: MidnightCompletionOrigin,
     ) -> Self {
         Self {
             transaction,
             expires_at_seconds,
             control,
+            origin,
         }
+    }
+
+    pub(crate) fn pre_broadcast_scope(&self) -> (MidnightPreBroadcastKind, &str, &str) {
+        let kind = match &self.origin {
+            MidnightCompletionOrigin::Transfer => MidnightPreBroadcastKind::Transfer,
+            MidnightCompletionOrigin::DustRegistration => {
+                MidnightPreBroadcastKind::DustRegistration
+            }
+            MidnightCompletionOrigin::ContractCall {
+                profile_id,
+                draft_id,
+            } => {
+                return (
+                    MidnightPreBroadcastKind::ContractCall,
+                    profile_id.as_str(),
+                    draft_id,
+                );
+            }
+        };
+        let attempt = &self.control.attempt;
+        (kind, attempt.profile_id.as_str(), attempt.draft_id.as_str())
+    }
+
+    pub(crate) fn network_id(&self) -> &str {
+        self.control.attempt.network_id.as_str()
+    }
+
+    pub(crate) fn planning_fingerprint(&self) -> [u8; 32] {
+        self.control.attempt.planning_fingerprint
     }
 
     pub(crate) fn cancellation_token(&self) -> Arc<AtomicBool> {
@@ -1107,6 +1150,10 @@ where
                     transaction: transaction.clone(),
                     expires_at_seconds,
                     control: Arc::clone(&control),
+                    origin: MidnightCompletionOrigin::ContractCall {
+                        profile_id: profile_id.clone(),
+                        draft_id: request.draft_id.clone(),
+                    },
                 },
                 dust_seed,
             )
@@ -2113,6 +2160,7 @@ where
                                 transaction: transaction.clone(),
                                 expires_at_seconds,
                                 control: Arc::clone(&worker_control),
+                                origin: MidnightCompletionOrigin::Transfer,
                             },
                             dust_seed,
                         )

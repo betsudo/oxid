@@ -46,11 +46,11 @@ use crate::{
     MidnightWalletAdapter, SPECKS_PER_DUST, STARS_PER_NIGHT, midnight_asset, network_by_id,
     submission_journal::{StoredSubmissionJournalEntry, StoredSubmissionState},
     transaction::{
-        CancelSubmissionOnDrop, LedgerIntent, LedgerTransaction, MidnightCompletionOutcome,
-        MidnightCompletionRequest, MidnightRegistrationContext, MidnightSpendableUtxo,
-        MidnightSubmissionAttempt, MidnightSubmissionControl, MidnightSubmissionReconciliation,
-        MidnightTransactionAuthorizer, MidnightTransactionSource, decode_signature,
-        decode_verifying_key, verify_signature,
+        CancelSubmissionOnDrop, LedgerIntent, LedgerTransaction, MidnightCompletionOrigin,
+        MidnightCompletionOutcome, MidnightCompletionRequest, MidnightRegistrationContext,
+        MidnightSpendableUtxo, MidnightSubmissionAttempt, MidnightSubmissionControl,
+        MidnightSubmissionReconciliation, MidnightTransactionAuthorizer, MidnightTransactionSource,
+        decode_signature, decode_verifying_key, verify_signature,
     },
 };
 
@@ -431,6 +431,7 @@ where
                                 transaction.clone(),
                                 expires_at_seconds,
                                 Arc::clone(&worker_control),
+                                MidnightCompletionOrigin::DustRegistration,
                             ),
                             dust_seed,
                         )
@@ -1207,6 +1208,9 @@ const fn map_transaction_error(
             WalletDustRegistrationPortError::InvalidChainState
         }
         WalletTransactionPortError::ProvingFailed => WalletDustRegistrationPortError::ProvingFailed,
+        WalletTransactionPortError::PreBroadcastDenied => {
+            WalletDustRegistrationPortError::PreBroadcastDenied
+        }
         WalletTransactionPortError::SubmissionRejected => {
             WalletDustRegistrationPortError::SubmissionRejected
         }
