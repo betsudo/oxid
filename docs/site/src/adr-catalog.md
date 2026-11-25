@@ -153,6 +153,12 @@ ADR status and delivery state answer different questions:
 | [0123](https://github.com/MediaNoxLabs/oxid/blob/develop/docs/adr/0123-adopt-one-ledger9-ssi-cohort.md) Adopt one Ledger 9 SSI cohort | Accepted | ADR-0015/0118/0122; issues #1191–#1195 | Selects one immutable Ledger 9/Compact/ZK/identity graph, a read-only shared-stack attach contract, and a provider-first headless-to-iOS migration without compatibility shortcuts |
 | [0124](https://github.com/MediaNoxLabs/oxid/blob/develop/docs/adr/0124-separate-public-midnight-routes-from-transport-authentication.md) Separate public Midnight routes from transport authentication | Proposed | ADR-0098/0118/0123; issue #1200 | Keeps PreProd profiles query-free and applies a runtime credential at exact native transport routes |
 
+## Draft proposals
+
+- [Coordinate ordered Midnight ledger operations](https://github.com/MediaNoxLabs/oxid/blob/develop/docs/adr/draft-coordinate-ordered-ledger-operations.md)
+  specifies finalized execution, indexed visibility, and restart recovery for
+  dependent writes, starting with native DID publication. [Issue #1232](https://github.com/betsudo/oxid/issues/1232)
+
 ## Current boundaries
 
 M0 implements ADR-0001 through ADR-0006, the applicable policy portions of
