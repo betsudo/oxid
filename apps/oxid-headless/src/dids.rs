@@ -20,7 +20,8 @@ use crate::{
 };
 
 impl HeadlessWallet {
-    pub(super) fn deploy_did(&self, request: Request, status_only: bool) -> Dispatch {
+    pub(super) fn deploy_did(&self, request: Request) -> Dispatch {
+        let status_only = request.method == "did.deploy.status";
         let params = match serde_json::from_value::<DeployDidParams>(request.params) {
             Ok(params) => params,
             Err(_) => {
