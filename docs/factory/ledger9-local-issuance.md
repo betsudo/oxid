@@ -76,6 +76,10 @@ their authenticated observations and reports elapsed attempt and visibility
 wait times when measured. The diagnostic ring records only fixed publication
 event codes.
 
+The coordinator allows two automatic replacements per effect after verified
+rejection or expiry. It retains a durable pause and the confirmed prefix when
+that budget is exhausted.
+
 The local development wallet uses the bounded settlement worker to retry
 preparation while the funded NIGHT output or fee allowance settles. A wallet
 whose eligible outputs cannot cover the fee shows **Add more NIGHT to enable
@@ -218,6 +222,11 @@ Once the expected faucet is listening, run these in the first terminal:
 run_portal_test testPrepareHolder 1800
 run_portal_test testFundedWalletRecoversAcrossRestart 600
 ```
+
+To qualify DID publication recovery itself, use a fresh disposable simulator
+and run `run_portal_test testDidPublicationRecoversAcrossRestart 1800` in place
+of those two selectors. It stops the app while publication has a partial
+finalized prefix and resumes from the identity inventory after a cold launch.
 
 The journey must perform, in order:
 

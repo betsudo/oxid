@@ -251,6 +251,7 @@ pub enum DidDeploymentFailure {
     InsufficientDust,
     ProvingUnavailable,
     SubmissionRejected,
+    AttemptLimitReached,
     ResolutionUnavailable,
     ResolutionMismatch,
     PersistenceUnavailable,
@@ -271,6 +272,7 @@ impl DidDeploymentFailure {
             Self::InsufficientDust => "insufficient_dust",
             Self::ProvingUnavailable => "proving_unavailable",
             Self::SubmissionRejected => "submission_rejected",
+            Self::AttemptLimitReached => "attempt_limit_reached",
             Self::ResolutionUnavailable => "resolution_unavailable",
             Self::ResolutionMismatch => "resolution_mismatch",
             Self::PersistenceUnavailable => "persistence_unavailable",
@@ -671,6 +673,7 @@ impl DidDeploymentOperation {
     pub fn replace_attempt(
         self,
         now: UnixTimestampMillis,
+        replacement_limit: u32,
     ) -> Result<Self, DidDeploymentOperationError> {
         if !matches!(
             self.state,
@@ -682,7 +685,13 @@ impl DidDeploymentOperation {
         {
             return Err(DidDeploymentOperationError::InvalidTransition);
         }
-        self.reset_attempt(now)
+        let mut replacement = self.reset_attempt(now)?;
+        if replacement.attempt > replacement_limit {
+            replacement.state = DidDeploymentState::RetryableFailure;
+            replacement.resume_from = Some(DidDeploymentState::Composing);
+            replacement.failure = Some(DidDeploymentFailure::AttemptLimitReached);
+        }
+        Ok(replacement)
     }
 
     pub fn renew_unarmed_attempt(
@@ -1370,12 +1379,43 @@ mod tests {
             .expect("submitting")
             .outcome_unknown(UnixTimestampMillis::new(5_000))
             .expect("unknown")
-            .replace_attempt(UnixTimestampMillis::new(6_000))
+            .replace_attempt(UnixTimestampMillis::new(6_000), 2)
             .expect("authoritative replacement");
         assert_eq!(operation.state(), DidDeploymentState::Composing);
         assert_eq!(operation.attempt(), 1);
         assert_eq!(operation.submission_id(), None);
         assert!(operation.receipts().is_empty());
+    }
+
+    #[test]
+    fn exhausted_replacements_pause_in_the_same_durable_transition() {
+        let operation = operation()
+            .composed(
+                did(),
+                "closed-attempt".to_owned(),
+                UnixTimestampMillis::new(2_000),
+            )
+            .unwrap()
+            .transition(DidDeploymentState::Proving, UnixTimestampMillis::new(3_000))
+            .unwrap()
+            .transition(
+                DidDeploymentState::Submitting,
+                UnixTimestampMillis::new(4_000),
+            )
+            .unwrap();
+        let paused = operation
+            .clone()
+            .replace_attempt(UnixTimestampMillis::new(5_000), 0)
+            .unwrap();
+        assert_eq!(paused.revision(), operation.revision() + 1);
+        assert_eq!(paused.state(), DidDeploymentState::RetryableFailure);
+        assert_eq!(
+            paused.failure(),
+            Some(DidDeploymentFailure::AttemptLimitReached)
+        );
+        assert_eq!(paused.resume_from(), Some(DidDeploymentState::Composing));
+        assert!(paused.submission_id().is_none());
+        assert!(DidDeploymentOperation::restore(paused.to_parts()).is_ok());
     }
 
     #[test]

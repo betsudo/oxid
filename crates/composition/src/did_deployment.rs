@@ -46,6 +46,7 @@ use sha2::{Digest, Sha256};
 use zeroize::Zeroizing;
 
 const DEPLOYMENT_TTL_MILLIS: u64 = 60 * 60 * 1_000;
+const MAX_AUTOMATIC_REPLACEMENTS: u32 = 2;
 
 struct NativeDidProvingMaterialSource {
     artifacts: MidnightDidCompactArtifacts,
@@ -689,6 +690,9 @@ impl NativeDidDeploymentService {
                     continue;
                 }
                 DidDeploymentState::RetryableFailure => {
+                    if operation.failure() == Some(DidDeploymentFailure::AttemptLimitReached) {
+                        return Ok(operation);
+                    }
                     let resume = operation
                         .resume_from()
                         .ok_or(NativeDidDeploymentError::Integrity)?;
@@ -925,8 +929,15 @@ impl NativeDidDeploymentService {
                 // states: it has checked finalized rejection or canonical
                 // coverage through the journaled anchor and deadline. A new
                 // identity/deadline is therefore safe; no receipt is lost.
-                let replacement = operation.replace_attempt(self.now()?)?;
+                let replacement =
+                    operation.replace_attempt(self.now()?, MAX_AUTOMATIC_REPLACEMENTS)?;
                 self.operations.upsert(replacement.clone())?;
+                if replacement.failure() == Some(DidDeploymentFailure::AttemptLimitReached) {
+                    self.diagnostics.record(
+                        DiagnosticCode::IdentityDidPublicationPaused,
+                        DiagnosticSeverity::Warning,
+                    );
+                }
                 Ok(replacement)
             }
         }

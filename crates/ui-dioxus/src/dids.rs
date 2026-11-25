@@ -533,6 +533,11 @@ pub(super) fn DidsPage(
                                             Ok(Ok(operation)) if operation.state() == DidDeploymentState::RetryableFailure => {
                                                 let failure = operation.failure().map_or("unknown", |failure| failure.as_str());
                                                 pending_deployment.set(Some(operation));
+                                                if failure == "attempt_limit_reached" {
+                                                    did_creation.set(DidCreationState::Failed);
+                                                    did_creation_notice.set(Some("DID publication is paused after repeated unsuccessful transactions. Your confirmed progress is saved.".to_owned()));
+                                                    return;
+                                                }
                                                 if failure == "protection_locked" {
                                                     did_creation.set(DidCreationState::Ready);
                                                     did_creation_notice.set(Some("Unlock this wallet to continue DID publication.".to_owned()));

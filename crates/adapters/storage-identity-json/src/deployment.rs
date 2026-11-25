@@ -509,6 +509,7 @@ fn parse_failure(value: &str) -> Result<DidDeploymentFailure, DidDeploymentOpera
         "insufficient_dust" => Ok(DidDeploymentFailure::InsufficientDust),
         "proving_unavailable" => Ok(DidDeploymentFailure::ProvingUnavailable),
         "submission_rejected" => Ok(DidDeploymentFailure::SubmissionRejected),
+        "attempt_limit_reached" => Ok(DidDeploymentFailure::AttemptLimitReached),
         "resolution_unavailable" => Ok(DidDeploymentFailure::ResolutionUnavailable),
         "resolution_mismatch" => Ok(DidDeploymentFailure::ResolutionMismatch),
         "persistence_unavailable" => Ok(DidDeploymentFailure::PersistenceUnavailable),
