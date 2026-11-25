@@ -18,7 +18,7 @@ let
 in
 stdenvNoCC.mkDerivation {
   pname = "oxid-midnight-did-ledger9-artifacts";
-  version = "0.5.0-e7e28ee";
+  version = "0.5.0-a18fc76";
 
   src = midnightIdentitySource;
   nativeBuildInputs = [
@@ -49,7 +49,7 @@ stdenvNoCC.mkDerivation {
     cp crates/midnight-did-runtime/assets/rust-compatibility.json "$out/"
 
     jq -n \
-      --arg gitSha "e7e28eea94515d59b5e7360a717f5c0dee3eecdf" \
+      --arg gitSha "a18fc76406db35bf38fb0618b2102ef97e31dc7c" \
       --arg version "0.5.0" \
       --argjson circuits ${lib.escapeShellArg (builtins.toJSON circuits)} \
       '
@@ -106,7 +106,7 @@ stdenvNoCC.mkDerivation {
 
   meta = {
     description = "Ledger 9 Midnight DID bootstrap and deactivation proving closure";
-    homepage = "https://github.com/betsudo/midnight-identity/pull/110";
+    homepage = "https://github.com/betsudo/midnight-identity";
     license = lib.licenses.asl20;
   };
 }

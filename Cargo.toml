@@ -133,10 +133,10 @@ k256 = { version = "=0.14.0", default-features = false, features = ["schnorr", "
 midnight-base-crypto = { version = "=1.1.1", git = "https://github.com/betsudo/midnight-ledger", rev = "6fbc2e3900845a858f70eebf8a0deab1d4d3c0d6", package = "midnight-base-crypto" }
 midnight-coin-structure = { version = "=3.0.1", git = "https://github.com/betsudo/midnight-ledger", rev = "6fbc2e3900845a858f70eebf8a0deab1d4d3c0d6", package = "midnight-coin-structure" }
 midnight-compact-runtime = { version = "=0.2.0", git = "https://github.com/betsudo/compact", rev = "d6513a24debac14d43a8199460d9dc2c6d9af2b1", package = "midnight-compact-runtime", features = ["experimental-functional"] }
-midnight-did-domain = { version = "=0.5.0", git = "https://github.com/betsudo/midnight-identity", rev = "e7e28eea94515d59b5e7360a717f5c0dee3eecdf" }
-midnight-did-jubjub-schnorr = { version = "=0.5.0", git = "https://github.com/betsudo/midnight-identity", rev = "e7e28eea94515d59b5e7360a717f5c0dee3eecdf" }
-midnight-did-runtime = { version = "=0.5.0", git = "https://github.com/betsudo/midnight-identity", rev = "e7e28eea94515d59b5e7360a717f5c0dee3eecdf", default-features = false, features = ["ledger-transaction"] }
-midnight-vc-proof = { version = "=0.5.0", git = "https://github.com/betsudo/midnight-identity", rev = "e7e28eea94515d59b5e7360a717f5c0dee3eecdf" }
+midnight-did-domain = { version = "=0.5.0", git = "https://github.com/betsudo/midnight-identity", rev = "a18fc76406db35bf38fb0618b2102ef97e31dc7c" }
+midnight-did-jubjub-schnorr = { version = "=0.5.0", git = "https://github.com/betsudo/midnight-identity", rev = "a18fc76406db35bf38fb0618b2102ef97e31dc7c" }
+midnight-did-runtime = { version = "=0.5.0", git = "https://github.com/betsudo/midnight-identity", rev = "a18fc76406db35bf38fb0618b2102ef97e31dc7c", default-features = false, features = ["ledger-transaction"] }
+midnight-vc-proof = { version = "=0.5.0", git = "https://github.com/betsudo/midnight-identity", rev = "a18fc76406db35bf38fb0618b2102ef97e31dc7c" }
 midnight-ledger = { package = "midnight-ledger-v9", version = "=1.0.2", git = "https://github.com/betsudo/midnight-ledger", rev = "6fbc2e3900845a858f70eebf8a0deab1d4d3c0d6", default-features = false }
 midnight-onchain-state = { version = "=4.0.1", git = "https://github.com/betsudo/midnight-ledger", rev = "6fbc2e3900845a858f70eebf8a0deab1d4d3c0d6", package = "midnight-onchain-state", features = ["public-internal-structure"] }
 midnight-onchain-runtime = { version = "=4.0.1", git = "https://github.com/betsudo/midnight-ledger", rev = "6fbc2e3900845a858f70eebf8a0deab1d4d3c0d6", package = "midnight-onchain-runtime" }

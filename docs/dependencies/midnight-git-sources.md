@@ -18,10 +18,11 @@ schema, Rust MSRV, and shared-stack releases.
 | `betsudo/compact` | `d6513a24debac14d43a8199460d9dc2c6d9af2b1` | Compact Rust AST/runtime ABI 54 |
 | `betsudo/midnight-zk` | `bca8db4d9e2c1ecaa5d1db5ba7a201935b6c6c8a` | proving implementation selected by Ledger 9 |
 | `betsudo/midnight-zkir` | `3377ad9e48741f60e0aa17010b6f23e34223d906` | ZKIR 3.2.1, schema 20 |
-| `betsudo/midnight-identity` | `e7e28eea94515d59b5e7360a717f5c0dee3eecdf` | merged Ledger 9 DID/VC release source |
+| `betsudo/midnight-identity` | `a18fc76406db35bf38fb0618b2102ef97e31dc7c` | merged Ledger 9 DID/VC release source |
 
-The identity revision is the immutable merge commit of upstream PR
-`betsudo/midnight-identity#110` and is admitted for release qualification.
+The identity revision includes the Rust/TypeScript DID parity changes from
+`betsudo/midnight-identity#122` and the indexed-address fallback from
+`betsudo/midnight-identity#120`, whose merge commit is pinned above.
 
 ## Required source form
 

@@ -46,9 +46,9 @@
     },
     "nativeIdentity": {
       "repository": "https://github.com/betsudo/midnight-identity",
-      "revision": "e7e28eea94515d59b5e7360a717f5c0dee3eecdf",
+      "revision": "a18fc76406db35bf38fb0618b2102ef97e31dc7c",
       "packageVersion": "0.5.0",
-      "upstreamPullRequest": 110,
+      "upstreamPullRequest": 120,
       "mergeRequiredBeforeRelease": false
     }
   },

@@ -104,6 +104,20 @@ const LEDGER9_SOURCE: PortalSource = PortalSource {
         "../../../../fixtures/laceid-portal/154ad777456ab40ab2f46a8b94959ae63b14a459/openid4vci-final/provenance.json"
     ),
 };
+const LEDGER9_SOURCES: &[PortalSource] = &[
+    LEDGER9_SOURCE,
+    PortalSource {
+        commit: "12b4b1baef544e514e6d35c6ba8b5b18bebf611c",
+        tree: "6aaa3b3cf557d6d28248269012925fd29d5f2cef",
+        provenance_sha256: "1f167d0f8eb0b9db543381afba49ffd75b0c5a77a5adc949a303f90bc2a6e748",
+        lock: include_bytes!(
+            "../../../../fixtures/laceid-portal/12b4b1baef544e514e6d35c6ba8b5b18bebf611c/source-lock.json"
+        ),
+        provenance: include_bytes!(
+            "../../../../fixtures/laceid-portal/12b4b1baef544e514e6d35c6ba8b5b18bebf611c/openid4vci-final/provenance.json"
+        ),
+    },
+];
 const BUNDLED_SOURCE: PortalSource = PortalSource {
     commit: PORTAL_INTEGRATION_COMMIT,
     tree: PORTAL_INTEGRATION_TREE,
@@ -321,7 +335,7 @@ impl PortalDeploymentManifest {
             && !matches!(self.routes, PortalManifestRoutes::Public { .. })
         {
             &BUNDLED_SOURCE
-        } else if LEDGER9_SOURCE.matches(self) {
+        } else if let Some(source) = LEDGER9_SOURCES.iter().find(|source| source.matches(self)) {
             let routes_match = match &self.routes {
                 PortalManifestRoutes::Local => {
                     self.issuer_origin == "http://127.0.0.1:8090"
@@ -356,7 +370,7 @@ impl PortalDeploymentManifest {
             if !routes_match {
                 return Err(PortalDeploymentManifestError::InvalidOrigin);
             }
-            &LEDGER9_SOURCE
+            source
         } else {
             return Err(PortalDeploymentManifestError::SourceLockMismatch);
         };
@@ -399,7 +413,7 @@ impl PortalDeploymentManifest {
 
     #[must_use]
     pub fn uses_ledger9_jubjub_jwk(&self) -> bool {
-        LEDGER9_SOURCE.matches(self)
+        LEDGER9_SOURCES.iter().any(|source| source.matches(self))
     }
 
     #[must_use]

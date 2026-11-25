@@ -117,7 +117,7 @@
       cargoOutputHashes = {
         "midnight-base-crypto-1.1.1" = "sha256-7nPujsILZToXHIBcRemu8NLrxmrg2+QM4sKPsJwGgu0=";
         "midnight-compact-runtime-0.2.0" = "sha256-Z7UM69FOS0DWefFGW71GlEz2lYWTOFoi1XnekD2jgM8=";
-        "midnight-did-domain-0.5.0" = "sha256-J684SunbTIK8fblcMAtBg7lTFj0lzyzpiRNDW9w2Uv4=";
+        "midnight-did-domain-0.5.0" = "sha256-Wmjac1/kVmARyAWPx3RCzA6UL+AN+KttmoTC14N/laA=";
         "midnight-proofs-0.8.2" = "sha256-lofqa58hDlJ0C3vIWFodsdwYYwYoPEDpS1PMGV9TULg=";
         "midnight-zkir-3.2.1" = "sha256-GtULoNDWGXjgIf9Vh8C4OXKlRLwm37lDQ+f0DAay/9c=";
       };

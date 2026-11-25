@@ -15,7 +15,7 @@ Oxid selects one Ledger 9 cohort for its native production graph:
 | `betsudo/compact` | `d6513a24debac14d43a8199460d9dc2c6d9af2b1` | Rust runtime `0.2.0`, ABI 54 |
 | `betsudo/midnight-zk` | `bca8db4d9e2c1ecaa5d1db5ba7a201935b6c6c8a` | `midnight-proofs 0.8.2` |
 | `betsudo/midnight-zkir` | `3377ad9e48741f60e0aa17010b6f23e34223d906` | ZKIR `3.2.1`, schema 20 |
-| `betsudo/midnight-identity` | `e7e28eea94515d59b5e7360a717f5c0dee3eecdf` | merged DID/VC Ledger 9 release source `0.5.0` |
+| `betsudo/midnight-identity` | `a18fc76406db35bf38fb0618b2102ef97e31dc7c` | merged DID/VC Ledger 9 release source `0.5.0` |
 
 Preview and PreProd history includes events encoded before the Ledger 9
 upgrade. The adapter's optional `mixed-era-replay` feature pins the published
@@ -25,8 +25,9 @@ transaction construction, proving, and DID/VC calls. The source check admits
 only the exact replay aliases in `wallet.historicalReplay`. See [the public
 issuance runbook](../factory/ledger9-public-issuance.md#replay-wallet-history-across-the-ledger-9-upgrade).
 
-The identity revision is the immutable merge commit of upstream PR
-`betsudo/midnight-identity#110` and is the qualified release source.
+The identity revision includes the Rust/TypeScript DID parity changes from
+`betsudo/midnight-identity#122` and the indexed-address fallback from
+`betsudo/midnight-identity#120`, whose merge commit is pinned above.
 
 ## Runtime topology
 
