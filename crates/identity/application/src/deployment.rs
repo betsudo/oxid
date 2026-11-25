@@ -23,6 +23,9 @@ pub enum DidDeploymentState {
     Proving,
     Submitting,
     Confirming,
+    /// Canonical execution is durable; authenticated postcondition observation
+    /// is still required before the next ledger effect may start.
+    AwaitingVisibility,
     Resolving,
     Ready,
     RetryableFailure,
@@ -38,6 +41,7 @@ impl DidDeploymentState {
             Self::Proving => "proving",
             Self::Submitting => "submitting",
             Self::Confirming => "confirming",
+            Self::AwaitingVisibility => "awaiting_visibility",
             Self::Resolving => "resolving",
             Self::Ready => "ready",
             Self::RetryableFailure => "retryable_failure",
@@ -114,6 +118,7 @@ pub struct DidDeploymentReceipt {
     transaction_hash_hex: String,
     block_hash_hex: String,
     block_height: u64,
+    attempt_elapsed_millis: Option<u64>,
 }
 
 impl DidDeploymentReceipt {
@@ -123,6 +128,7 @@ impl DidDeploymentReceipt {
         transaction_hash_hex: String,
         block_hash_hex: String,
         block_height: u64,
+        attempt_elapsed_millis: Option<u64>,
     ) -> Result<Self, DidDeploymentOperationError> {
         if !effect.is_transaction()
             || submission_id.is_empty()
@@ -138,6 +144,7 @@ impl DidDeploymentReceipt {
             transaction_hash_hex,
             block_hash_hex,
             block_height,
+            attempt_elapsed_millis,
         })
     }
 
@@ -164,6 +171,69 @@ impl DidDeploymentReceipt {
     #[must_use]
     pub const fn block_height(&self) -> u64 {
         self.block_height
+    }
+
+    #[must_use]
+    pub const fn attempt_elapsed_millis(&self) -> Option<u64> {
+        self.attempt_elapsed_millis
+    }
+}
+
+/// Authenticated state observation for a finalized effect. The Midnight action
+/// hash is intentionally retained separately from the enclosing Substrate
+/// extrinsic hash in [`DidDeploymentReceipt`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DidDeploymentObservation {
+    effect: DidDeploymentEffect,
+    action_transaction_hash_hex: String,
+    action_block_hash_hex: String,
+    action_block_height: u64,
+    visibility_wait_millis: Option<u64>,
+}
+
+impl DidDeploymentObservation {
+    pub fn restore(
+        effect: DidDeploymentEffect,
+        action_transaction_hash_hex: String,
+        action_block_hash_hex: String,
+        action_block_height: u64,
+        visibility_wait_millis: Option<u64>,
+    ) -> Result<Self, DidDeploymentOperationError> {
+        if !effect.is_transaction()
+            || !is_lower_hex_32(&action_transaction_hash_hex)
+            || !is_lower_hex_32(&action_block_hash_hex)
+        {
+            return Err(DidDeploymentOperationError::InvalidData);
+        }
+        Ok(Self {
+            effect,
+            action_transaction_hash_hex,
+            action_block_hash_hex,
+            action_block_height,
+            visibility_wait_millis,
+        })
+    }
+
+    #[must_use]
+    pub const fn effect(&self) -> DidDeploymentEffect {
+        self.effect
+    }
+    #[must_use]
+    pub fn action_transaction_hash_hex(&self) -> &str {
+        &self.action_transaction_hash_hex
+    }
+    #[must_use]
+    pub fn action_block_hash_hex(&self) -> &str {
+        &self.action_block_hash_hex
+    }
+    #[must_use]
+    pub const fn action_block_height(&self) -> u64 {
+        self.action_block_height
+    }
+
+    #[must_use]
+    pub const fn visibility_wait_millis(&self) -> Option<u64> {
+        self.visibility_wait_millis
     }
 }
 
@@ -214,6 +284,7 @@ pub struct DidDeploymentOperation {
     operation_id: DidDeploymentOperationId,
     profile_id: IdentityProfileId,
     network: MidnightNetwork,
+    account_index: Option<u32>,
     state: DidDeploymentState,
     resume_from: Option<DidDeploymentState>,
     failure: Option<DidDeploymentFailure>,
@@ -221,6 +292,13 @@ pub struct DidDeploymentOperation {
     did: Option<MidnightDid>,
     submission_id: Option<String>,
     receipts: Vec<DidDeploymentReceipt>,
+    observations: Vec<DidDeploymentObservation>,
+    legacy_observations_pending: bool,
+    /// Monotonic durable generation used to fence stale workers.
+    revision: u64,
+    /// Zero-based replacement counter for the current effect.
+    attempt: u32,
+    attempt_started_at: UnixTimestampMillis,
     transaction_hash_hex: Option<String>,
     block_hash_hex: Option<String>,
     block_height: Option<u64>,
@@ -235,6 +313,7 @@ pub struct DidDeploymentOperationParts {
     pub operation_id: DidDeploymentOperationId,
     pub profile_id: IdentityProfileId,
     pub network: MidnightNetwork,
+    pub account_index: Option<u32>,
     pub state: DidDeploymentState,
     pub resume_from: Option<DidDeploymentState>,
     pub failure: Option<DidDeploymentFailure>,
@@ -242,6 +321,11 @@ pub struct DidDeploymentOperationParts {
     pub did: Option<MidnightDid>,
     pub submission_id: Option<String>,
     pub receipts: Vec<DidDeploymentReceipt>,
+    pub observations: Vec<DidDeploymentObservation>,
+    pub legacy_observations_pending: bool,
+    pub revision: u64,
+    pub attempt: u32,
+    pub attempt_started_at_millis: u64,
     pub transaction_hash_hex: Option<String>,
     pub block_hash_hex: Option<String>,
     pub block_height: Option<u64>,
@@ -254,6 +338,7 @@ impl DidDeploymentOperation {
         operation_id: DidDeploymentOperationId,
         profile_id: IdentityProfileId,
         network: MidnightNetwork,
+        account_index: u32,
         now: UnixTimestampMillis,
     ) -> Result<Self, DidDeploymentOperationError> {
         if network == MidnightNetwork::Offchain || now.value() == 0 {
@@ -263,6 +348,7 @@ impl DidDeploymentOperation {
             operation_id,
             profile_id,
             network,
+            account_index: Some(account_index),
             state: DidDeploymentState::Composing,
             resume_from: None,
             failure: None,
@@ -270,6 +356,11 @@ impl DidDeploymentOperation {
             did: None,
             submission_id: None,
             receipts: Vec::new(),
+            observations: Vec::new(),
+            legacy_observations_pending: false,
+            revision: 0,
+            attempt: 0,
+            attempt_started_at: now,
             transaction_hash_hex: None,
             block_hash_hex: None,
             block_height: None,
@@ -285,6 +376,7 @@ impl DidDeploymentOperation {
             operation_id: parts.operation_id,
             profile_id: parts.profile_id,
             network: parts.network,
+            account_index: parts.account_index,
             state: parts.state,
             resume_from: parts.resume_from,
             failure: parts.failure,
@@ -292,6 +384,11 @@ impl DidDeploymentOperation {
             did: parts.did,
             submission_id: parts.submission_id,
             receipts: parts.receipts,
+            observations: parts.observations,
+            legacy_observations_pending: parts.legacy_observations_pending,
+            revision: parts.revision,
+            attempt: parts.attempt,
+            attempt_started_at: UnixTimestampMillis::new(parts.attempt_started_at_millis),
             transaction_hash_hex: parts.transaction_hash_hex,
             block_hash_hex: parts.block_hash_hex,
             block_height: parts.block_height,
@@ -308,6 +405,7 @@ impl DidDeploymentOperation {
             operation_id: self.operation_id.clone(),
             profile_id: self.profile_id.clone(),
             network: self.network,
+            account_index: self.account_index,
             state: self.state,
             resume_from: self.resume_from,
             failure: self.failure,
@@ -315,6 +413,11 @@ impl DidDeploymentOperation {
             did: self.did.clone(),
             submission_id: self.submission_id.clone(),
             receipts: self.receipts.clone(),
+            observations: self.observations.clone(),
+            legacy_observations_pending: self.legacy_observations_pending,
+            revision: self.revision,
+            attempt: self.attempt,
+            attempt_started_at_millis: self.attempt_started_at.value(),
             transaction_hash_hex: self.transaction_hash_hex.clone(),
             block_hash_hex: self.block_hash_hex.clone(),
             block_height: self.block_height,
@@ -371,6 +474,41 @@ impl DidDeploymentOperation {
     #[must_use]
     pub fn receipts(&self) -> &[DidDeploymentReceipt] {
         &self.receipts
+    }
+
+    #[must_use]
+    pub fn observations(&self) -> &[DidDeploymentObservation] {
+        &self.observations
+    }
+
+    #[must_use]
+    pub fn next_observation_receipt(&self) -> Option<&DidDeploymentReceipt> {
+        self.receipts.get(self.observations.len())
+    }
+
+    #[must_use]
+    pub const fn legacy_observations_pending(&self) -> bool {
+        self.legacy_observations_pending
+    }
+
+    #[must_use]
+    pub const fn revision(&self) -> u64 {
+        self.revision
+    }
+
+    #[must_use]
+    pub const fn account_index(&self) -> Option<u32> {
+        self.account_index
+    }
+
+    #[must_use]
+    pub const fn attempt(&self) -> u32 {
+        self.attempt
+    }
+
+    #[must_use]
+    pub const fn attempt_started_at(&self) -> UnixTimestampMillis {
+        self.attempt_started_at
     }
 
     #[must_use]
@@ -457,6 +595,10 @@ impl DidDeploymentOperation {
         }
         self.state = next;
         self.updated_at = now;
+        self.revision = self
+            .revision
+            .checked_add(1)
+            .ok_or(DidDeploymentOperationError::Integrity)?;
         if !matches!(
             next,
             DidDeploymentState::RetryableFailure | DidDeploymentState::OutcomeUnknown
@@ -494,6 +636,10 @@ impl DidDeploymentOperation {
         self.failure = Some(failure);
         self.state = DidDeploymentState::RetryableFailure;
         self.updated_at = now;
+        self.revision = self
+            .revision
+            .checked_add(1)
+            .ok_or(DidDeploymentOperationError::Integrity)?;
         Ok(self)
     }
 
@@ -512,6 +658,70 @@ impl DidDeploymentOperation {
         self.failure = None;
         self.state = DidDeploymentState::OutcomeUnknown;
         self.updated_at = now;
+        self.revision = self
+            .revision
+            .checked_add(1)
+            .ok_or(DidDeploymentOperationError::Integrity)?;
+        Ok(self)
+    }
+
+    /// Closes an attempt only after the submission journal has authoritative
+    /// finalized rejection or expiry evidence. The next composition receives a
+    /// fresh durable submission identity; confirmed predecessor receipts stay.
+    pub fn replace_attempt(
+        self,
+        now: UnixTimestampMillis,
+    ) -> Result<Self, DidDeploymentOperationError> {
+        if !matches!(
+            self.state,
+            DidDeploymentState::Submitting
+                | DidDeploymentState::Confirming
+                | DidDeploymentState::OutcomeUnknown
+        ) || self.submission_id.is_none()
+            || now.value() < self.updated_at.value()
+        {
+            return Err(DidDeploymentOperationError::InvalidTransition);
+        }
+        self.reset_attempt(now)
+    }
+
+    pub fn renew_unarmed_attempt(
+        self,
+        now: UnixTimestampMillis,
+    ) -> Result<Self, DidDeploymentOperationError> {
+        if !matches!(
+            self.state,
+            DidDeploymentState::Composing
+                | DidDeploymentState::Funding
+                | DidDeploymentState::Proving
+        ) || now.value() < self.updated_at.value()
+        {
+            return Err(DidDeploymentOperationError::InvalidTransition);
+        }
+        self.reset_attempt(now)
+    }
+
+    fn reset_attempt(
+        mut self,
+        now: UnixTimestampMillis,
+    ) -> Result<Self, DidDeploymentOperationError> {
+        self.submission_id = None;
+        if self.effect == DidDeploymentEffect::DeployContract {
+            self.did = None;
+        }
+        self.attempt = self
+            .attempt
+            .checked_add(1)
+            .ok_or(DidDeploymentOperationError::Integrity)?;
+        self.state = DidDeploymentState::Composing;
+        self.failure = None;
+        self.resume_from = None;
+        self.attempt_started_at = now;
+        self.updated_at = now;
+        self.revision = self
+            .revision
+            .checked_add(1)
+            .ok_or(DidDeploymentOperationError::Integrity)?;
         Ok(self)
     }
 
@@ -542,26 +752,80 @@ impl DidDeploymentOperation {
             transaction_hash_hex: transaction_hash_hex.clone(),
             block_hash_hex: block_hash_hex.clone(),
             block_height,
+            attempt_elapsed_millis: Some(
+                now.value().saturating_sub(self.attempt_started_at.value()),
+            ),
         });
         self.transaction_hash_hex = Some(transaction_hash_hex);
         self.block_hash_hex = Some(block_hash_hex);
         self.block_height = Some(block_height);
+        // Finalized execution and state visibility are separate durable facts.
+        // Keep the cursor on this effect until an authenticated observation
+        // attributable to this receipt has been saved.
+        self.transition(DidDeploymentState::AwaitingVisibility, now)
+    }
+
+    /// Persists an authenticated postcondition bound to the current finalized
+    /// receipt, then advances the cursor exactly once.
+    pub fn observed(
+        mut self,
+        action_transaction_hash_hex: String,
+        action_block_hash_hex: String,
+        action_block_height: u64,
+        now: UnixTimestampMillis,
+    ) -> Result<Self, DidDeploymentOperationError> {
+        if (self.state != DidDeploymentState::AwaitingVisibility
+            && !self.legacy_observations_pending)
+            || now.value() < self.updated_at.value()
+        {
+            return Err(DidDeploymentOperationError::InvalidTransition);
+        }
+        let receipt = self
+            .next_observation_receipt()
+            .ok_or(DidDeploymentOperationError::InvalidTransition)?;
+        if action_block_hash_hex != receipt.block_hash_hex()
+            || action_block_height != receipt.block_height()
+        {
+            return Err(DidDeploymentOperationError::InvalidData);
+        }
+        self.observations.push(DidDeploymentObservation::restore(
+            receipt.effect(),
+            action_transaction_hash_hex,
+            action_block_hash_hex,
+            action_block_height,
+            (self.state == DidDeploymentState::AwaitingVisibility
+                && !self.legacy_observations_pending)
+                .then(|| now.value().saturating_sub(self.updated_at.value())),
+        )?);
+        if self.observations.len() == self.receipts.len() {
+            self.legacy_observations_pending = false;
+        }
+        if self.state != DidDeploymentState::AwaitingVisibility
+            || self.observations.len() != self.receipts.len()
+        {
+            let state = self.state;
+            return self.transition(state, now);
+        }
         self.effect = self
             .effect
             .next()
             .ok_or(DidDeploymentOperationError::InvalidTransition)?;
-        let next_state = if self.effect == DidDeploymentEffect::ResolveDocument {
+        let next = if self.effect == DidDeploymentEffect::ResolveDocument {
             DidDeploymentState::Resolving
         } else {
             DidDeploymentState::Composing
         };
-        self.transition(next_state, now)
+        self.attempt = 0;
+        self.attempt_started_at = now;
+        self.transition(next, now)
     }
 
     fn validate(&self) -> Result<(), DidDeploymentOperationError> {
         if self.network == MidnightNetwork::Offchain
             || self.created_at.value() == 0
             || self.updated_at.value() < self.created_at.value()
+            || self.attempt_started_at.value() < self.created_at.value()
+            || self.attempt_started_at.value() > self.updated_at.value()
             || self
                 .did
                 .as_ref()
@@ -579,7 +843,10 @@ impl DidDeploymentOperation {
                 .as_ref()
                 .is_some_and(|value| !is_lower_hex_32(value))
             || self.receipts.len() > 8
-            || !valid_receipt_prefix(&self.receipts, self.effect)
+            || self.observations.len() > self.receipts.len()
+            || (self.legacy_observations_pending && self.observations.len() >= self.receipts.len())
+            || !valid_receipt_prefix(&self.receipts, self.effect, self.state)
+            || !valid_observation_prefix(&self.observations, &self.receipts)
         {
             return Err(DidDeploymentOperationError::Integrity);
         }
@@ -602,10 +869,22 @@ impl DidDeploymentOperation {
                     self.did.is_some()
                         && self.submission_id.is_none()
                         && inclusion
+                        && (self.legacy_observations_pending
+                            || self.observations.len() == self.receipts.len())
                         && self.resume_from.is_none()
                         && self.failure.is_none()
                 }
             },
+            DidDeploymentState::AwaitingVisibility => {
+                self.did.is_some()
+                    && self.submission_id.is_none()
+                    && inclusion
+                    && self.receipts.last().map(DidDeploymentReceipt::effect) == Some(self.effect)
+                    && (self.legacy_observations_pending
+                        || self.observations.len() + 1 == self.receipts.len())
+                    && self.resume_from.is_none()
+                    && self.failure.is_none()
+            }
             DidDeploymentState::Funding
             | DidDeploymentState::Proving
             | DidDeploymentState::Submitting
@@ -618,6 +897,9 @@ impl DidDeploymentOperation {
                     && self.submission_id.is_none()
                     && inclusion
                     && self.receipts.len() == 8
+                    && (self.observations.len() == 8
+                        || (self.state == DidDeploymentState::Resolving
+                            && self.legacy_observations_pending))
                     && self.resume_from.is_none()
                     && self.failure.is_none()
             }
@@ -652,7 +934,9 @@ fn valid_transition(
         | (DidDeploymentState::Proving, DidDeploymentState::Submitting)
         | (DidDeploymentState::Submitting, DidDeploymentState::Confirming)
         | (DidDeploymentState::Confirming, DidDeploymentState::Composing)
-        | (DidDeploymentState::Confirming, DidDeploymentState::Resolving)
+        | (DidDeploymentState::Confirming, DidDeploymentState::AwaitingVisibility)
+        | (DidDeploymentState::AwaitingVisibility, DidDeploymentState::Composing)
+        | (DidDeploymentState::AwaitingVisibility, DidDeploymentState::Resolving)
         | (DidDeploymentState::Resolving, DidDeploymentState::Ready) => true,
         (DidDeploymentState::RetryableFailure, resumed) => resume_from == Some(resumed),
         (DidDeploymentState::OutcomeUnknown, DidDeploymentState::Confirming) => true,
@@ -660,7 +944,11 @@ fn valid_transition(
     }
 }
 
-fn valid_receipt_prefix(receipts: &[DidDeploymentReceipt], current: DidDeploymentEffect) -> bool {
+fn valid_receipt_prefix(
+    receipts: &[DidDeploymentReceipt],
+    current: DidDeploymentEffect,
+    state: DidDeploymentState,
+) -> bool {
     const EFFECTS: [DidDeploymentEffect; 8] = [
         DidDeploymentEffect::DeployContract,
         DidDeploymentEffect::InstallVerificationMethodVerifier,
@@ -676,7 +964,11 @@ fn valid_receipt_prefix(receipts: &[DidDeploymentReceipt], current: DidDeploymen
         .zip(EFFECTS)
         .all(|(receipt, expected)| receipt.effect == expected)
         && EFFECTS
-            .get(receipts.len())
+            .get(if state == DidDeploymentState::AwaitingVisibility {
+                receipts.len().saturating_sub(1)
+            } else {
+                receipts.len()
+            })
             .copied()
             .unwrap_or(DidDeploymentEffect::ResolveDocument)
             == current
@@ -685,6 +977,20 @@ fn valid_receipt_prefix(receipts: &[DidDeploymentReceipt], current: DidDeploymen
                 && receipt.submission_id.len() <= 256
                 && is_lower_hex_32(&receipt.transaction_hash_hex)
                 && is_lower_hex_32(&receipt.block_hash_hex)
+        })
+}
+
+fn valid_observation_prefix(
+    observations: &[DidDeploymentObservation],
+    receipts: &[DidDeploymentReceipt],
+) -> bool {
+    observations
+        .iter()
+        .zip(receipts)
+        .all(|(observation, receipt)| {
+            observation.effect == receipt.effect
+                && observation.action_block_hash_hex == receipt.block_hash_hex
+                && observation.action_block_height == receipt.block_height
         })
 }
 
@@ -722,9 +1028,18 @@ impl fmt::Display for DidDeploymentOperationError {
 
 impl Error for DidDeploymentOperationError {}
 
+/// Held for one worker invocation, including its external effects.
+pub trait DidDeploymentWorkerPermit: Send {}
+
 /// Durable storage boundary. Exactly one non-ready operation may be active for
 /// a profile/network pair; implementations must enforce that invariant.
 pub trait DidDeploymentOperationRepository: Send + Sync {
+    fn try_acquire_worker(
+        &self,
+    ) -> Result<Box<dyn DidDeploymentWorkerPermit>, DidDeploymentOperationError> {
+        Err(DidDeploymentOperationError::Unavailable)
+    }
+
     fn upsert(&self, operation: DidDeploymentOperation) -> Result<(), DidDeploymentOperationError>;
 
     fn get(
@@ -795,6 +1110,14 @@ pub type DeployDidFuture<'a> = Pin<
 /// durable progress snapshot and never contains a secret or transaction body.
 pub trait DeployDidUseCase: Send + Sync {
     fn execute<'a>(&'a self, command: DeployDidCommand) -> DeployDidFuture<'a>;
+
+    fn status(
+        &self,
+        _: &IdentityProfileId,
+        _: MidnightNetwork,
+    ) -> Result<Option<DidDeploymentOperation>, DidDeploymentUseCaseError> {
+        Err(DidDeploymentUseCaseError::Unavailable)
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -843,6 +1166,7 @@ mod tests {
             DidDeploymentOperationId::parse("deployment-1").expect("operation id"),
             IdentityProfileId::parse("profile-1").expect("profile id"),
             MidnightNetwork::Undeployed,
+            0,
             UnixTimestampMillis::new(1_000),
         )
         .expect("operation")
@@ -881,6 +1205,15 @@ mod tests {
                 )
                 .expect("include effect");
             now += 1;
+            operation = operation
+                .observed(
+                    format!("{:064x}", ordinal + 32),
+                    format!("{:064x}", ordinal + 16),
+                    u64::try_from(ordinal).expect("ordinal"),
+                    UnixTimestampMillis::new(now),
+                )
+                .expect("observe effect");
+            now += 1;
         }
         operation
     }
@@ -906,7 +1239,14 @@ mod tests {
                 42,
                 UnixTimestampMillis::new(6_000),
             )
-            .expect("included");
+            .expect("included")
+            .observed(
+                "3".repeat(64),
+                "2".repeat(64),
+                42,
+                UnixTimestampMillis::new(6_001),
+            )
+            .expect("observed");
         operation = complete_remaining_effects(operation, 7_000)
             .transition(DidDeploymentState::Ready, UnixTimestampMillis::new(10_000))
             .expect("ready");
@@ -916,6 +1256,7 @@ mod tests {
         assert_eq!(operation.receipts()[0].block_height(), 42);
         assert_eq!(operation.block_height(), Some(8));
         assert_eq!(operation.receipts().len(), 8);
+        assert_eq!(operation.observations().len(), 8);
     }
 
     #[test]
@@ -1012,6 +1353,32 @@ mod tests {
     }
 
     #[test]
+    fn finalized_rejection_can_only_create_a_fresh_attempt_identity() {
+        let operation = operation()
+            .composed(
+                did(),
+                "attempt-1".to_owned(),
+                UnixTimestampMillis::new(2_000),
+            )
+            .expect("composed")
+            .transition(DidDeploymentState::Proving, UnixTimestampMillis::new(3_000))
+            .expect("proving")
+            .transition(
+                DidDeploymentState::Submitting,
+                UnixTimestampMillis::new(4_000),
+            )
+            .expect("submitting")
+            .outcome_unknown(UnixTimestampMillis::new(5_000))
+            .expect("unknown")
+            .replace_attempt(UnixTimestampMillis::new(6_000))
+            .expect("authoritative replacement");
+        assert_eq!(operation.state(), DidDeploymentState::Composing);
+        assert_eq!(operation.attempt(), 1);
+        assert_eq!(operation.submission_id(), None);
+        assert!(operation.receipts().is_empty());
+    }
+
+    #[test]
     fn ready_is_terminal_and_evidence_is_strict() {
         let operation = operation()
             .composed(did(), "draft-1".to_owned(), UnixTimestampMillis::new(2_000))
@@ -1047,6 +1414,27 @@ mod tests {
                 UnixTimestampMillis::new(6_000),
             )
             .expect("included");
+        assert_eq!(included.state(), DidDeploymentState::AwaitingVisibility);
+        assert!(
+            included
+                .clone()
+                .observed(
+                    "3".repeat(64),
+                    "4".repeat(64),
+                    42,
+                    UnixTimestampMillis::new(6_001)
+                )
+                .is_err(),
+            "mismatching visibility must not advance"
+        );
+        let included = included
+            .observed(
+                "3".repeat(64),
+                "2".repeat(64),
+                42,
+                UnixTimestampMillis::new(6_001),
+            )
+            .expect("observed");
         let ready = complete_remaining_effects(included, 7_000)
             .transition(DidDeploymentState::Ready, UnixTimestampMillis::new(10_000))
             .expect("ready");

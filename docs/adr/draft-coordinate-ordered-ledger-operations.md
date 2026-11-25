@@ -94,6 +94,14 @@ that conflict and use the operation's reviewed replan or approval policy.
 An indexer lookup may locate the candidate block. The node and the applicable
 ledger result establish finalized execution.
 
+In the Ledger 9 DID adapter, match the Substrate extrinsic in its canonical
+block to the successful Midnight transaction and contract action in that
+extrinsic's events. Match the indexer action to the resulting Midnight hash.
+Compare its serialized state with the state returned by
+`midnight_contractState` at the receipt's exact block hash. A later indexed
+head can confirm the same action. A different action needs its own verified
+compatibility decision before any successor can run.
+
 ### Automatic recovery
 
 | Failure or interruption | Recovery policy |

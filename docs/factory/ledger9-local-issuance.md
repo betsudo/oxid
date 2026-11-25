@@ -63,8 +63,18 @@ OXID_ENABLE_LIVE_LEDGER9_DID_E2E=1 \
 
 The command attaches read-only to the shared stack, authenticates the generated
 DID artifacts, creates a fresh holder wallet, receives the fixed local grant,
-waits for positive DUST, deploys all eight holder-DID effects, and requires live
-resolution. It owns and removes only its temporary wallet/faucet state.
+and waits for positive DUST. It terminates the owned wallet process after
+observing a durable partial DID receipt list. A new wallet process reopens the
+same store and resumes the same operation and DID. The test compares the
+finalized prefix before and after restart, requires all eight effects and live
+resolution, and reports the number of preserved receipts. It removes its
+temporary wallet and faucet state.
+
+Headless clients can read the saved checkpoint with `did.deploy.status`
+without starting publication. The result separates finalized receipts from
+their authenticated observations and reports elapsed attempt and visibility
+wait times when measured. The diagnostic ring records only fixed publication
+event codes.
 
 The local development wallet uses the bounded settlement worker to retry
 preparation while the funded NIGHT output or fee allowance settles. A wallet

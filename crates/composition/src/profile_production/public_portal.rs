@@ -185,6 +185,7 @@ mod native {
             Arc::new(JsonDidDeploymentOperationRepository::new(
                 private.join("did-deployments.json"),
             )),
+            services.diagnostic_events(),
         )
         .ok_or(CompositionError::NativeDidDeploymentUnavailable)?;
         Ok(with_native_wallet_onboarding(

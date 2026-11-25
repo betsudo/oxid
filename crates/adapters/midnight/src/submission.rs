@@ -645,6 +645,7 @@ async fn reconcile_live_submission(
         .await
         .map_err(|_| WalletTransactionPortError::Timeout)?
         .map_err(|_| WalletTransactionPortError::Unavailable)?;
+    let finalized_head = block.reference();
     let mut reached_anchor = false;
     for _ in 0..MAX_RECONCILIATION_BLOCKS {
         if block.hash().0 == entry.anchor_block_hash {
@@ -695,8 +696,21 @@ async fn reconcile_live_submission(
     if !reached_anchor {
         return Ok(MidnightSubmissionReconciliation::Unresolved);
     }
-    let chain_tip = fetch_chain_tip(config.indexer_http_route()).await?;
-    if Timestamp::from_secs(entry.expires_at.value() / 1_000) <= chain_tip.timestamp {
+    // The same finalized head bounds the receipt search and the expiry
+    // decision. A newer indexer tip could otherwise expire a transaction
+    // that is still awaiting finality above the blocks we searched.
+    let timestamp = dynamic::storage("Timestamp", "Now", Vec::<dynamic::Value>::new());
+    let finalized_timestamp = timeout(
+        CONNECT_TIMEOUT,
+        client.storage().at(finalized_head).fetch(&timestamp),
+    )
+    .await
+    .map_err(|_| WalletTransactionPortError::Timeout)?
+    .map_err(|_| WalletTransactionPortError::Unavailable)?
+    .ok_or(WalletTransactionPortError::InvalidChainState)?
+    .as_type::<u64>()
+    .map_err(|_| WalletTransactionPortError::InvalidChainState)?;
+    if finalized_timestamp / 1_000 > entry.expires_at.value() / 1_000 {
         Ok(MidnightSubmissionReconciliation::Expired)
     } else {
         Ok(MidnightSubmissionReconciliation::Unresolved)

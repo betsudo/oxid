@@ -20,7 +20,7 @@ use crate::{
 };
 
 impl HeadlessWallet {
-    pub(super) fn deploy_did(&self, request: Request) -> Dispatch {
+    pub(super) fn deploy_did(&self, request: Request, status_only: bool) -> Dispatch {
         let params = match serde_json::from_value::<DeployDidParams>(request.params) {
             Ok(params) => params,
             Err(_) => {
@@ -59,7 +59,17 @@ impl HeadlessWallet {
                 ));
             }
         };
-        match futures::executor::block_on(self.application.deploy_did().execute(DeployDidCommand {
+        let publication = self.application.deploy_did();
+        if status_only {
+            return match publication.status(&profile_id, network) {
+                Ok(operation) => Dispatch::continue_with(Response::success(
+                    request.id,
+                    json!({ "deployment": operation.as_ref().map(did_deployment_value) }),
+                )),
+                Err(error) => Dispatch::continue_with(did_deployment_error(request.id, error)),
+            };
+        }
+        match futures::executor::block_on(publication.execute(DeployDidCommand {
             profile_id,
             network,
             account_index: params.account_index,

@@ -39,6 +39,12 @@ pub enum DiagnosticCode {
     IdentityOffchainDidCreationFailed,
     IdentityOffchainDidResolutionSucceeded,
     IdentityOffchainDidResolutionFailed,
+    IdentityDidPublicationAwaitingVisibility,
+    IdentityDidPublicationEffectVisible,
+    IdentityDidPublicationOutcomeUnknown,
+    IdentityDidPublicationApprovalRequired,
+    IdentityDidPublicationPaused,
+    IdentityDidPublicationReady,
     MidnightDustSyncFailed,
     MidnightDustSyncWorkerPanicked,
     MidnightDustSyncWorkerSpawnFailed,
@@ -70,6 +76,18 @@ impl DiagnosticCode {
                 "identity.did.offchain.resolution.succeeded"
             }
             Self::IdentityOffchainDidResolutionFailed => "identity.did.offchain.resolution.failed",
+            Self::IdentityDidPublicationAwaitingVisibility => {
+                "identity.did.publication.awaiting_visibility"
+            }
+            Self::IdentityDidPublicationEffectVisible => "identity.did.publication.effect_visible",
+            Self::IdentityDidPublicationOutcomeUnknown => {
+                "identity.did.publication.outcome_unknown"
+            }
+            Self::IdentityDidPublicationApprovalRequired => {
+                "identity.did.publication.approval_required"
+            }
+            Self::IdentityDidPublicationPaused => "identity.did.publication.paused",
+            Self::IdentityDidPublicationReady => "identity.did.publication.ready",
             Self::MidnightDustSyncFailed => "midnight.dust.sync.failed",
             Self::MidnightDustSyncWorkerPanicked => "midnight.dust.sync.worker_panicked",
             Self::MidnightDustSyncWorkerSpawnFailed => "midnight.dust.sync.worker_spawn_failed",

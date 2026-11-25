@@ -173,6 +173,29 @@ impl DidDeploymentEffectComposer for AllEffectsComposer {
             })
         })
     }
+
+    fn observe<'a>(
+        &'a self,
+        operation: &'a DidDeploymentOperation,
+    ) -> Pin<
+        Box<
+            dyn Future<Output = Result<DidDeploymentObservation, NativeDidDeploymentError>>
+                + Send
+                + 'a,
+        >,
+    > {
+        Box::pin(async move {
+            let receipt = operation.receipts().last().expect("finalized receipt");
+            DidDeploymentObservation::restore(
+                operation.effect(),
+                "7".repeat(64),
+                receipt.block_hash_hex().to_owned(),
+                receipt.block_height(),
+                None,
+            )
+            .map_err(NativeDidDeploymentError::from)
+        })
+    }
 }
 
 impl DidDeploymentEffectComposer for IndexerPendingAfterDeploy {
@@ -198,12 +221,38 @@ impl DidDeploymentEffectComposer for IndexerPendingAfterDeploy {
             })
         })
     }
+
+    fn observe<'a>(
+        &'a self,
+        _: &'a DidDeploymentOperation,
+    ) -> Pin<
+        Box<
+            dyn Future<Output = Result<DidDeploymentObservation, NativeDidDeploymentError>>
+                + Send
+                + 'a,
+        >,
+    > {
+        Box::pin(async { Err(NativeDidDeploymentError::IndexerPending) })
+    }
 }
 
 #[derive(Default)]
 struct MemoryOperations(Mutex<Vec<DidDeploymentOperation>>);
 
+struct MemoryWorkerPermit;
+
+impl oxid_identity_application::DidDeploymentWorkerPermit for MemoryWorkerPermit {}
+
 impl DidDeploymentOperationRepository for MemoryOperations {
+    fn try_acquire_worker(
+        &self,
+    ) -> Result<
+        Box<dyn oxid_identity_application::DidDeploymentWorkerPermit>,
+        DidDeploymentOperationError,
+    > {
+        Ok(Box::new(MemoryWorkerPermit))
+    }
+
     fn upsert(&self, operation: DidDeploymentOperation) -> Result<(), DidDeploymentOperationError> {
         let mut operations = self
             .0
@@ -213,8 +262,14 @@ impl DidDeploymentOperationRepository for MemoryOperations {
             .iter_mut()
             .find(|candidate| candidate.operation_id() == operation.operation_id())
         {
+            if operation.revision() != current.revision().saturating_add(1) {
+                return Err(DidDeploymentOperationError::Conflict);
+            }
             *current = operation;
         } else {
+            if operation.revision() != 0 {
+                return Err(DidDeploymentOperationError::Conflict);
+            }
             operations.push(operation);
         }
         Ok(())
@@ -290,12 +345,16 @@ struct IncludedSubmission {
 
 struct UnknownThenIncludedSubmission {
     submissions: AtomicUsize,
+    reconciliations: AtomicUsize,
 }
 
 impl IncludedSubmission {
-    fn status(state: MidnightContractCallSubmissionState) -> MidnightContractCallSubmissionStatus {
+    fn status(
+        draft_id: &str,
+        state: MidnightContractCallSubmissionState,
+    ) -> MidnightContractCallSubmissionStatus {
         MidnightContractCallSubmissionStatus {
-            draft_id: "did-deployment".to_owned(),
+            draft_id: draft_id.to_owned(),
             state,
             transaction_hash: (state == MidnightContractCallSubmissionState::Included)
                 .then_some([1; 32]),
@@ -325,17 +384,23 @@ impl MidnightContractCallSubmissionPort for IncludedSubmission {
     fn contract_call_submission_status(
         &self,
         _: &str,
-        _: &str,
+        draft_id: &str,
     ) -> Result<MidnightContractCallSubmissionStatus, WalletTransactionPortError> {
-        Ok(Self::status(MidnightContractCallSubmissionState::Included))
+        Ok(Self::status(
+            draft_id,
+            MidnightContractCallSubmissionState::Included,
+        ))
     }
 
     fn cancel_contract_call_submission(
         &self,
         _: &str,
-        _: &str,
+        draft_id: &str,
     ) -> Result<MidnightContractCallSubmissionStatus, WalletTransactionPortError> {
-        Ok(Self::status(MidnightContractCallSubmissionState::Included))
+        Ok(Self::status(
+            draft_id,
+            MidnightContractCallSubmissionState::Included,
+        ))
     }
 
     fn contract_call_submission_history(
@@ -343,6 +408,7 @@ impl MidnightContractCallSubmissionPort for IncludedSubmission {
         _: &str,
     ) -> Result<Vec<MidnightContractCallSubmissionStatus>, WalletTransactionPortError> {
         Ok(vec![Self::status(
+            "did-deployment",
             MidnightContractCallSubmissionState::Included,
         )])
     }
@@ -350,9 +416,12 @@ impl MidnightContractCallSubmissionPort for IncludedSubmission {
     fn reconcile_contract_call_submission(
         &self,
         _: &str,
-        _: &str,
+        draft_id: &str,
     ) -> Result<MidnightContractCallSubmissionStatus, WalletTransactionPortError> {
-        Ok(Self::status(MidnightContractCallSubmissionState::Included))
+        Ok(Self::status(
+            draft_id,
+            MidnightContractCallSubmissionState::Included,
+        ))
     }
 }
 
@@ -377,9 +446,10 @@ impl MidnightContractCallSubmissionPort for UnknownThenIncludedSubmission {
     fn contract_call_submission_status(
         &self,
         _: &str,
-        _: &str,
+        draft_id: &str,
     ) -> Result<MidnightContractCallSubmissionStatus, WalletTransactionPortError> {
         Ok(IncludedSubmission::status(
+            draft_id,
             MidnightContractCallSubmissionState::Included,
         ))
     }
@@ -397,6 +467,7 @@ impl MidnightContractCallSubmissionPort for UnknownThenIncludedSubmission {
         _: &str,
     ) -> Result<Vec<MidnightContractCallSubmissionStatus>, WalletTransactionPortError> {
         Ok(vec![IncludedSubmission::status(
+            "did-deployment",
             MidnightContractCallSubmissionState::Included,
         )])
     }
@@ -404,10 +475,16 @@ impl MidnightContractCallSubmissionPort for UnknownThenIncludedSubmission {
     fn reconcile_contract_call_submission(
         &self,
         _: &str,
-        _: &str,
+        draft_id: &str,
     ) -> Result<MidnightContractCallSubmissionStatus, WalletTransactionPortError> {
+        let attempt = self.reconciliations.fetch_add(1, Ordering::SeqCst);
         Ok(IncludedSubmission::status(
-            MidnightContractCallSubmissionState::Included,
+            draft_id,
+            if attempt < 1 {
+                MidnightContractCallSubmissionState::OutcomeUnknown
+            } else {
+                MidnightContractCallSubmissionState::Included
+            },
         ))
     }
 }
@@ -553,6 +630,7 @@ fn native_effect_composer_authenticates_and_composes_the_first_maintenance_updat
         DidDeploymentOperationId::parse("deployment-native-effects").expect("operation id"),
         command().profile_id,
         MidnightNetwork::Undeployed,
+        0,
         UnixTimestampMillis::new(10_000),
     )
     .expect("operation");
@@ -591,7 +669,14 @@ fn native_effect_composer_authenticates_and_composes_the_first_maintenance_updat
             42,
             UnixTimestampMillis::new(10_000),
         )
-        .expect("included deploy");
+        .expect("included deploy")
+        .observed(
+            "3".repeat(64),
+            "2".repeat(64),
+            42,
+            UnixTimestampMillis::new(10_000),
+        )
+        .expect("observed deploy");
     assert_eq!(
         operation.effect(),
         DidDeploymentEffect::InstallVerificationMethodVerifier
@@ -614,13 +699,34 @@ fn deployment_reaches_ready_and_repeated_requests_do_not_resubmit() {
         operations,
     );
 
-    let first = futures::executor::block_on(service.execute(command())).expect("first deployment");
+    let first = settle_until_resolution(&service, command());
     let second =
         futures::executor::block_on(service.execute(command())).expect("idempotent deployment");
 
     assert_eq!(first.state(), DidDeploymentState::Ready);
+    assert_eq!(first.receipts().len(), 8);
+    assert_eq!(first.observations().len(), 8);
     assert_eq!(second.operation_id(), first.operation_id());
     assert_eq!(submissions.submissions.load(Ordering::SeqCst), 8);
+}
+
+fn settle_until_resolution(
+    service: &NativeDidDeploymentService,
+    command: DeployDidCommand,
+) -> DidDeploymentOperation {
+    for _ in 0..9 {
+        let operation = futures::executor::block_on(service.execute(command.clone()))
+            .expect("drive the next durable DID phase");
+        if matches!(
+            operation.state(),
+            DidDeploymentState::Ready
+                | DidDeploymentState::Resolving
+                | DidDeploymentState::RetryableFailure
+        ) {
+            return operation;
+        }
+    }
+    panic!("DID did not settle within the ordered publication steps")
 }
 
 #[test]
@@ -641,14 +747,15 @@ fn indexed_receipt_barrier_prevents_the_next_transaction_from_being_composed() {
 
     let operation =
         futures::executor::block_on(service.execute(command())).expect("durable deployment");
+    let still_waiting = futures::executor::block_on(service.execute(command()))
+        .expect("lagging indexer leaves the receipt untouched");
+    assert_eq!(still_waiting, operation);
 
-    assert_eq!(
-        operation.effect(),
-        DidDeploymentEffect::InstallVerificationMethodVerifier
-    );
-    assert_eq!(operation.state(), DidDeploymentState::Composing);
+    assert_eq!(operation.effect(), DidDeploymentEffect::DeployContract);
+    assert_eq!(operation.state(), DidDeploymentState::AwaitingVisibility);
     assert_eq!(submissions.submissions.load(Ordering::SeqCst), 1);
     assert_eq!(operation.receipts().len(), 1);
+    assert_eq!(operation.observations().len(), 0);
 }
 
 #[test]
@@ -663,8 +770,7 @@ fn incomplete_live_resolution_waits_without_resubmitting_or_exposing_ready() {
         operations,
     );
 
-    let operation =
-        futures::executor::block_on(service.execute(command())).expect("durable failure snapshot");
+    let operation = settle_until_resolution(&service, command());
 
     assert_eq!(operation.state(), DidDeploymentState::Resolving);
     assert_eq!(operation.failure(), None);
@@ -685,8 +791,7 @@ fn unavailable_resolution_keeps_recovered_deployment_resolving_without_resubmiss
         operations,
     );
 
-    let first = futures::executor::block_on(service.execute(command()))
-        .expect("unavailable resolver leaves a durable recovery snapshot");
+    let first = settle_until_resolution(&service, command());
     let second = futures::executor::block_on(service.execute(command()))
         .expect("retry keeps the same unresolved deployment");
 
@@ -709,8 +814,7 @@ fn different_live_subject_still_pauses_as_a_resolution_mismatch() {
         operations,
     );
 
-    let operation =
-        futures::executor::block_on(service.execute(command())).expect("durable mismatch");
+    let operation = settle_until_resolution(&service, command());
 
     assert_eq!(operation.state(), DidDeploymentState::RetryableFailure);
     assert_eq!(
@@ -725,6 +829,7 @@ fn different_live_subject_still_pauses_as_a_resolution_mismatch() {
 fn outcome_unknown_reconciles_without_a_second_submission() {
     let submissions = Arc::new(UnknownThenIncludedSubmission {
         submissions: AtomicUsize::new(0),
+        reconciliations: AtomicUsize::new(0),
     });
     let operations = Arc::new(MemoryOperations::default());
     let service = NativeDidDeploymentService::with_effects(
@@ -739,10 +844,12 @@ fn outcome_unknown_reconciles_without_a_second_submission() {
 
     let unknown =
         futures::executor::block_on(service.execute(command())).expect("unknown is durable");
-    let reconciled =
-        futures::executor::block_on(service.execute(command())).expect("reconciled deployment");
+    let still_unknown =
+        futures::executor::block_on(service.execute(command())).expect("unknown remains durable");
+    let reconciled = settle_until_resolution(&service, command());
 
     assert_eq!(unknown.state(), DidDeploymentState::OutcomeUnknown);
+    assert_eq!(still_unknown.state(), DidDeploymentState::OutcomeUnknown);
     assert_eq!(reconciled.state(), DidDeploymentState::Ready);
     assert_eq!(reconciled.operation_id(), unknown.operation_id());
     assert_eq!(submissions.submissions.load(Ordering::SeqCst), 8);
@@ -759,6 +866,7 @@ fn restored_submitting_operation_reconciles_before_continuing() {
         DidDeploymentOperationId::parse("deployment-restored-submitting").expect("operation id"),
         deploy.profile_id.clone(),
         deploy.network,
+        0,
         UnixTimestampMillis::new(10_000),
     )
     .expect("operation");
@@ -778,9 +886,9 @@ fn restored_submitting_operation_reconciles_before_continuing() {
             UnixTimestampMillis::new(10_000),
         )
         .expect("submitting");
-    operations
-        .upsert(operation)
-        .expect("persist interrupted state");
+    // Simulate a journal restored from a prior process, whose existing
+    // revision is the current durable generation rather than a new write.
+    operations.0.lock().expect("operations").push(operation);
     let service = NativeDidDeploymentService::with_effects(
         Arc::new(AllEffectsComposer),
         Arc::new(PassthroughFunding),
@@ -791,8 +899,7 @@ fn restored_submitting_operation_reconciles_before_continuing() {
         Arc::new(FixedRandom),
     );
 
-    let recovered = futures::executor::block_on(service.execute(deploy))
-        .expect("reconciled deployment completes");
+    let recovered = settle_until_resolution(&service, deploy);
 
     assert_eq!(recovered.state(), DidDeploymentState::Ready);
     assert_eq!(submissions.submissions.load(Ordering::SeqCst), 7);
