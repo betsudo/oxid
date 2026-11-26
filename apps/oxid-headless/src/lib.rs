@@ -287,7 +287,7 @@ impl HeadlessWallet {
             "vault.claim" => self.claim_from_vault_lock(request),
             "vault.withdraw" => self.withdraw_from_vault_lock(request),
             "did.create" => self.create_did(request),
-            "did.deploy" => self.deploy_did(request),
+            "did.deploy" | "did.deploy.status" => self.deploy_did(request),
             "did.resolve" => self.resolve_did(request),
             "did.list" => self.list_dids(request),
             "did.get" => self.get_did(request),

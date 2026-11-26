@@ -126,6 +126,38 @@ enum DidJourney {
     Detail(String),
 }
 
+fn did_deployment_progress_text(
+    operation: &oxid_identity_application::DidDeploymentOperation,
+) -> String {
+    use oxid_identity_application::DidDeploymentFailure;
+
+    let stage = match operation.state() {
+        DidDeploymentState::RetryableFailure => match operation.failure() {
+            Some(DidDeploymentFailure::ProtectionLocked) => "Unlock the wallet to continue",
+            Some(DidDeploymentFailure::LedgerStateConflict) => {
+                "DID publication paused due to a ledger state conflict"
+            }
+            Some(DidDeploymentFailure::AttemptLimitReached) => {
+                "DID publication paused after unsuccessful transactions"
+            }
+            _ => "Preparing the next DID transaction",
+        },
+        DidDeploymentState::Submitting | DidDeploymentState::Confirming => "Waiting for finality",
+        DidDeploymentState::AwaitingVisibility => "Waiting for indexed state",
+        DidDeploymentState::OutcomeUnknown => "Recovering the previous submission",
+        DidDeploymentState::Resolving => "Verifying the published DID",
+        DidDeploymentState::Ready => "DID published",
+        DidDeploymentState::Composing
+        | DidDeploymentState::Funding
+        | DidDeploymentState::Proving => "Preparing the next DID transaction",
+    };
+    format!(
+        "{stage} ({} finalized, {} observed).",
+        operation.receipts().len(),
+        operation.observations().len()
+    )
+}
+
 fn did_method_name(identifier: &str) -> &str {
     identifier
         .rsplit_once('#')
@@ -217,6 +249,8 @@ pub(super) fn DidsPage(
     let mut selected_network = use_signal(|| None::<String>);
     let mut did_creation = use_signal(|| DidCreationState::Ready);
     let mut did_creation_notice = use_signal(|| None::<String>);
+    let mut pending_deployment =
+        use_signal(|| None::<oxid_identity_application::DidDeploymentOperation>);
     let mut did_publication_busy = use_signal(|| false);
     let mut did_publication_notice = use_signal(|| None::<String>);
     let mut did_copy_notice = use_signal(|| None::<String>);
@@ -270,6 +304,33 @@ pub(super) fn DidsPage(
             selected_network.set(network);
         });
     });
+    let progress_service = services.deploy_did();
+    let progress_profile = IdentityProfileId::parse(profile_id.clone()).ok();
+    use_effect(move || {
+        let Some(network) = selected_network
+            .read()
+            .as_deref()
+            .and_then(MidnightNetwork::parse)
+        else {
+            return;
+        };
+        let Some(profile) = progress_profile.clone() else {
+            return;
+        };
+        let service = progress_service.clone();
+        spawn(async move {
+            let progress = run_ui_blocking(move || service.status(&profile, network))
+                .await
+                .ok()
+                .and_then(Result::ok)
+                .flatten()
+                .filter(|operation| !operation.state().terminal());
+            if selected_network.peek().as_deref() == Some(network.as_str()) {
+                pending_deployment.set(progress);
+            }
+        });
+    });
+    let retained_deployment = pending_deployment.read().clone();
 
     let is_authentication_request = pending_identity_request
         .read()
@@ -386,10 +447,13 @@ pub(super) fn DidsPage(
                     h2 { "Create your identity" }
                     p { class: "form-hint", "Publish a protected DID to the selected Midnight network. The wallet submits the ordered Ledger effects, waits for finality, and verifies the finished document through live resolution before it becomes available for credentials." }
                     if creation == DidCreationState::Ready {
+                        if let Some(operation) = &retained_deployment {
+                            p { class: "form-hint", "{did_deployment_progress_text(operation)}" }
+                        }
                         button {
                             class: "primary-action", r#type: "button",
                             disabled: resolving || !ledger_deployment_available,
-                            aria_label: "Create Midnight DID",
+                            aria_label: if retained_deployment.is_some() { "Continue DID publication" } else { "Create Midnight DID" },
                             onclick: move |_| {
                                 {
                                     let mut creation = did_creation.write();
@@ -441,6 +505,7 @@ pub(super) fn DidsPage(
                                         let command = command.clone();
                                         match run_ui_future(async move { service.execute(command).await }).await {
                                             Ok(Ok(operation)) if operation.state() == DidDeploymentState::Ready => {
+                                                pending_deployment.set(None);
                                                 let Some(did) = operation.did().map(|did| did.as_str().to_owned()) else {
                                                     did_creation.set(DidCreationState::Failed);
                                                     did_creation_notice.set(Some("Midnight confirmed the deployment without a resolvable DID.".to_owned()));
@@ -477,15 +542,30 @@ pub(super) fn DidsPage(
                                                 return;
                                             }
                                             Ok(Ok(operation)) if operation.state() == DidDeploymentState::RetryableFailure => {
-                                                let failure = operation.failure().map_or("unknown", |failure| failure.as_str());
-                                                did_creation_notice.set(Some(format!("Waiting for Midnight to converge: {failure}. Progress is retained and will resume automatically.")));
+                                                use oxid_identity_application::DidDeploymentFailure;
+                                                let failure = operation.failure();
+                                                let progress = did_deployment_progress_text(&operation);
+                                                pending_deployment.set(Some(operation));
+                                                match failure {
+                                                    Some(DidDeploymentFailure::AttemptLimitReached) => {
+                                                        did_creation.set(DidCreationState::Failed);
+                                                        did_creation_notice.set(Some(progress));
+                                                        return;
+                                                    }
+                                                    Some(DidDeploymentFailure::ProtectionLocked | DidDeploymentFailure::LedgerStateConflict) => {
+                                                        did_creation.set(DidCreationState::Ready);
+                                                        did_creation_notice.set(Some(progress));
+                                                        return;
+                                                    }
+                                                    _ => {
+                                                        let reason = failure.map_or("unknown", |failure| failure.as_str());
+                                                        did_creation_notice.set(Some(format!("Waiting for Midnight to converge: {reason}. Progress is retained and will resume automatically.")));
+                                                    }
+                                                }
                                             }
                                             Ok(Ok(operation)) => {
-                                                did_creation_notice.set(Some(format!(
-                                                    "Publishing to Midnight: {} · {}.",
-                                                    operation.state().as_str(),
-                                                    operation.effect().as_str(),
-                                                )));
+                                                did_creation_notice.set(Some(did_deployment_progress_text(&operation)));
+                                                pending_deployment.set(Some(operation));
                                             }
                                             Ok(Err(error)) => {
                                                 did_creation.set(DidCreationState::Failed);
@@ -504,7 +584,7 @@ pub(super) fn DidsPage(
                                     did_creation_notice.set(Some("Midnight DID deployment did not finish within ten minutes. Progress was retained for a safe retry.".to_owned()));
                                 });
                             },
-                            "Create Midnight DID"
+                            if retained_deployment.is_some() { "Continue DID publication" } else { "Create Midnight DID" }
                         }
                         p { class: "form-hint",
                             if let Some(network) = selected_network.read().as_deref() {
@@ -1005,7 +1085,7 @@ pub(super) fn DidsPage(
                             class: "primary-action",
                             r#type: "button",
                             onclick: move |_| journey.set(DidJourney::Create),
-                            "Create a DID"
+                            if retained_deployment.is_some() { "Resume DID publication" } else { "Create a DID" }
                         }
                         button {
                             class: "secondary-action",

@@ -2,20 +2,22 @@
 
 use std::{
     collections::BTreeSet,
+    fs::{File, OpenOptions, TryLockError},
     path::{Path, PathBuf},
     sync::Mutex,
 };
 
 use oxid_adapter_store_atomic as store_atomic;
 use oxid_identity_application::{
-    DidDeploymentEffect, DidDeploymentFailure, DidDeploymentOperation, DidDeploymentOperationError,
-    DidDeploymentOperationId, DidDeploymentOperationParts, DidDeploymentOperationRepository,
-    DidDeploymentReceipt, DidDeploymentState,
+    DidDeploymentEffect, DidDeploymentFailure, DidDeploymentObservation, DidDeploymentOperation,
+    DidDeploymentOperationError, DidDeploymentOperationId, DidDeploymentOperationParts,
+    DidDeploymentOperationRepository, DidDeploymentReceipt, DidDeploymentState,
+    DidDeploymentWorkerPermit,
 };
 use oxid_identity_domain::{IdentityProfileId, MidnightDid, MidnightNetwork};
 use serde::{Deserialize, Serialize};
 
-const SCHEMA_VERSION: u32 = 2;
+const SCHEMA_VERSION: u32 = 3;
 const MAX_OPERATIONS: usize = 128;
 const MAX_STORE_BYTES: usize = 512 * 1_024;
 
@@ -24,6 +26,12 @@ pub struct JsonDidDeploymentOperationRepository {
     path: PathBuf,
     access: Mutex<()>,
 }
+
+struct JsonDidDeploymentWorkerPermit {
+    _file: File,
+}
+
+impl DidDeploymentWorkerPermit for JsonDidDeploymentWorkerPermit {}
 
 impl JsonDidDeploymentOperationRepository {
     #[must_use]
@@ -48,8 +56,29 @@ impl JsonDidDeploymentOperationRepository {
         else {
             return Ok(StoredOperations::default());
         };
-        let stored: StoredOperations =
+        let mut stored: StoredOperations =
             serde_json::from_slice(&bytes).map_err(|_| DidDeploymentOperationError::Integrity)?;
+        if stored.schema_version == 2 {
+            for operation in &mut stored.operations {
+                operation.legacy_observations_pending =
+                    operation.observations.len() < operation.receipts.len();
+                if operation.state == DidDeploymentState::Ready.as_str()
+                    && operation.legacy_observations_pending
+                {
+                    operation.state = DidDeploymentState::Resolving.as_str().to_owned();
+                }
+                if operation.state == DidDeploymentState::RetryableFailure.as_str()
+                    && operation.submission_id.is_some()
+                {
+                    // Legacy pauses did not retain the broadcast boundary.
+                    // Resolve the original draft before rebuilding it.
+                    operation.state = DidDeploymentState::Submitting.as_str().to_owned();
+                    operation.failure = None;
+                    operation.resume_from = None;
+                }
+            }
+            stored.schema_version = SCHEMA_VERSION;
+        }
         validate(&stored)?;
         Ok(stored)
     }
@@ -66,6 +95,40 @@ impl JsonDidDeploymentOperationRepository {
 }
 
 impl DidDeploymentOperationRepository for JsonDidDeploymentOperationRepository {
+    fn try_acquire_worker(
+        &self,
+    ) -> Result<Box<dyn DidDeploymentWorkerPermit>, DidDeploymentOperationError> {
+        let parent = self
+            .path
+            .parent()
+            .ok_or(DidDeploymentOperationError::Unavailable)?;
+        store_atomic::ensure_private_directory(parent).map_err(map_store_error)?;
+        let lock_path = self.path.with_extension("worker-lock");
+        let mut create = OpenOptions::new();
+        create.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt as _;
+            create.mode(0o600);
+        }
+        let lock = match create.open(&lock_path) {
+            Ok(file) => file,
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                store_atomic::reject_non_private_file(&lock_path).map_err(map_store_error)?;
+                OpenOptions::new()
+                    .write(true)
+                    .open(&lock_path)
+                    .map_err(|_| DidDeploymentOperationError::Unavailable)?
+            }
+            Err(_) => return Err(DidDeploymentOperationError::Unavailable),
+        };
+        match lock.try_lock() {
+            Ok(()) => Ok(Box::new(JsonDidDeploymentWorkerPermit { _file: lock })),
+            Err(TryLockError::WouldBlock) => Err(DidDeploymentOperationError::Conflict),
+            Err(TryLockError::Error(_)) => Err(DidDeploymentOperationError::Unavailable),
+        }
+    }
+
     fn upsert(&self, operation: DidDeploymentOperation) -> Result<(), DidDeploymentOperationError> {
         let _guard = self
             .access
@@ -88,8 +151,15 @@ impl DidDeploymentOperationRepository for JsonDidDeploymentOperationRepository {
             .iter_mut()
             .find(|candidate| candidate.operation_id == operation.operation_id().as_str())
         {
+            let current = existing.to_domain()?;
+            if operation.revision() != current.revision().saturating_add(1) {
+                return Err(DidDeploymentOperationError::Conflict);
+            }
             *existing = encoded;
         } else {
+            if operation.revision() != 0 {
+                return Err(DidDeploymentOperationError::Conflict);
+            }
             if stored.operations.len() >= MAX_OPERATIONS {
                 return Err(DidDeploymentOperationError::CapacityExceeded);
             }
@@ -183,6 +253,8 @@ struct StoredOperation {
     operation_id: String,
     profile_id: String,
     network: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    account_index: Option<u32>,
     state: String,
     resume_from: Option<String>,
     failure: Option<String>,
@@ -190,11 +262,34 @@ struct StoredOperation {
     did: Option<String>,
     submission_id: Option<String>,
     receipts: Vec<StoredReceipt>,
+    /// Missing in schema-two records; such receipts are re-observed before
+    /// progression rather than trusted as visibility evidence.
+    #[serde(default)]
+    observations: Vec<StoredObservation>,
+    #[serde(default)]
+    legacy_observations_pending: bool,
+    #[serde(default)]
+    revision: u64,
+    #[serde(default)]
+    attempt: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    attempt_started_at_millis: Option<u64>,
     transaction_hash_hex: Option<String>,
     block_hash_hex: Option<String>,
     block_height: Option<u64>,
     created_at_millis: u64,
     updated_at_millis: u64,
+}
+
+#[derive(Deserialize, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct StoredObservation {
+    effect: String,
+    action_transaction_hash_hex: String,
+    action_block_hash_hex: String,
+    action_block_height: u64,
+    #[serde(default)]
+    visibility_wait_millis: Option<u64>,
 }
 
 #[derive(Deserialize, Serialize)]
@@ -205,6 +300,8 @@ struct StoredReceipt {
     transaction_hash_hex: String,
     block_hash_hex: String,
     block_height: u64,
+    #[serde(default)]
+    attempt_elapsed_millis: Option<u64>,
 }
 
 impl From<&DidDeploymentOperation> for StoredOperation {
@@ -214,6 +311,7 @@ impl From<&DidDeploymentOperation> for StoredOperation {
             operation_id: parts.operation_id.as_str().to_owned(),
             profile_id: parts.profile_id.as_str().to_owned(),
             network: parts.network.as_str().to_owned(),
+            account_index: parts.account_index,
             state: parts.state.as_str().to_owned(),
             resume_from: parts
                 .resume_from
@@ -235,8 +333,26 @@ impl From<&DidDeploymentOperation> for StoredOperation {
                     transaction_hash_hex: receipt.transaction_hash_hex().to_owned(),
                     block_hash_hex: receipt.block_hash_hex().to_owned(),
                     block_height: receipt.block_height(),
+                    attempt_elapsed_millis: receipt.attempt_elapsed_millis(),
                 })
                 .collect(),
+            observations: parts
+                .observations
+                .into_iter()
+                .map(|observation| StoredObservation {
+                    effect: observation.effect().as_str().to_owned(),
+                    action_transaction_hash_hex: observation
+                        .action_transaction_hash_hex()
+                        .to_owned(),
+                    action_block_hash_hex: observation.action_block_hash_hex().to_owned(),
+                    action_block_height: observation.action_block_height(),
+                    visibility_wait_millis: observation.visibility_wait_millis(),
+                })
+                .collect(),
+            legacy_observations_pending: parts.legacy_observations_pending,
+            revision: parts.revision,
+            attempt: parts.attempt,
+            attempt_started_at_millis: Some(parts.attempt_started_at_millis),
             transaction_hash_hex: parts.transaction_hash_hex,
             block_hash_hex: parts.block_hash_hex,
             block_height: parts.block_height,
@@ -254,6 +370,7 @@ impl StoredOperation {
             profile_id: IdentityProfileId::parse(self.profile_id.clone())
                 .map_err(|_| DidDeploymentOperationError::Integrity)?,
             network: parse_network(&self.network)?,
+            account_index: self.account_index,
             state: parse_state(&self.state)?,
             resume_from: self.resume_from.as_deref().map(parse_state).transpose()?,
             failure: self.failure.as_deref().map(parse_failure).transpose()?,
@@ -275,10 +392,31 @@ impl StoredOperation {
                         receipt.transaction_hash_hex.clone(),
                         receipt.block_hash_hex.clone(),
                         receipt.block_height,
+                        receipt.attempt_elapsed_millis,
                     )
                     .map_err(|_| DidDeploymentOperationError::Integrity)
                 })
                 .collect::<Result<Vec<_>, _>>()?,
+            observations: self
+                .observations
+                .iter()
+                .map(|observation| {
+                    DidDeploymentObservation::restore(
+                        parse_effect(&observation.effect)?,
+                        observation.action_transaction_hash_hex.clone(),
+                        observation.action_block_hash_hex.clone(),
+                        observation.action_block_height,
+                        observation.visibility_wait_millis,
+                    )
+                    .map_err(|_| DidDeploymentOperationError::Integrity)
+                })
+                .collect::<Result<Vec<_>, _>>()?,
+            legacy_observations_pending: self.legacy_observations_pending,
+            revision: self.revision,
+            attempt: self.attempt,
+            attempt_started_at_millis: self
+                .attempt_started_at_millis
+                .unwrap_or(self.created_at_millis),
             transaction_hash_hex: self.transaction_hash_hex.clone(),
             block_hash_hex: self.block_hash_hex.clone(),
             block_height: self.block_height,
@@ -332,6 +470,7 @@ fn parse_state(value: &str) -> Result<DidDeploymentState, DidDeploymentOperation
         "proving" => Ok(DidDeploymentState::Proving),
         "submitting" => Ok(DidDeploymentState::Submitting),
         "confirming" => Ok(DidDeploymentState::Confirming),
+        "awaiting_visibility" => Ok(DidDeploymentState::AwaitingVisibility),
         "resolving" => Ok(DidDeploymentState::Resolving),
         "ready" => Ok(DidDeploymentState::Ready),
         "retryable_failure" => Ok(DidDeploymentState::RetryableFailure),
@@ -365,11 +504,13 @@ fn parse_failure(value: &str) -> Result<DidDeploymentFailure, DidDeploymentOpera
         "funding_unavailable" => Ok(DidDeploymentFailure::FundingUnavailable),
         "insufficient_night" => Ok(DidDeploymentFailure::InsufficientNight),
         "chain_state_unavailable" => Ok(DidDeploymentFailure::ChainStateUnavailable),
+        "ledger_state_conflict" => Ok(DidDeploymentFailure::LedgerStateConflict),
         "unsupported_network" => Ok(DidDeploymentFailure::UnsupportedNetwork),
         "invalid_funding_plan" => Ok(DidDeploymentFailure::InvalidFundingPlan),
         "insufficient_dust" => Ok(DidDeploymentFailure::InsufficientDust),
         "proving_unavailable" => Ok(DidDeploymentFailure::ProvingUnavailable),
         "submission_rejected" => Ok(DidDeploymentFailure::SubmissionRejected),
+        "attempt_limit_reached" => Ok(DidDeploymentFailure::AttemptLimitReached),
         "resolution_unavailable" => Ok(DidDeploymentFailure::ResolutionUnavailable),
         "resolution_mismatch" => Ok(DidDeploymentFailure::ResolutionMismatch),
         "persistence_unavailable" => Ok(DidDeploymentFailure::PersistenceUnavailable),
@@ -448,6 +589,7 @@ mod tests {
             DidDeploymentOperationId::parse(id).expect("operation id"),
             IdentityProfileId::parse(profile).expect("profile id"),
             MidnightNetwork::Undeployed,
+            0,
             UnixTimestampMillis::new(1_000),
         )
         .expect("operation")
@@ -458,21 +600,46 @@ mod tests {
         let store = Store::new();
         let did =
             MidnightDid::parse(format!("did:midnight:undeployed:{}", "a".repeat(64))).expect("did");
-        let operation = operation("operation-1", "profile-1")
+        let mut operation = operation("operation-1", "profile-1");
+        store
+            .repository
+            .upsert(operation.clone())
+            .expect("save initial");
+        operation = operation
             .composed(did, "draft-1".to_owned(), UnixTimestampMillis::new(2_000))
-            .expect("composed")
+            .expect("composed");
+        store
+            .repository
+            .upsert(operation.clone())
+            .expect("save composed");
+        operation = operation
             .transition(DidDeploymentState::Proving, UnixTimestampMillis::new(3_000))
-            .expect("proving")
+            .expect("proving");
+        store
+            .repository
+            .upsert(operation.clone())
+            .expect("save proving");
+        operation = operation
             .transition(
                 DidDeploymentState::Submitting,
                 UnixTimestampMillis::new(4_000),
             )
-            .expect("submitting")
+            .expect("submitting");
+        store
+            .repository
+            .upsert(operation.clone())
+            .expect("save submitting");
+        operation = operation
             .transition(
                 DidDeploymentState::Confirming,
                 UnixTimestampMillis::new(5_000),
             )
-            .expect("confirming")
+            .expect("confirming");
+        store
+            .repository
+            .upsert(operation.clone())
+            .expect("save confirming");
+        operation = operation
             .included(
                 "1".repeat(64),
                 "2".repeat(64),
@@ -480,7 +647,10 @@ mod tests {
                 UnixTimestampMillis::new(6_000),
             )
             .expect("included");
-        store.repository.upsert(operation.clone()).expect("save");
+        store
+            .repository
+            .upsert(operation.clone())
+            .expect("save finalized");
 
         assert_eq!(
             store
@@ -502,6 +672,106 @@ mod tests {
                 .latest(operation.profile_id(), MidnightNetwork::Undeployed)
                 .expect("latest"),
             Some(operation)
+        );
+    }
+
+    #[test]
+    fn worker_permit_fences_independent_repository_instances() {
+        let store = Store::new();
+        let second = JsonDidDeploymentOperationRepository::new(store.repository.configured_path());
+        let permit = store.repository.try_acquire_worker().expect("first permit");
+        assert!(matches!(
+            second.try_acquire_worker(),
+            Err(DidDeploymentOperationError::Conflict)
+        ));
+        drop(permit);
+        assert!(second.try_acquire_worker().is_ok());
+    }
+
+    #[test]
+    fn legacy_receipt_survives_with_a_required_observation_before_protected_work() {
+        let store = Store::new();
+        let operation = operation("legacy-operation", "profile-1")
+            .composed(
+                MidnightDid::parse(format!("did:midnight:undeployed:{}", "a".repeat(64))).unwrap(),
+                "legacy-deploy".to_owned(),
+                UnixTimestampMillis::new(2_000),
+            )
+            .unwrap()
+            .transition(DidDeploymentState::Proving, UnixTimestampMillis::new(3_000))
+            .unwrap()
+            .transition(
+                DidDeploymentState::Submitting,
+                UnixTimestampMillis::new(4_000),
+            )
+            .unwrap()
+            .transition(
+                DidDeploymentState::Confirming,
+                UnixTimestampMillis::new(5_000),
+            )
+            .unwrap()
+            .included(
+                "1".repeat(64),
+                "2".repeat(64),
+                17,
+                UnixTimestampMillis::new(6_000),
+            )
+            .unwrap();
+        let mut legacy = serde_json::to_value(StoredOperation::from(&operation)).unwrap();
+        legacy["state"] = serde_json::json!("composing");
+        legacy["effect"] = serde_json::json!("install_verification_method_verifier");
+        for field in [
+            "observations",
+            "legacyObservationsPending",
+            "revision",
+            "attempt",
+            "attemptStartedAtMillis",
+        ] {
+            legacy.as_object_mut().unwrap().remove(field);
+        }
+        store_atomic::write_owner_private(
+            store.repository.configured_path(),
+            &serde_json::to_vec(&serde_json::json!({"schemaVersion":2,"operations":[legacy]}))
+                .unwrap(),
+        )
+        .unwrap();
+        let restored = store
+            .repository
+            .get(operation.operation_id())
+            .expect("legacy journal");
+        assert!(restored.legacy_observations_pending());
+        assert_eq!(restored.receipts(), operation.receipts());
+        let observed = restored
+            .observed(
+                "3".repeat(64),
+                "2".repeat(64),
+                17,
+                UnixTimestampMillis::new(7_000),
+            )
+            .unwrap();
+        assert!(!observed.legacy_observations_pending());
+        assert_eq!(
+            observed.effect(),
+            DidDeploymentEffect::InstallVerificationMethodVerifier
+        );
+        store
+            .repository
+            .upsert(observed)
+            .expect("migrated checkpoint");
+    }
+
+    #[test]
+    fn rejects_stale_revision_writes() {
+        let store = Store::new();
+        let operation = operation("operation-1", "profile-1");
+        store
+            .repository
+            .upsert(operation.clone())
+            .expect("initial save");
+        assert_eq!(
+            store.repository.upsert(operation),
+            Err(DidDeploymentOperationError::Conflict),
+            "a duplicate/stale worker cannot overwrite the same revision"
         );
     }
 

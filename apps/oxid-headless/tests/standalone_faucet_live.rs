@@ -211,13 +211,7 @@ impl ProcessHarness {
     }
 
     fn request(&mut self, id: &str, method: &str, params: Value) -> Value {
-        serde_json::to_writer(
-            &mut self.input,
-            &json!({"protocol":self.protocol,"id":id,"method":method,"params":params}),
-        )
-        .expect("request JSON");
-        self.input.write_all(b"\n").expect("request newline");
-        self.input.flush().expect("request flush");
+        self.send_request(id, method, params);
         let mut line = String::new();
         self.output.read_line(&mut line).expect("response line");
         if line.is_empty() {
@@ -228,6 +222,16 @@ impl ProcessHarness {
             panic!("child exited before responding; stderr={stderr}");
         }
         serde_json::from_str(&line).expect("response JSON")
+    }
+
+    fn send_request(&mut self, id: &str, method: &str, params: Value) {
+        serde_json::to_writer(
+            &mut self.input,
+            &json!({"protocol":self.protocol,"id":id,"method":method,"params":params}),
+        )
+        .expect("request JSON");
+        self.input.write_all(b"\n").expect("request newline");
+        self.input.flush().expect("request flush");
     }
 
     fn finish(mut self, method: &str) {
@@ -252,6 +256,82 @@ impl ProcessHarness {
             .read_to_string(&mut stderr)
             .expect("child stderr after failure");
         stderr
+    }
+}
+
+fn read_did_checkpoint(root: &Path) -> Result<Option<Value>, String> {
+    let bytes = match fs::read(root.join("private/did-deployments.json")) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(format!("read DID publication checkpoint: {error}")),
+    };
+    let journal: Value = serde_json::from_slice(&bytes).map_err(|error| error.to_string())?;
+    let entries = journal["operations"]
+        .as_array()
+        .ok_or("DID journal entries are missing")?;
+    let [entry] = entries.as_slice() else {
+        return Err("isolated holder must have exactly one operation".into());
+    };
+    Ok(Some(entry.clone()))
+}
+
+fn interrupt_did_between_effects(wallet: &mut ProcessHarness, root: &Path) -> Value {
+    let deadline = Instant::now() + DID_DEPLOYMENT_DEADLINE;
+    loop {
+        wallet.send_request(
+            "did-deploy",
+            "did.deploy",
+            json!({"network":NETWORK,"accountIndex":0}),
+        );
+        let process = wallet.child.as_mut().expect("owned wallet process");
+        let output = &mut wallet.output;
+        let response = thread::scope(|scope| {
+            let read_response = scope.spawn(move || {
+                let mut line = String::new();
+                output
+                    .read_line(&mut line)
+                    .expect("read deployment response");
+                line
+            });
+            loop {
+                let has_partial_receipts = read_did_checkpoint(root).map(|checkpoint| {
+                    checkpoint
+                        .and_then(|entry| entry["receipts"].as_array().map(Vec::len))
+                        .is_some_and(|count| (1..8).contains(&count))
+                });
+                if !matches!(has_partial_receipts, Ok(false)) || Instant::now() >= deadline {
+                    process.kill().expect("terminate owned wallet process");
+                    process.wait().expect("reap owned wallet process");
+                    read_response.join().expect("finish response reader");
+                    assert!(
+                        has_partial_receipts.expect("observe durable publication checkpoint"),
+                        "no partial DID receipt before deadline"
+                    );
+                    return None;
+                }
+                if read_response.is_finished() {
+                    return Some(read_response.join().expect("finish response reader"));
+                }
+                thread::sleep(Duration::from_millis(25));
+            }
+        });
+        let Some(response) = response else {
+            wallet.child.take();
+            return read_did_checkpoint(root)
+                .expect("read checkpoint after process death")
+                .expect("restore checkpoint after process death");
+        };
+        let response: Value = serde_json::from_str(&response).expect("valid progress response");
+        assert_eq!(
+            response["ok"], true,
+            "DID start must return durable progress"
+        );
+        let stage = response["result"]["deployment"]["state"].as_str();
+        assert!(
+            !matches!(stage, Some("ready" | "retryable_failure")),
+            "DID reached {stage:?} before the interruption"
+        );
+        thread::sleep(Duration::from_secs(2));
     }
 }
 
@@ -694,11 +774,9 @@ fn register_and_await_dust(wallet: &mut ProcessHarness) -> Duration {
                 .as_str()
                 .and_then(|amount| amount.parse::<u128>().ok())
                 .unwrap_or_default();
-            assert!(
-                amount > 0,
-                "ready settlement must expose non-zero DUST: {dust}"
-            );
-            return started.elapsed();
+            if amount > 0 {
+                return started.elapsed();
+            }
         }
 
         let advance = if settlement_state_is_retryable(state) {
@@ -864,6 +942,40 @@ fn funded_wallet_deploys_and_resolves_a_native_holder_did() {
     assert!(dust <= DUST_DEADLINE);
 
     let started = Instant::now();
+    let checkpoint = interrupt_did_between_effects(&mut wallet, &wallet_root);
+    let confirmed = checkpoint["receipts"].as_array().expect("confirmed prefix");
+    assert!(
+        (1..8).contains(&confirmed.len()),
+        "process must stop between DID writes"
+    );
+    wallet = ProcessHarness::wallet(&wallet_root);
+    for (id, method, params) in [
+        (
+            "restart-select-profile",
+            "wallet.profile.select",
+            json!({"profileId":checkpoint["profileId"]}),
+        ),
+        (
+            "restart-select-network",
+            "wallet.network.select",
+            json!({"networkId":NETWORK}),
+        ),
+        ("restart-unlock", "wallet.security.unlock", json!({})),
+    ] {
+        let response = wallet.request(id, method, params);
+        assert_eq!(response["ok"], true, "{id} failed after process death");
+    }
+    await_night(&mut wallet);
+    register_and_await_dust(&mut wallet);
+    let restored = wallet.request(
+        "restored-did-progress",
+        "did.deploy.status",
+        json!({"network": NETWORK}),
+    );
+    assert_eq!(restored["ok"], true, "read restored DID progress");
+    let restored = &restored["result"]["deployment"];
+    assert_eq!(restored["operationId"], checkpoint["operationId"]);
+    assert_eq!(restored["revision"], checkpoint["revision"]);
     let deployment = loop {
         let deployment = wallet.request(
             "did-deploy",
@@ -900,6 +1012,8 @@ fn funded_wallet_deploys_and_resolves_a_native_holder_did() {
         thread::sleep(Duration::from_secs(2));
     };
     let snapshot = &deployment["result"]["deployment"];
+    assert_eq!(snapshot["operationId"], checkpoint["operationId"]);
+    assert_eq!(snapshot["did"], checkpoint["did"]);
     assert_eq!(snapshot["effect"], "resolve_document");
     assert_eq!(snapshot["containsSecrets"], false);
     assert_eq!(
@@ -909,6 +1023,23 @@ fn funded_wallet_deploys_and_resolves_a_native_holder_did() {
             .len(),
         8
     );
+    for (retained, final_receipt) in confirmed
+        .iter()
+        .zip(snapshot["receipts"].as_array().expect("final DID receipts"))
+    {
+        for field in [
+            "effect",
+            "submissionId",
+            "transactionHashHex",
+            "blockHashHex",
+            "blockHeight",
+        ] {
+            assert_eq!(
+                final_receipt[field], retained[field],
+                "confirmed receipt changed during restart"
+            );
+        }
+    }
     let did = snapshot["did"].as_str().expect("deployed DID");
     let resolved = wallet.request("did-resolve", "did.resolve", json!({"did":did}));
     assert_eq!(resolved["ok"], true, "{resolved}");
@@ -921,7 +1052,8 @@ fn funded_wallet_deploys_and_resolves_a_native_holder_did() {
     faucet.finish("faucet.shutdown");
     root.cleanup();
     println!(
-        "standalone-native-did-e2e: PASS receipts=8 durationSeconds={}",
+        "standalone-native-did-e2e: PASS restart=true preservedReceipts={} receipts=8 durationSeconds={}",
+        confirmed.len(),
         started.elapsed().as_secs()
     );
 }

@@ -706,6 +706,11 @@ pub fn capability_manifest(context: CapabilityManifestContext) -> Vec<Capability
             .boolean("durable", true)
             .boolean("secretsExposed", false)
             .boolean("indexedReceiptBarrier", true),
+        CapabilityView::new("did.deploy.status", "composition_dependent")
+            .text("mode", "native_ledger")
+            .text("scope", "active_profile")
+            .boolean("readOnly", true)
+            .boolean("secretsExposed", false),
         CapabilityView::new("did.resolve", "ready")
             .text("mode", "standalone")
             .texts("sources", &["standalone", "live"]),

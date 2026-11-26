@@ -17,23 +17,26 @@ use oxid_adapter_did_midnight::{
 };
 use oxid_adapter_midnight::{
     MidnightContractCallFundingPort, MidnightContractCallFundingRequest,
-    MidnightContractCallSubmissionPort, MidnightContractCallSubmissionRequest,
-    MidnightContractCallSubmissionState, MidnightPublicCallContextSource,
-    MidnightRemoteProvingMaterialSource, MidnightStandaloneConfig,
+    MidnightContractCallSubmissionMode, MidnightContractCallSubmissionPort,
+    MidnightContractCallSubmissionRequest, MidnightContractCallSubmissionState,
+    MidnightPublicCallContextSource, MidnightRemoteProvingMaterialSource, MidnightStandaloneConfig,
 };
 use oxid_adapter_passport_vault::{
-    NodeAnchoredPassportVaultStateSource, PassportVaultCallChainContextSource,
+    CanonicalMidnightOperation, NodeAnchoredPassportVaultStateSource,
+    PassportVaultCallChainContextSource,
 };
+use oxid_diagnostics_application::{DiagnosticCode, DiagnosticEventSinkPort, DiagnosticSeverity};
 use oxid_foundation::UnixTimestampMillis;
 use oxid_identity_application::{
     DeployDidCommand, DeployDidFuture, DeployDidUseCase, DidDeploymentEffect, DidDeploymentFailure,
-    DidDeploymentOperation, DidDeploymentOperationError, DidDeploymentOperationId,
-    DidDeploymentOperationRepository, DidDeploymentState, DidDeploymentUseCaseError, DidResolution,
-    DidResolutionPort, DidResolutionPortError, DidResolutionSource, IdentityProfileId, JwkCurve,
-    MidnightDid, MidnightNetwork, VerificationRelationship,
+    DidDeploymentObservation, DidDeploymentOperation, DidDeploymentOperationError,
+    DidDeploymentOperationId, DidDeploymentOperationRepository, DidDeploymentReceipt,
+    DidDeploymentState, DidDeploymentUseCaseError, DidResolution, DidResolutionPort,
+    DidResolutionPortError, DidResolutionSource, IdentityProfileId, JwkCurve, MidnightDid,
+    MidnightNetwork, VerificationRelationship,
 };
 use oxid_passport_vault_application::{
-    PassportVaultContractStateSourceError, PassportVaultContractStateSourcePort,
+    PassportVaultContractStateSnapshot, PassportVaultContractStateSourceError,
 };
 use oxid_platform_ports::{ClockPort, RandomPort};
 use oxid_wallet_application::{
@@ -43,6 +46,7 @@ use sha2::{Digest, Sha256};
 use zeroize::Zeroizing;
 
 const DEPLOYMENT_TTL_MILLIS: u64 = 60 * 60 * 1_000;
+const MAX_AUTOMATIC_REPLACEMENTS: u32 = 2;
 
 struct NativeDidProvingMaterialSource {
     artifacts: MidnightDidCompactArtifacts,
@@ -117,6 +121,7 @@ where
         midnight,
         Arc::clone(&services.did_resolution_port),
         super::identity::headless_did_deployment_repository(),
+        services.diagnostic_events(),
     ) {
         services.deploy_did = deployment;
     }
@@ -129,6 +134,7 @@ pub(super) fn native_did_deployment<K, M>(
     midnight: Arc<M>,
     resolver: Arc<dyn DidResolutionPort>,
     operations: Arc<dyn DidDeploymentOperationRepository>,
+    diagnostics: Arc<dyn DiagnosticEventSinkPort>,
 ) -> Option<Arc<dyn DeployDidUseCase>>
 where
     K: WalletDerivedSecretUsePort + WalletKeyOperationPort + 'static,
@@ -160,6 +166,7 @@ where
         submission,
         resolver,
         operations,
+        diagnostics,
         Arc::new(oxid_adapter_platform_system::SystemClock),
         Arc::new(oxid_adapter_platform_system::OsRandom),
     )))
@@ -171,6 +178,7 @@ pub(super) struct NativeDidDeploymentService {
     submission: Arc<dyn MidnightContractCallSubmissionPort>,
     resolver: Arc<dyn DidResolutionPort>,
     operations: Arc<dyn DidDeploymentOperationRepository>,
+    diagnostics: Arc<dyn DiagnosticEventSinkPort>,
     clock: Arc<dyn ClockPort>,
     random: Arc<dyn RandomPort>,
 }
@@ -194,7 +202,21 @@ trait DidDeploymentEffectComposer: Send + Sync {
         operation: &'a DidDeploymentOperation,
         account_index: u32,
     ) -> DidDeploymentEffectFuture<'a>;
+
+    /// Reads authenticated state for the exact finalized predecessor. This is
+    /// deliberately distinct from composition so an indexer result, node ack,
+    /// or best block cannot advance the ordered cursor.
+    fn observe<'a>(
+        &'a self,
+        operation: &'a DidDeploymentOperation,
+    ) -> DidDeploymentObservationFuture<'a>;
 }
+
+type DidDeploymentObservationFuture<'a> = Pin<
+    Box<
+        dyn Future<Output = Result<DidDeploymentObservation, NativeDidDeploymentError>> + Send + 'a,
+    >,
+>;
 
 type DidDeploymentContextFuture<'a> = Pin<
     Box<dyn Future<Output = Result<MidnightDidCallContext, NativeDidDeploymentError>> + Send + 'a>,
@@ -205,10 +227,30 @@ pub(super) trait DidDeploymentContextSource: Send + Sync {
         &'a self,
         operation: &'a DidDeploymentOperation,
     ) -> DidDeploymentContextFuture<'a>;
+
+    fn observe<'a>(
+        &'a self,
+        operation: &'a DidDeploymentOperation,
+    ) -> DidDeploymentObservationFuture<'a> {
+        Box::pin(async move {
+            let context = self.context(operation).await?;
+            let receipt = operation
+                .next_observation_receipt()
+                .ok_or(NativeDidDeploymentError::Integrity)?;
+            DidDeploymentObservation::restore(
+                receipt.effect(),
+                hex::encode(context.observation_transaction_hash),
+                hex::encode(context.observation_block_hash),
+                context.observation_block_height,
+                None,
+            )
+            .map_err(NativeDidDeploymentError::from)
+        })
+    }
 }
 
 struct NodeAnchoredDidDeploymentContextSource {
-    chain: Arc<NodeAnchoredPassportVaultStateSource>,
+    chain: NodeAnchoredPassportVaultStateSource,
     wallet: Arc<dyn MidnightPublicCallContextSource>,
 }
 
@@ -223,10 +265,46 @@ impl NodeAnchoredDidDeploymentContextSource {
             config.contract_state_authentication(),
         )
         .map_err(|_| NativeDidDeploymentError::Unavailable)?;
-        Ok(Self {
-            chain: Arc::new(chain),
-            wallet,
-        })
+        Ok(Self { chain, wallet })
+    }
+
+    async fn authenticated_state(
+        &self,
+        contract_address: [u8; 32],
+        receipt: &DidDeploymentReceipt,
+        historical: bool,
+    ) -> Result<PassportVaultContractStateSnapshot, NativeDidDeploymentError> {
+        let address = hex::encode(contract_address);
+        let expected = match receipt.effect() {
+            DidDeploymentEffect::DeployContract => {
+                CanonicalMidnightOperation::Deploy(contract_address)
+            }
+            DidDeploymentEffect::InstallVerificationMethodVerifier
+            | DidDeploymentEffect::InstallJubjubVerifier
+            | DidDeploymentEffect::InstallRelationshipVerifier => {
+                CanonicalMidnightOperation::Maintain(contract_address)
+            }
+            DidDeploymentEffect::AddAuthenticationMethod
+            | DidDeploymentEffect::AddAuthenticationRelationship
+            | DidDeploymentEffect::AddAssertionMethod
+            | DidDeploymentEffect::AddAssertionRelationship => {
+                CanonicalMidnightOperation::Call(contract_address)
+            }
+            DidDeploymentEffect::ResolveDocument => {
+                return Err(NativeDidDeploymentError::Integrity);
+            }
+        };
+        self.chain
+            .read_verified_effect(
+                &address,
+                expected,
+                decode_hex_32(receipt.transaction_hash_hex())?,
+                decode_hex_32(receipt.block_hash_hex())?,
+                receipt.block_height(),
+                historical,
+            )
+            .await
+            .map_err(map_contract_state_error)
     }
 }
 
@@ -237,26 +315,18 @@ impl DidDeploymentContextSource for NodeAnchoredDidDeploymentContextSource {
     ) -> DidDeploymentContextFuture<'a> {
         Box::pin(async move {
             let did = operation.did().ok_or(NativeDidDeploymentError::Integrity)?;
-            let address = hex::encode(did_contract_address(did)?);
+            let contract_address = did_contract_address(did)?;
             let receipt = operation
                 .receipts()
                 .last()
                 .ok_or(NativeDidDeploymentError::Integrity)?;
             let snapshot = self
-                .chain
-                .read(&address)
-                .await
-                .map_err(map_contract_state_error)?;
-            // The submission receipt identifies the enclosing Substrate extrinsic,
-            // while the indexer exposes the embedded Midnight transaction hash.
-            // Those are intentionally different hash domains. Bind the indexed
-            // contract action to the receipt's exact finalized block and contract
-            // address before composing the next effect.
-            if snapshot.contract_address_hex != address
-                || snapshot.action_block_hash_hex != receipt.block_hash_hex()
-                || snapshot.action_block_height != receipt.block_height()
-            {
-                return Err(NativeDidDeploymentError::IndexerPending);
+                .authenticated_state(contract_address, receipt, false)
+                .await?;
+            if operation.observations().last().is_none_or(|observation| {
+                observation.action_transaction_hash_hex() != snapshot.transaction_hash_hex
+            }) {
+                return Err(NativeDidDeploymentError::LedgerStateConflict);
             }
             let chain = self
                 .chain
@@ -275,7 +345,7 @@ impl DidDeploymentContextSource for NodeAnchoredDidDeploymentContextSource {
                 .ok_or(NativeDidDeploymentError::Integrity)?;
             Ok(MidnightDidCallContext {
                 contract_state: snapshot.serialized_contract_state,
-                contract_address: did_contract_address(did)?,
+                contract_address,
                 observation_transaction_hash: decode_hex_32(&snapshot.transaction_hash_hex)?,
                 observation_block_hash: decode_hex_32(&snapshot.action_block_hash_hex)?,
                 observation_block_height: snapshot.action_block_height,
@@ -287,6 +357,33 @@ impl DidDeploymentContextSource for NodeAnchoredDidDeploymentContextSource {
                 coin_public_key: wallet.coin_public_key(),
                 encryption_public_key: wallet.encryption_public_key(),
             })
+        })
+    }
+
+    fn observe<'a>(
+        &'a self,
+        operation: &'a DidDeploymentOperation,
+    ) -> DidDeploymentObservationFuture<'a> {
+        Box::pin(async move {
+            let did = operation.did().ok_or(NativeDidDeploymentError::Integrity)?;
+            let receipt = operation
+                .next_observation_receipt()
+                .ok_or(NativeDidDeploymentError::Integrity)?;
+            let snapshot = self
+                .authenticated_state(
+                    did_contract_address(did)?,
+                    receipt,
+                    operation.legacy_observations_pending(),
+                )
+                .await?;
+            DidDeploymentObservation::restore(
+                receipt.effect(),
+                snapshot.transaction_hash_hex,
+                snapshot.action_block_hash_hex,
+                snapshot.action_block_height,
+                None,
+            )
+            .map_err(NativeDidDeploymentError::from)
         })
     }
 }
@@ -425,6 +522,13 @@ impl DidDeploymentEffectComposer for NativeDidDeploymentEffects {
             })
         })
     }
+
+    fn observe<'a>(
+        &'a self,
+        operation: &'a DidDeploymentOperation,
+    ) -> DidDeploymentObservationFuture<'a> {
+        self.contexts.observe(operation)
+    }
 }
 
 impl NativeDidDeploymentService {
@@ -438,6 +542,7 @@ impl NativeDidDeploymentService {
         submission: Arc<dyn MidnightContractCallSubmissionPort>,
         resolver: Arc<dyn DidResolutionPort>,
         operations: Arc<dyn DidDeploymentOperationRepository>,
+        diagnostics: Arc<dyn DiagnosticEventSinkPort>,
         clock: Arc<dyn ClockPort>,
         random: Arc<dyn RandomPort>,
     ) -> Self {
@@ -452,6 +557,7 @@ impl NativeDidDeploymentService {
             submission,
             resolver,
             operations,
+            diagnostics,
             clock,
             random,
         }
@@ -474,6 +580,7 @@ impl NativeDidDeploymentService {
             submission,
             resolver,
             operations,
+            diagnostics: Arc::new(oxid_diagnostics_application::NoopDiagnosticEventSink),
             clock,
             random,
         }
@@ -488,6 +595,16 @@ impl NativeDidDeploymentService {
         if network == MidnightNetwork::Offchain {
             return Err(NativeDidDeploymentError::InvalidRequest);
         }
+        let _worker = match self.operations.try_acquire_worker() {
+            Ok(worker) => worker,
+            Err(DidDeploymentOperationError::Conflict) => {
+                return self
+                    .operations
+                    .latest(&profile_id, network)?
+                    .ok_or(NativeDidDeploymentError::Unavailable);
+            }
+            Err(error) => return Err(error.into()),
+        };
         let mut operation = match self.operations.active(&profile_id, network)? {
             Some(operation) => operation,
             None => match self.operations.latest(&profile_id, network)? {
@@ -495,14 +612,64 @@ impl NativeDidDeploymentService {
                     return Ok(operation);
                 }
                 Some(_) => return Err(NativeDidDeploymentError::Integrity),
-                None => self.new_operation(profile_id, network)?,
+                None => self.new_operation(profile_id, network, account_index)?,
             },
         };
 
-        for _ in 0..16 {
+        if operation
+            .account_index()
+            .is_some_and(|saved| saved != account_index)
+        {
+            return Err(NativeDidDeploymentError::InvalidRequest);
+        }
+
+        // Each of eight writes has a distinct finalization and visibility
+        // transition, followed by live resolution.
+        for _ in 0..24 {
+            if operation.state() == DidDeploymentState::AwaitingVisibility
+                || (operation.legacy_observations_pending()
+                    && !matches!(
+                        operation.state(),
+                        DidDeploymentState::Submitting
+                            | DidDeploymentState::Confirming
+                            | DidDeploymentState::OutcomeUnknown
+                            | DidDeploymentState::RetryableFailure
+                    ))
+            {
+                match self.effects.observe(&operation).await {
+                    Ok(observation) => {
+                        operation = operation.observed(
+                            observation.action_transaction_hash_hex().to_owned(),
+                            observation.action_block_hash_hex().to_owned(),
+                            observation.action_block_height(),
+                            self.now()?,
+                        )?;
+                        self.operations.upsert(operation.clone())?;
+                        self.diagnostics.record(
+                            DiagnosticCode::IdentityDidPublicationEffectVisible,
+                            DiagnosticSeverity::Info,
+                        );
+                        continue;
+                    }
+                    // Preserve the finalized receipt and do no protected work
+                    // until the exact action becomes observable on the same
+                    // canonical history.
+                    Err(
+                        NativeDidDeploymentError::IndexerPending
+                        | NativeDidDeploymentError::Unavailable,
+                    ) => return Ok(operation),
+                    Err(NativeDidDeploymentError::LedgerStateConflict) => {
+                        return self.pause(operation, DidDeploymentFailure::LedgerStateConflict);
+                    }
+                    Err(error) => return Err(error),
+                }
+            }
             match operation.state() {
                 DidDeploymentState::Ready => return Ok(operation),
                 DidDeploymentState::Resolving => return self.resolve(operation).await,
+                DidDeploymentState::AwaitingVisibility => {
+                    return Err(NativeDidDeploymentError::Integrity);
+                }
                 DidDeploymentState::OutcomeUnknown => {
                     operation = self.reconcile(operation)?;
                     if operation.state() == DidDeploymentState::OutcomeUnknown {
@@ -521,12 +688,16 @@ impl NativeDidDeploymentService {
                         DidDeploymentState::Submitting
                             | DidDeploymentState::Confirming
                             | DidDeploymentState::OutcomeUnknown
+                            | DidDeploymentState::RetryableFailure
                     ) {
                         return Ok(operation);
                     }
                     continue;
                 }
                 DidDeploymentState::RetryableFailure => {
+                    if operation.failure() == Some(DidDeploymentFailure::AttemptLimitReached) {
+                        return Ok(operation);
+                    }
                     let resume = operation
                         .resume_from()
                         .ok_or(NativeDidDeploymentError::Integrity)?;
@@ -539,15 +710,27 @@ impl NativeDidDeploymentService {
                 | DidDeploymentState::Proving => {}
             }
 
+            if request_expires_at(&operation)?.value() <= self.now()?.value() {
+                operation = operation.renew_unarmed_attempt(self.now()?)?;
+                self.operations.upsert(operation.clone())?;
+            }
             let plan = match self.effects.compose(&operation, account_index).await {
                 Ok(plan) => plan,
                 Err(NativeDidDeploymentError::IndexerPending) => return Ok(operation),
                 Err(NativeDidDeploymentError::Unavailable) => {
                     return self.pause(operation, DidDeploymentFailure::CompositionUnavailable);
                 }
+                Err(NativeDidDeploymentError::ProtectionLocked) => {
+                    return self.pause(operation, DidDeploymentFailure::ProtectionLocked);
+                }
+                Err(NativeDidDeploymentError::LedgerStateConflict) => {
+                    return self.pause(operation, DidDeploymentFailure::LedgerStateConflict);
+                }
                 Err(error) => return Err(error),
             };
-            let draft_id = effect_submission_id(&operation);
+            let draft_id = operation
+                .submission_id()
+                .map_or_else(|| effect_submission_id(&operation), str::to_owned);
             if operation.state() == DidDeploymentState::Composing {
                 operation = if operation.effect() == DidDeploymentEffect::DeployContract {
                     operation.composed(
@@ -602,14 +785,36 @@ impl NativeDidDeploymentService {
                 ),
             ) {
                 Ok(outcome) => outcome,
-                Err(WalletTransactionPortError::SubmissionOutcomeUnknown) => {
+                Err(error) => {
+                    // Once submission has started, only the journal can
+                    // distinguish a pre-arm failure from an ambiguous send.
+                    if error != WalletTransactionPortError::SubmissionOutcomeUnknown
+                        && matches!(
+                            self.submission.contract_call_submission_status(
+                                operation.profile_id().as_str(),
+                                operation
+                                    .submission_id()
+                                    .ok_or(NativeDidDeploymentError::Integrity)?,
+                            ),
+                            Err(WalletTransactionPortError::DraftNotFound)
+                        )
+                    {
+                        return self.pause(operation, map_transaction_failure(error));
+                    }
                     let unknown = operation.outcome_unknown(self.now()?)?;
                     self.operations.upsert(unknown.clone())?;
+                    self.diagnostics.record(
+                        DiagnosticCode::IdentityDidPublicationOutcomeUnknown,
+                        DiagnosticSeverity::Warning,
+                    );
                     return Ok(unknown);
                 }
-                Err(error) => return self.pause(operation, map_transaction_failure(error)),
             };
+            if outcome.mode != MidnightContractCallSubmissionMode::Live {
+                return Err(NativeDidDeploymentError::Integrity);
+            }
             operation = operation.transition(DidDeploymentState::Confirming, self.now()?)?;
+            self.operations.upsert(operation.clone())?;
             operation = operation.included(
                 hex::encode(outcome.transaction_hash),
                 hex::encode(outcome.block_hash),
@@ -617,6 +822,13 @@ impl NativeDidDeploymentService {
                 self.now()?,
             )?;
             self.operations.upsert(operation.clone())?;
+            // Yield at the durable finality boundary. The UI can report the
+            // saved phase and the next command verifies visibility separately.
+            self.diagnostics.record(
+                DiagnosticCode::IdentityDidPublicationAwaitingVisibility,
+                DiagnosticSeverity::Info,
+            );
+            return Ok(operation);
         }
         Err(NativeDidDeploymentError::Integrity)
     }
@@ -625,6 +837,7 @@ impl NativeDidDeploymentService {
         &self,
         profile_id: IdentityProfileId,
         network: MidnightNetwork,
+        account_index: u32,
     ) -> Result<DidDeploymentOperation, NativeDidDeploymentError> {
         let mut random = [0_u8; 16];
         self.random
@@ -632,7 +845,8 @@ impl NativeDidDeploymentService {
             .map_err(|_| NativeDidDeploymentError::Unavailable)?;
         let id = DidDeploymentOperationId::parse(format!("did-deployment-{}", hex::encode(random)))
             .map_err(|_| NativeDidDeploymentError::InvalidRequest)?;
-        let operation = DidDeploymentOperation::new(id, profile_id, network, self.now()?)?;
+        let operation =
+            DidDeploymentOperation::new(id, profile_id, network, account_index, self.now()?)?;
         self.operations.upsert(operation.clone())?;
         Ok(operation)
     }
@@ -644,14 +858,40 @@ impl NativeDidDeploymentService {
         let draft_id = operation
             .submission_id()
             .ok_or(NativeDidDeploymentError::Integrity)?;
-        let status = self
+        let profile = operation.profile_id().as_str();
+        let status = match self
             .submission
-            .reconcile_contract_call_submission(operation.profile_id().as_str(), draft_id)
-            .map_err(|_| NativeDidDeploymentError::Transaction)?;
+            .reconcile_contract_call_submission(profile, draft_id)
+        {
+            Ok(status) => status,
+            Err(WalletTransactionPortError::DraftNotFound)
+                if operation.state() == DidDeploymentState::Submitting
+                    && matches!(
+                        self.submission
+                            .contract_call_submission_status(profile, draft_id),
+                        Err(WalletTransactionPortError::DraftNotFound)
+                    ) =>
+            {
+                // The worker permit fences other preparations. The native adapter
+                // writes the durable receipt before it can ever dispatch.
+                return self.pause(operation, DidDeploymentFailure::FundingUnavailable);
+            }
+            Err(WalletTransactionPortError::Unavailable | WalletTransactionPortError::Timeout) => {
+                return Ok(operation);
+            }
+            Err(_) => return Err(NativeDidDeploymentError::Transaction),
+        };
+        if status.draft_id != draft_id {
+            return Err(NativeDidDeploymentError::Integrity);
+        }
         match status.state {
             MidnightContractCallSubmissionState::Included => {
+                if status.mode != Some(MidnightContractCallSubmissionMode::Live) {
+                    return Err(NativeDidDeploymentError::Integrity);
+                }
                 let confirming =
                     operation.transition(DidDeploymentState::Confirming, self.now()?)?;
+                self.operations.upsert(confirming.clone())?;
                 let included = confirming.included(
                     hex::encode(
                         status
@@ -669,19 +909,47 @@ impl NativeDidDeploymentService {
                     self.now()?,
                 )?;
                 self.operations.upsert(included.clone())?;
+                self.diagnostics.record(
+                    DiagnosticCode::IdentityDidPublicationAwaitingVisibility,
+                    DiagnosticSeverity::Info,
+                );
                 Ok(included)
             }
             MidnightContractCallSubmissionState::OutcomeUnknown => {
-                let unknown = operation.outcome_unknown(self.now()?)?;
-                self.operations.upsert(unknown.clone())?;
-                Ok(unknown)
+                // Repeated read-only reconciliations are normal after a lost
+                // watch. They must not manufacture a second transition or
+                // reopen broadcast admission.
+                if operation.state() == DidDeploymentState::OutcomeUnknown {
+                    Ok(operation)
+                } else {
+                    let unknown = operation.outcome_unknown(self.now()?)?;
+                    self.operations.upsert(unknown.clone())?;
+                    self.diagnostics.record(
+                        DiagnosticCode::IdentityDidPublicationOutcomeUnknown,
+                        DiagnosticSeverity::Warning,
+                    );
+                    Ok(unknown)
+                }
             }
             MidnightContractCallSubmissionState::Running
             | MidnightContractCallSubmissionState::CancellationRequested
             | MidnightContractCallSubmissionState::Broadcasting => Ok(operation),
             MidnightContractCallSubmissionState::Rejected
             | MidnightContractCallSubmissionState::Expired => {
-                self.pause(operation, DidDeploymentFailure::SubmissionRejected)
+                // Only the submission adapter can return these terminal
+                // states: it has checked finalized rejection or canonical
+                // coverage through the journaled anchor and deadline. A new
+                // identity/deadline is therefore safe; no receipt is lost.
+                let replacement =
+                    operation.replace_attempt(self.now()?, MAX_AUTOMATIC_REPLACEMENTS)?;
+                self.operations.upsert(replacement.clone())?;
+                if replacement.failure() == Some(DidDeploymentFailure::AttemptLimitReached) {
+                    self.diagnostics.record(
+                        DiagnosticCode::IdentityDidPublicationPaused,
+                        DiagnosticSeverity::Warning,
+                    );
+                }
+                Ok(replacement)
             }
         }
     }
@@ -714,6 +982,10 @@ impl NativeDidDeploymentService {
         }
         let ready = operation.transition(DidDeploymentState::Ready, self.now()?)?;
         self.operations.upsert(ready.clone())?;
+        self.diagnostics.record(
+            DiagnosticCode::IdentityDidPublicationReady,
+            DiagnosticSeverity::Info,
+        );
         Ok(ready)
     }
 
@@ -724,6 +996,14 @@ impl NativeDidDeploymentService {
     ) -> Result<DidDeploymentOperation, NativeDidDeploymentError> {
         let paused = operation.retryable_failure(failure, self.now()?)?;
         self.operations.upsert(paused.clone())?;
+        self.diagnostics.record(
+            if failure == DidDeploymentFailure::ProtectionLocked {
+                DiagnosticCode::IdentityDidPublicationApprovalRequired
+            } else {
+                DiagnosticCode::IdentityDidPublicationPaused
+            },
+            DiagnosticSeverity::Warning,
+        );
         Ok(paused)
     }
 
@@ -741,6 +1021,19 @@ impl DeployDidUseCase for NativeDidDeploymentService {
                 .await
                 .map_err(DidDeploymentUseCaseError::from)
         })
+    }
+
+    fn status(
+        &self,
+        profile_id: &IdentityProfileId,
+        network: MidnightNetwork,
+    ) -> Result<Option<DidDeploymentOperation>, DidDeploymentUseCaseError> {
+        if network == MidnightNetwork::Offchain {
+            return Err(DidDeploymentUseCaseError::InvalidRequest);
+        }
+        self.operations
+            .latest(profile_id, network)
+            .map_err(|error| NativeDidDeploymentError::from(error).into())
     }
 }
 
@@ -799,9 +1092,10 @@ fn decode_hex_32(value: &str) -> Result<[u8; 32], NativeDidDeploymentError> {
 
 fn effect_submission_id(operation: &DidDeploymentOperation) -> String {
     format!(
-        "{}-{}",
+        "{}-{}-attempt-{}",
         operation.operation_id().as_str(),
-        operation.effect().as_str()
+        operation.effect().as_str(),
+        operation.attempt().saturating_add(1),
     )
 }
 
@@ -818,7 +1112,7 @@ fn request_expires_at(
     operation: &DidDeploymentOperation,
 ) -> Result<UnixTimestampMillis, NativeDidDeploymentError> {
     operation
-        .created_at()
+        .attempt_started_at()
         .value()
         .checked_add(DEPLOYMENT_TTL_MILLIS)
         .map(UnixTimestampMillis::new)
@@ -843,9 +1137,11 @@ const fn map_contract_state_error(
         PassportVaultContractStateSourceError::InvalidConfiguration
         | PassportVaultContractStateSourceError::InvalidAddress
         | PassportVaultContractStateSourceError::CapacityExceeded
-        | PassportVaultContractStateSourceError::InvalidResponse
-        | PassportVaultContractStateSourceError::FinalityMismatch => {
+        | PassportVaultContractStateSourceError::InvalidResponse => {
             NativeDidDeploymentError::Integrity
+        }
+        PassportVaultContractStateSourceError::FinalityMismatch => {
+            NativeDidDeploymentError::LedgerStateConflict
         }
     }
 }
@@ -914,6 +1210,8 @@ fn map_transaction_failure(error: WalletTransactionPortError) -> DidDeploymentFa
 pub(super) enum NativeDidDeploymentError {
     Unavailable,
     IndexerPending,
+    ProtectionLocked,
+    LedgerStateConflict,
     InvalidRequest,
     Integrity,
     Operation,
@@ -927,6 +1225,8 @@ impl fmt::Display for NativeDidDeploymentError {
         formatter.write_str(match self {
             Self::Unavailable => "native DID deployment dependencies are unavailable",
             Self::IndexerPending => "native DID deployment is waiting for indexed finality",
+            Self::ProtectionLocked => "native DID publication requires wallet unlock",
+            Self::LedgerStateConflict => "finalized ledger state conflicts with the DID receipt",
             Self::InvalidRequest => "native DID deployment request is invalid",
             Self::Integrity => "native DID deployment state failed integrity validation",
             Self::Operation => "native DID deployment operation persistence failed",
@@ -954,8 +1254,12 @@ impl From<DidDeploymentOperationError> for NativeDidDeploymentError {
 }
 
 impl From<oxid_identity_application::DidLifecyclePortError> for NativeDidDeploymentError {
-    fn from(_: oxid_identity_application::DidLifecyclePortError) -> Self {
-        Self::Lifecycle
+    fn from(error: oxid_identity_application::DidLifecyclePortError) -> Self {
+        if error == oxid_identity_application::DidLifecyclePortError::Locked {
+            Self::ProtectionLocked
+        } else {
+            Self::Lifecycle
+        }
     }
 }
 
@@ -970,6 +1274,8 @@ impl From<NativeDidDeploymentError> for DidDeploymentUseCaseError {
         match error {
             NativeDidDeploymentError::Unavailable => Self::Unavailable,
             NativeDidDeploymentError::IndexerPending => Self::Unavailable,
+            NativeDidDeploymentError::ProtectionLocked => Self::Composition,
+            NativeDidDeploymentError::LedgerStateConflict => Self::Integrity,
             NativeDidDeploymentError::InvalidRequest => Self::InvalidRequest,
             NativeDidDeploymentError::Integrity => Self::Integrity,
             NativeDidDeploymentError::Operation => Self::Persistence,

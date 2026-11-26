@@ -82,6 +82,7 @@
     "vault.withdraw",
     "did.create",
     "did.deploy",
+    "did.deploy.status",
     "did.resolve",
     "did.list",
     "did.get",
@@ -142,6 +143,7 @@
     "diagnostics.snapshot": "superseded",
     "vault.contract_state.read": "composition_dependent",
     "did.deploy": "composition_dependent",
+    "did.deploy.status": "composition_dependent",
     "credential.presentation.accept": "blocked"
   },
   "manifestAliases": {

@@ -63,8 +63,26 @@ OXID_ENABLE_LIVE_LEDGER9_DID_E2E=1 \
 
 The command attaches read-only to the shared stack, authenticates the generated
 DID artifacts, creates a fresh holder wallet, receives the fixed local grant,
-waits for positive DUST, deploys all eight holder-DID effects, and requires live
-resolution. It owns and removes only its temporary wallet/faucet state.
+and waits for positive DUST. It terminates the owned wallet process after
+observing a durable partial DID receipt list. A new wallet process reopens the
+same store and resumes the same operation and DID. The test compares the
+finalized prefix before and after restart, requires all eight effects and live
+resolution, and reports the number of preserved receipts. It removes its
+temporary wallet and faucet state.
+
+Headless clients can read the saved checkpoint with `did.deploy.status`
+without starting publication. The result separates finalized receipts from
+their authenticated observations and reports elapsed attempt and visibility
+wait times when measured. If protected composition needs an unlock, the
+checkpoint reports `protection_locked`. If authenticated state conflicts with
+a receipt, it reports `ledger_state_conflict`. Both pauses preserve the receipt
+prefix and the phase to resume. Continuing rechecks the same step before any
+successor is funded or submitted. The diagnostic ring records only fixed
+publication event codes.
+
+The coordinator allows two automatic replacements per effect after verified
+rejection or expiry. It retains a durable pause and the confirmed prefix when
+that budget is exhausted.
 
 The local development wallet uses the bounded settlement worker to retry
 preparation while the funded NIGHT output or fee allowance settles. A wallet
@@ -208,6 +226,11 @@ Once the expected faucet is listening, run these in the first terminal:
 run_portal_test testPrepareHolder 1800
 run_portal_test testFundedWalletRecoversAcrossRestart 600
 ```
+
+To qualify DID publication recovery itself, use a fresh disposable simulator
+and run `run_portal_test testDidPublicationRecoversAcrossRestart 1800` in place
+of those two selectors. It stops the app while publication has a partial
+finalized prefix and resumes from the identity inventory after a cold launch.
 
 The journey must perform, in order:
 

@@ -215,6 +215,107 @@ struct DecodedFinalizedBlock {
     transactions: Vec<DecodedMidnightTransaction>,
 }
 
+/// Links the receipt's Substrate extrinsic to the successful Midnight action
+/// emitted for that exact extrinsic in the canonical finalized block.
+pub(crate) async fn verified_effect_in_block(
+    rpc: &LegacyRpcMethods<SubstrateConfig>,
+    block_hash: subxt::utils::H256,
+    extrinsic_hash: [u8; 32],
+    expected: CanonicalMidnightOperation,
+) -> Result<[u8; 32], FinalizedMidnightHistoryError> {
+    let details = required_archive_item(rpc_result(rpc.chain_get_block(Some(block_hash))).await?)?;
+    let schema = RuntimeSchemaCache::default()
+        .at(rpc, details.block.header.parent_hash)
+        .await?;
+    let hasher = <SubstrateConfig as Config>::Hasher::new(&schema.metadata);
+    if details.block.header.hash_with(hasher) != block_hash {
+        return Err(FinalizedMidnightHistoryError::InvalidChainState);
+    }
+    if details.block.extrinsics.len() > MAX_EXTRINSICS_PER_BLOCK {
+        return Err(FinalizedMidnightHistoryError::CapacityExceeded);
+    }
+    let mut matched = details
+        .block
+        .extrinsics
+        .into_iter()
+        .enumerate()
+        .filter(|(_, raw)| hasher.hash(&raw.0).0 == extrinsic_hash);
+    let (index, raw) = matched
+        .next()
+        .ok_or(FinalizedMidnightHistoryError::InvalidChainState)?;
+    if matched.next().is_some() || raw.0.len() > MAX_TRANSACTION_BYTES {
+        return Err(FinalizedMidnightHistoryError::InvalidChainState);
+    }
+    let extrinsics =
+        Extrinsics::<SubstrateConfig>::decode_from(vec![raw.0], schema.metadata.clone())
+            .map_err(|_| FinalizedMidnightHistoryError::InvalidChainState)?;
+    let exact = extrinsics
+        .iter()
+        .next()
+        .ok_or(FinalizedMidnightHistoryError::InvalidChainState)?;
+    if !matches!(
+        (exact.pallet_name(), exact.variant_name()),
+        (Ok("Midnight"), Ok("send_mn_transaction"))
+    ) {
+        return Err(FinalizedMidnightHistoryError::InvalidChainState);
+    }
+    let event_bytes = required_archive_item(
+        rpc_result(rpc.state_get_storage(&schema.events_key, Some(block_hash))).await?,
+    )?;
+    if event_bytes.len() > MAX_EVENT_STORAGE_BYTES {
+        return Err(FinalizedMidnightHistoryError::CapacityExceeded);
+    }
+    let events = Events::<SubstrateConfig>::decode_from(event_bytes, schema.metadata);
+    if events.len() > MAX_EVENTS_PER_BLOCK {
+        return Err(FinalizedMidnightHistoryError::CapacityExceeded);
+    }
+    let mut scoped = Vec::new();
+    for event in events.iter() {
+        let event = event.map_err(|_| FinalizedMidnightHistoryError::InvalidChainState)?;
+        if matches!(event.phase(), Phase::ApplyExtrinsic(candidate) if candidate as usize == index)
+            && let Some(relevant) = decode_relevant_event(
+                event.pallet_name(),
+                event.variant_name(),
+                event.field_bytes(),
+            )?
+        {
+            scoped.push(relevant);
+        }
+    }
+    exact_effect_event_hash(&scoped, expected)
+}
+
+fn exact_effect_event_hash(
+    events: &[RelevantEvent],
+    expected: CanonicalMidnightOperation,
+) -> Result<[u8; 32], FinalizedMidnightHistoryError> {
+    let mut successes = 0;
+    let mut transaction = None;
+    let mut action = None;
+    for event in events {
+        match *event {
+            RelevantEvent::ExtrinsicSuccess => successes += 1,
+            RelevantEvent::Outcome {
+                transaction_hash,
+                all_applied: true,
+            } if transaction.is_none() => {
+                transaction = Some(transaction_hash);
+            }
+            RelevantEvent::Operation {
+                transaction_hash,
+                operation,
+            } if action.is_none() && operation == expected => {
+                action = Some(transaction_hash);
+            }
+            _ => return Err(FinalizedMidnightHistoryError::InvalidChainState),
+        }
+    }
+    match (successes, transaction, action) {
+        (1, Some(transaction), Some(action)) if transaction == action => Ok(transaction),
+        _ => Err(FinalizedMidnightHistoryError::InvalidChainState),
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum RelevantEvent {
     ExtrinsicSuccess,
@@ -810,6 +911,37 @@ mod tests {
             timestamp_seconds,
             transactions,
         }
+    }
+
+    #[test]
+    fn verified_contract_effect_binds_exact_extrinsic_outcome_and_operation() {
+        let address = [10; 32];
+        let expected = CanonicalMidnightOperation::Maintain(address);
+        let inner_hash = [43; 32];
+        let mut events = [
+            RelevantEvent::ExtrinsicSuccess,
+            RelevantEvent::Outcome {
+                transaction_hash: inner_hash,
+                all_applied: true,
+            },
+            RelevantEvent::Operation {
+                transaction_hash: inner_hash,
+                operation: expected,
+            },
+        ];
+        assert_eq!(exact_effect_event_hash(&events, expected), Ok(inner_hash));
+        assert_eq!(
+            exact_effect_event_hash(&events, CanonicalMidnightOperation::Call(address)),
+            Err(FinalizedMidnightHistoryError::InvalidChainState)
+        );
+        events[1] = RelevantEvent::Outcome {
+            transaction_hash: inner_hash,
+            all_applied: false,
+        };
+        assert_eq!(
+            exact_effect_event_hash(&events, expected),
+            Err(FinalizedMidnightHistoryError::InvalidChainState)
+        );
     }
 
     #[test]

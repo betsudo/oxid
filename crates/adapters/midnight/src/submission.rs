@@ -645,6 +645,7 @@ async fn reconcile_live_submission(
         .await
         .map_err(|_| WalletTransactionPortError::Timeout)?
         .map_err(|_| WalletTransactionPortError::Unavailable)?;
+    let finalized_head = block.reference();
     let mut reached_anchor = false;
     for _ in 0..MAX_RECONCILIATION_BLOCKS {
         if block.hash().0 == entry.anchor_block_hash {
@@ -692,11 +693,33 @@ async fn reconcile_live_submission(
     if block.hash().0 == entry.anchor_block_hash {
         reached_anchor = true;
     }
+    // The captured finalized head bounds the receipt search and the timestamp
+    // lookup. An indexer can be newer than the block range we searched.
+    reconcile_absent_live_submission(reached_anchor, entry.expires_at, async {
+        let timestamp = dynamic::storage("Timestamp", "Now", Vec::<dynamic::Value>::new());
+        timeout(
+            CONNECT_TIMEOUT,
+            client.storage().at(finalized_head).fetch(&timestamp),
+        )
+        .await
+        .map_err(|_| WalletTransactionPortError::Timeout)?
+        .map_err(|_| WalletTransactionPortError::Unavailable)?
+        .ok_or(WalletTransactionPortError::InvalidChainState)?
+        .as_type::<u64>()
+        .map_err(|_| WalletTransactionPortError::InvalidChainState)
+    })
+    .await
+}
+
+async fn reconcile_absent_live_submission(
+    reached_anchor: bool,
+    expires_at: oxid_foundation::UnixTimestampMillis,
+    finalized_timestamp: impl Future<Output = Result<u64, WalletTransactionPortError>>,
+) -> Result<MidnightSubmissionReconciliation, WalletTransactionPortError> {
     if !reached_anchor {
         return Ok(MidnightSubmissionReconciliation::Unresolved);
     }
-    let chain_tip = fetch_chain_tip(config.indexer_http_route()).await?;
-    if Timestamp::from_secs(entry.expires_at.value() / 1_000) <= chain_tip.timestamp {
+    if finalized_timestamp.await? / 1_000 > expires_at.value() / 1_000 {
         Ok(MidnightSubmissionReconciliation::Expired)
     } else {
         Ok(MidnightSubmissionReconciliation::Unresolved)
@@ -2206,6 +2229,7 @@ fn websocket_message_type(value: &Value) -> Result<&str, WalletTransactionPortEr
 
 #[cfg(test)]
 mod tests {
+
     use std::{
         io::{BufRead, BufReader, ErrorKind, Write},
         net::TcpListener,
@@ -2236,6 +2260,41 @@ mod tests {
     };
 
     use super::*;
+
+    #[test]
+    fn absent_submission_requires_full_finalized_history_and_a_later_finalized_second() {
+        use std::cell::Cell;
+
+        let deadline = UnixTimestampMillis::new(10_000);
+        for (reached_anchor, finalized_time, expected) in [
+            (false, 100_000, MidnightSubmissionReconciliation::Unresolved),
+            (true, 9_999, MidnightSubmissionReconciliation::Unresolved),
+            (true, 10_000, MidnightSubmissionReconciliation::Unresolved),
+            (true, 10_999, MidnightSubmissionReconciliation::Unresolved),
+            (true, 11_000, MidnightSubmissionReconciliation::Expired),
+        ] {
+            let timestamp_reads = Cell::new(0);
+            let reconciliation = futures::executor::block_on(reconcile_absent_live_submission(
+                reached_anchor,
+                deadline,
+                async {
+                    timestamp_reads.set(timestamp_reads.get() + 1);
+                    Ok(finalized_time)
+                },
+            ));
+            assert_eq!(reconciliation, Ok(expected));
+            assert_eq!(timestamp_reads.get(), usize::from(reached_anchor));
+        }
+
+        assert_eq!(
+            futures::executor::block_on(reconcile_absent_live_submission(
+                true,
+                deadline,
+                std::future::ready(Err(WalletTransactionPortError::Unavailable)),
+            )),
+            Err(WalletTransactionPortError::Unavailable)
+        );
+    }
 
     const ADDRESS: &str =
         "mn_addr_undeployed1asujt0dayj4pelgq97wv75hjhscqv9epmzzpapkf8sy8c87jhh9smkp9zh";

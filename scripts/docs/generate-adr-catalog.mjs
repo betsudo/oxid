@@ -12,7 +12,7 @@ export const DEVELOP_ADR_BLOB_BASE = "https://github.com/MediaNoxLabs/oxid/blob/
 export function renderAdrCatalog(index) {
   const body = index
     .replace(/^# /gm, "## ")
-    .replace(/\]\((([0-9]{4})[A-Za-z0-9./_-]*\.md)\)/g, `](${DEVELOP_ADR_BLOB_BASE}/$1)`);
+    .replace(/\]\(((?:[0-9]{4}|draft-)[A-Za-z0-9./_-]*\.md)\)/g, `](${DEVELOP_ADR_BLOB_BASE}/$1)`);
   return [
     "# Decision records",
     "",

@@ -320,8 +320,7 @@ final class PortalFlowTests: XCTestCase {
     }
 
     @MainActor
-    func testPrepareHolder() async throws {
-        let application = application()
+    private func fundLocalHolder(in application: XCUIApplication) async throws {
         ensureProfile(in: application)
         application.buttons["Wallet"].tap()
         let activate = application.buttons["Activate protected Midnight account"]
@@ -350,11 +349,19 @@ final class PortalFlowTests: XCTestCase {
             "The fresh Portal holder wallet did not observe its finalized NIGHT grant."
         )
         application.buttons["Close Receive"].firstMatch.tap()
+    }
+
+    @MainActor
+    private func openIdentities(in application: XCUIApplication) {
         application.buttons["Documents"].tap()
         let manage = application.buttons["Manage identities"]
         XCTAssertTrue(manage.waitForExistence(timeout: 10))
         scrollTo(manage, in: application)
         manage.tap()
+    }
+
+    @MainActor
+    private func startDidPublication(in application: XCUIApplication) {
         let createDid = application.buttons["Create a DID"]
         XCTAssertTrue(createDid.waitForExistence(timeout: 10))
         scrollTo(createDid, in: application)
@@ -363,10 +370,52 @@ final class PortalFlowTests: XCTestCase {
         XCTAssertTrue(confirmCreateDid.waitForExistence(timeout: 10))
         scrollTo(confirmCreateDid, in: application)
         confirmCreateDid.tap()
+    }
+
+    @MainActor
+    private func assertPublishedHolder(in application: XCUIApplication) {
         let copyDid = application.buttons["Copy DID"]
         XCTAssertTrue(copyDid.waitForExistence(timeout: 1_500))
         XCTAssertTrue(application.staticTexts["Managed"].exists)
         XCTAssertTrue(application.staticTexts["Standalone development · Midnight network"].exists)
+    }
+
+    @MainActor
+    func testPrepareHolder() async throws {
+        let application = application()
+        try await fundLocalHolder(in: application)
+        openIdentities(in: application)
+        startDidPublication(in: application)
+        assertPublishedHolder(in: application)
+    }
+
+    @MainActor
+    func testDidPublicationRecoversAcrossRestart() async throws {
+        let application = application()
+        try await fundLocalHolder(in: application)
+        openIdentities(in: application)
+        startDidPublication(in: application)
+        let partialProgress = application.staticTexts.matching(
+            NSPredicate(format: "label MATCHES %@", ".*\\([1-7] finalized, [0-7] observed\\).*")
+        ).firstMatch
+        XCTAssertTrue(
+            partialProgress.waitForExistence(timeout: 480),
+            "Publication did not expose partial finalized progress."
+        )
+        application.terminate()
+        XCTAssertTrue(application.wait(for: .notRunning, timeout: 15))
+        application.launch()
+        XCTAssertTrue(application.buttons["Documents"].waitForExistence(timeout: 30))
+        openIdentities(in: application)
+        let resume = application.buttons["Resume DID publication"]
+        XCTAssertTrue(resume.waitForExistence(timeout: 30), "The pending publication was not restored.")
+        scrollTo(resume, in: application)
+        resume.tap()
+        let continuePublication = application.buttons["Continue DID publication"]
+        XCTAssertTrue(continuePublication.waitForExistence(timeout: 15))
+        scrollTo(continuePublication, in: application)
+        continuePublication.tap()
+        assertPublishedHolder(in: application)
     }
 
     @MainActor

@@ -137,8 +137,9 @@ test("Lychee remaps only the same-repository develop prefix and still checks all
 });
 
 test("the renderer keeps durable develop URLs for candidate-only ADRs", () => {
-  const rendered = renderAdrCatalog("# ADRs\n\n| [0104](0104-example.md) Example | Accepted |\n");
+  const rendered = renderAdrCatalog("# ADRs\n\n| [0104](0104-example.md) Example | Accepted |\n\n[Proposal](draft-example.md)\n");
   assert.ok(rendered.includes(`${DEVELOP_BLOB_PREFIX}docs/adr/0104-example.md`));
+  assert.ok(rendered.includes(`${DEVELOP_BLOB_PREFIX}docs/adr/draft-example.md`));
 });
 
 test("the committed ADR catalog is the exact hermetic renderer output", () => {
