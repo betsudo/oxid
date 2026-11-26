@@ -326,7 +326,7 @@ impl DidDeploymentContextSource for NodeAnchoredDidDeploymentContextSource {
             if operation.observations().last().is_none_or(|observation| {
                 observation.action_transaction_hash_hex() != snapshot.transaction_hash_hex
             }) {
-                return Err(NativeDidDeploymentError::Integrity);
+                return Err(NativeDidDeploymentError::LedgerStateConflict);
             }
             let chain = self
                 .chain
@@ -633,6 +633,7 @@ impl NativeDidDeploymentService {
                         DidDeploymentState::Submitting
                             | DidDeploymentState::Confirming
                             | DidDeploymentState::OutcomeUnknown
+                            | DidDeploymentState::RetryableFailure
                     ))
             {
                 match self.effects.observe(&operation).await {
@@ -657,6 +658,9 @@ impl NativeDidDeploymentService {
                         NativeDidDeploymentError::IndexerPending
                         | NativeDidDeploymentError::Unavailable,
                     ) => return Ok(operation),
+                    Err(NativeDidDeploymentError::LedgerStateConflict) => {
+                        return self.pause(operation, DidDeploymentFailure::LedgerStateConflict);
+                    }
                     Err(error) => return Err(error),
                 }
             }
@@ -684,6 +688,7 @@ impl NativeDidDeploymentService {
                         DidDeploymentState::Submitting
                             | DidDeploymentState::Confirming
                             | DidDeploymentState::OutcomeUnknown
+                            | DidDeploymentState::RetryableFailure
                     ) {
                         return Ok(operation);
                     }
@@ -714,6 +719,12 @@ impl NativeDidDeploymentService {
                 Err(NativeDidDeploymentError::IndexerPending) => return Ok(operation),
                 Err(NativeDidDeploymentError::Unavailable) => {
                     return self.pause(operation, DidDeploymentFailure::CompositionUnavailable);
+                }
+                Err(NativeDidDeploymentError::ProtectionLocked) => {
+                    return self.pause(operation, DidDeploymentFailure::ProtectionLocked);
+                }
+                Err(NativeDidDeploymentError::LedgerStateConflict) => {
+                    return self.pause(operation, DidDeploymentFailure::LedgerStateConflict);
                 }
                 Err(error) => return Err(error),
             };
@@ -1126,9 +1137,11 @@ const fn map_contract_state_error(
         PassportVaultContractStateSourceError::InvalidConfiguration
         | PassportVaultContractStateSourceError::InvalidAddress
         | PassportVaultContractStateSourceError::CapacityExceeded
-        | PassportVaultContractStateSourceError::InvalidResponse
-        | PassportVaultContractStateSourceError::FinalityMismatch => {
+        | PassportVaultContractStateSourceError::InvalidResponse => {
             NativeDidDeploymentError::Integrity
+        }
+        PassportVaultContractStateSourceError::FinalityMismatch => {
+            NativeDidDeploymentError::LedgerStateConflict
         }
     }
 }
@@ -1197,6 +1210,8 @@ fn map_transaction_failure(error: WalletTransactionPortError) -> DidDeploymentFa
 pub(super) enum NativeDidDeploymentError {
     Unavailable,
     IndexerPending,
+    ProtectionLocked,
+    LedgerStateConflict,
     InvalidRequest,
     Integrity,
     Operation,
@@ -1210,6 +1225,8 @@ impl fmt::Display for NativeDidDeploymentError {
         formatter.write_str(match self {
             Self::Unavailable => "native DID deployment dependencies are unavailable",
             Self::IndexerPending => "native DID deployment is waiting for indexed finality",
+            Self::ProtectionLocked => "native DID publication requires wallet unlock",
+            Self::LedgerStateConflict => "finalized ledger state conflicts with the DID receipt",
             Self::InvalidRequest => "native DID deployment request is invalid",
             Self::Integrity => "native DID deployment state failed integrity validation",
             Self::Operation => "native DID deployment operation persistence failed",
@@ -1237,8 +1254,12 @@ impl From<DidDeploymentOperationError> for NativeDidDeploymentError {
 }
 
 impl From<oxid_identity_application::DidLifecyclePortError> for NativeDidDeploymentError {
-    fn from(_: oxid_identity_application::DidLifecyclePortError) -> Self {
-        Self::Lifecycle
+    fn from(error: oxid_identity_application::DidLifecyclePortError) -> Self {
+        if error == oxid_identity_application::DidLifecyclePortError::Locked {
+            Self::ProtectionLocked
+        } else {
+            Self::Lifecycle
+        }
     }
 }
 
@@ -1253,6 +1274,8 @@ impl From<NativeDidDeploymentError> for DidDeploymentUseCaseError {
         match error {
             NativeDidDeploymentError::Unavailable => Self::Unavailable,
             NativeDidDeploymentError::IndexerPending => Self::Unavailable,
+            NativeDidDeploymentError::ProtectionLocked => Self::Composition,
+            NativeDidDeploymentError::LedgerStateConflict => Self::Integrity,
             NativeDidDeploymentError::InvalidRequest => Self::InvalidRequest,
             NativeDidDeploymentError::Integrity => Self::Integrity,
             NativeDidDeploymentError::Operation => Self::Persistence,

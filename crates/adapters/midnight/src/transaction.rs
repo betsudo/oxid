@@ -3750,6 +3750,127 @@ mod tests {
         assert_eq!(idempotent.block_height, 9);
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn armed_contract_call_restart_reconciles_the_saved_hash_before_rebroadcast() {
+        use std::os::unix::fs::DirBuilderExt as _;
+
+        struct CountedCompletion(Arc<AtomicUsize>);
+        impl MidnightTransactionCompleter for CountedCompletion {
+            fn complete(
+                &self,
+                _: MidnightCompletionRequest,
+                _: &[u8; 32],
+            ) -> Result<MidnightCompletionOutcome, WalletTransactionPortError> {
+                self.0.fetch_add(1, Ordering::SeqCst);
+                Err(WalletTransactionPortError::Unavailable)
+            }
+        }
+
+        struct ExactReconciler;
+        impl MidnightSubmissionReconciler for ExactReconciler {
+            fn reconcile(
+                &self,
+                entry: &StoredSubmissionJournalEntry,
+            ) -> Result<MidnightSubmissionReconciliation, WalletTransactionPortError> {
+                assert_eq!(entry.transaction_hash, [7; 32]);
+                assert_eq!(entry.anchor_block_hash, [8; 32]);
+                assert_eq!(entry.expires_at.value(), 1_800_000_000_000);
+                Ok(MidnightSubmissionReconciliation::Unresolved)
+            }
+        }
+
+        let completions = Arc::new(AtomicUsize::new(0));
+        let directory = std::env::temp_dir().join(format!(
+            "oxid-armed-contract-call-restart-{}",
+            std::process::id()
+        ));
+        std::fs::DirBuilder::new()
+            .mode(0o700)
+            .create(&directory)
+            .unwrap();
+        let config =
+            crate::MidnightSubmissionJournalConfig::new(directory.join("journal.json")).unwrap();
+        let reopen = || {
+            Arc::new(
+                crate::submission_journal::JsonMidnightSubmissionJournalStore::new(config.clone()),
+            )
+        };
+        let draft_id = "did-restart-armed";
+        let (journal_profile, journal_draft) =
+            contract_call_journal_ids(&profile(), draft_id).unwrap();
+        let expires_at = UnixTimestampMillis::new(1_800_000_000_000);
+        let updated_at = UnixTimestampMillis::new(2_000);
+
+        let control = MidnightSubmissionControl::new(
+            MidnightSubmissionAttempt {
+                profile_id: journal_profile,
+                network_id: network_id("undeployed").unwrap(),
+                draft_id: journal_draft,
+                planning_fingerprint: [6; 32],
+                expires_at,
+                updated_at,
+            },
+            reopen(),
+        );
+        let restore = || {
+            submittable_adapter(Arc::new(CountedCompletion(completions.clone())))
+                .with_submission_recovery(reopen(), Arc::new(ExactReconciler))
+        };
+        // No attempt is durable before begin_broadcast. Simulate the
+        // reread a recovered coordinator performs before rebuilding.
+        assert_eq!(
+            restore().reconcile_contract_call_submission(profile().as_str(), draft_id),
+            Err(WalletTransactionPortError::DraftNotFound)
+        );
+        // Simulate termination after arming the journal and before sending.
+        control
+            .begin_broadcast(42, [7; 32], [8; 32], WalletTransferSubmissionMode::Live)
+            .unwrap();
+        drop(control);
+
+        let restored = restore();
+        let unresolved = restored
+            .reconcile_contract_call_submission(profile().as_str(), draft_id)
+            .unwrap();
+        assert_eq!(
+            unresolved.state,
+            MidnightContractCallSubmissionState::OutcomeUnknown
+        );
+        assert_eq!(unresolved.transaction_hash, Some([7; 32]));
+        assert_eq!(
+            restore()
+                .contract_call_submission_status(profile().as_str(), draft_id)
+                .unwrap(),
+            unresolved
+        );
+        let funded = restored
+            .fund_contract_call(MidnightContractCallFundingRequest::new(
+                profile().as_str(),
+                "undeployed",
+                1_800_000_000,
+                true,
+                serialized_contract_call_with_night_shortfall(1),
+            ))
+            .unwrap()
+            .into_transaction();
+        assert_eq!(
+            restored.complete_contract_call(MidnightContractCallSubmissionRequest::new(
+                profile().as_str(),
+                "undeployed",
+                draft_id,
+                [6; 32],
+                expires_at,
+                updated_at,
+                funded,
+            )),
+            Err(WalletTransactionPortError::SubmissionOutcomeUnknown)
+        );
+        assert_eq!(completions.load(Ordering::SeqCst), 0);
+        std::fs::remove_file(config.path()).unwrap();
+        std::fs::remove_dir(directory).unwrap();
+    }
+
     #[test]
     fn contract_funding_rejects_wrong_mode_network_and_trailing_bytes() {
         let adapter = submittable_adapter(Arc::new(SimulatedMidnightTransactionCompleter));

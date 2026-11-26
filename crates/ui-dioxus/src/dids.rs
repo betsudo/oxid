@@ -129,7 +129,19 @@ enum DidJourney {
 fn did_deployment_progress_text(
     operation: &oxid_identity_application::DidDeploymentOperation,
 ) -> String {
+    use oxid_identity_application::DidDeploymentFailure;
+
     let stage = match operation.state() {
+        DidDeploymentState::RetryableFailure => match operation.failure() {
+            Some(DidDeploymentFailure::ProtectionLocked) => "Unlock the wallet to continue",
+            Some(DidDeploymentFailure::LedgerStateConflict) => {
+                "DID publication paused due to a ledger state conflict"
+            }
+            Some(DidDeploymentFailure::AttemptLimitReached) => {
+                "DID publication paused after unsuccessful transactions"
+            }
+            _ => "Preparing the next DID transaction",
+        },
         DidDeploymentState::Submitting | DidDeploymentState::Confirming => "Waiting for finality",
         DidDeploymentState::AwaitingVisibility => "Waiting for indexed state",
         DidDeploymentState::OutcomeUnknown => "Recovering the previous submission",
@@ -137,8 +149,7 @@ fn did_deployment_progress_text(
         DidDeploymentState::Ready => "DID published",
         DidDeploymentState::Composing
         | DidDeploymentState::Funding
-        | DidDeploymentState::Proving
-        | DidDeploymentState::RetryableFailure => "Preparing the next DID transaction",
+        | DidDeploymentState::Proving => "Preparing the next DID transaction",
     };
     format!(
         "{stage} ({} finalized, {} observed).",
@@ -531,19 +542,26 @@ pub(super) fn DidsPage(
                                                 return;
                                             }
                                             Ok(Ok(operation)) if operation.state() == DidDeploymentState::RetryableFailure => {
-                                                let failure = operation.failure().map_or("unknown", |failure| failure.as_str());
+                                                use oxid_identity_application::DidDeploymentFailure;
+                                                let failure = operation.failure();
+                                                let progress = did_deployment_progress_text(&operation);
                                                 pending_deployment.set(Some(operation));
-                                                if failure == "attempt_limit_reached" {
-                                                    did_creation.set(DidCreationState::Failed);
-                                                    did_creation_notice.set(Some("DID publication is paused after repeated unsuccessful transactions. Your confirmed progress is saved.".to_owned()));
-                                                    return;
+                                                match failure {
+                                                    Some(DidDeploymentFailure::AttemptLimitReached) => {
+                                                        did_creation.set(DidCreationState::Failed);
+                                                        did_creation_notice.set(Some(progress));
+                                                        return;
+                                                    }
+                                                    Some(DidDeploymentFailure::ProtectionLocked | DidDeploymentFailure::LedgerStateConflict) => {
+                                                        did_creation.set(DidCreationState::Ready);
+                                                        did_creation_notice.set(Some(progress));
+                                                        return;
+                                                    }
+                                                    _ => {
+                                                        let reason = failure.map_or("unknown", |failure| failure.as_str());
+                                                        did_creation_notice.set(Some(format!("Waiting for Midnight to converge: {reason}. Progress is retained and will resume automatically.")));
+                                                    }
                                                 }
-                                                if failure == "protection_locked" {
-                                                    did_creation.set(DidCreationState::Ready);
-                                                    did_creation_notice.set(Some("Unlock this wallet to continue DID publication.".to_owned()));
-                                                    return;
-                                                }
-                                                did_creation_notice.set(Some(format!("Waiting for Midnight to converge: {failure}. Progress is retained and will resume automatically.")));
                                             }
                                             Ok(Ok(operation)) => {
                                                 did_creation_notice.set(Some(did_deployment_progress_text(&operation)));

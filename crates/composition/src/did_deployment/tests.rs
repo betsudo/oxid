@@ -929,3 +929,7 @@ fn operation_model_failures_are_not_misreported_as_storage_outages() {
         ));
     }
 }
+
+#[cfg(unix)]
+#[path = "tests/restart.rs"]
+mod restart;

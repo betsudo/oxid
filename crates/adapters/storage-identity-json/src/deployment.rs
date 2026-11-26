@@ -504,6 +504,7 @@ fn parse_failure(value: &str) -> Result<DidDeploymentFailure, DidDeploymentOpera
         "funding_unavailable" => Ok(DidDeploymentFailure::FundingUnavailable),
         "insufficient_night" => Ok(DidDeploymentFailure::InsufficientNight),
         "chain_state_unavailable" => Ok(DidDeploymentFailure::ChainStateUnavailable),
+        "ledger_state_conflict" => Ok(DidDeploymentFailure::LedgerStateConflict),
         "unsupported_network" => Ok(DidDeploymentFailure::UnsupportedNetwork),
         "invalid_funding_plan" => Ok(DidDeploymentFailure::InvalidFundingPlan),
         "insufficient_dust" => Ok(DidDeploymentFailure::InsufficientDust),

@@ -73,8 +73,12 @@ temporary wallet and faucet state.
 Headless clients can read the saved checkpoint with `did.deploy.status`
 without starting publication. The result separates finalized receipts from
 their authenticated observations and reports elapsed attempt and visibility
-wait times when measured. The diagnostic ring records only fixed publication
-event codes.
+wait times when measured. If protected composition needs an unlock, the
+checkpoint reports `protection_locked`. If authenticated state conflicts with
+a receipt, it reports `ledger_state_conflict`. Both pauses preserve the receipt
+prefix and the phase to resume. Continuing rechecks the same step before any
+successor is funded or submitted. The diagnostic ring records only fixed
+publication event codes.
 
 The coordinator allows two automatic replacements per effect after verified
 rejection or expiry. It retains a durable pause and the confirmed prefix when

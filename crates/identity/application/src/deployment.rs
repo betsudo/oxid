@@ -246,6 +246,7 @@ pub enum DidDeploymentFailure {
     FundingUnavailable,
     InsufficientNight,
     ChainStateUnavailable,
+    LedgerStateConflict,
     UnsupportedNetwork,
     InvalidFundingPlan,
     InsufficientDust,
@@ -267,6 +268,7 @@ impl DidDeploymentFailure {
             Self::FundingUnavailable => "funding_unavailable",
             Self::InsufficientNight => "insufficient_night",
             Self::ChainStateUnavailable => "chain_state_unavailable",
+            Self::LedgerStateConflict => "ledger_state_conflict",
             Self::UnsupportedNetwork => "unsupported_network",
             Self::InvalidFundingPlan => "invalid_funding_plan",
             Self::InsufficientDust => "insufficient_dust",
@@ -830,6 +832,11 @@ impl DidDeploymentOperation {
     }
 
     fn validate(&self) -> Result<(), DidDeploymentOperationError> {
+        let receipt_state = if self.state == DidDeploymentState::RetryableFailure {
+            self.resume_from.unwrap_or(self.state)
+        } else {
+            self.state
+        };
         if self.network == MidnightNetwork::Offchain
             || self.created_at.value() == 0
             || self.updated_at.value() < self.created_at.value()
@@ -854,7 +861,7 @@ impl DidDeploymentOperation {
             || self.receipts.len() > 8
             || self.observations.len() > self.receipts.len()
             || (self.legacy_observations_pending && self.observations.len() >= self.receipts.len())
-            || !valid_receipt_prefix(&self.receipts, self.effect, self.state)
+            || !valid_receipt_prefix(&self.receipts, self.effect, receipt_state)
             || !valid_observation_prefix(&self.observations, &self.receipts)
         {
             return Err(DidDeploymentOperationError::Integrity);

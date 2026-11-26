@@ -4,6 +4,7 @@ use std::{
     collections::BTreeMap,
     error::Error,
     fmt,
+    future::Future,
     net::IpAddr,
     sync::{Arc, Mutex},
     thread,
@@ -398,8 +399,23 @@ async fn read_on_runtime(
         return Err(PassportVaultContractStateSourceError::FinalityMismatch);
     }
     if let Some(receipt) = receipt {
-        verify_contract_effect(&rpc, &rpc_client, &snapshot, canonical_action_hash, receipt)
-            .await?;
+        verify_contract_effect(
+            &snapshot,
+            canonical_action_hash,
+            receipt,
+            verified_effect_in_block(
+                &rpc,
+                canonical_action_hash,
+                receipt.extrinsic_hash,
+                receipt.expected,
+            ),
+            read_node_contract_state(
+                &rpc_client,
+                &snapshot.contract_address_hex,
+                canonical_action_hash,
+            ),
+        )
+        .await?;
     }
     snapshot.finalized_head_hash_hex = hex::encode(finalized_head.as_ref());
     retain_context(&config, context)?;
@@ -407,11 +423,11 @@ async fn read_on_runtime(
 }
 
 async fn verify_contract_effect(
-    rpc: &LegacyRpcMethods<SubstrateConfig>,
-    rpc_client: &RpcClient,
     snapshot: &PassportVaultContractStateSnapshot,
     action_block: subxt::utils::H256,
     receipt: ContractEffectReceipt,
+    finalized_effect: impl Future<Output = Result<[u8; 32], FinalizedMidnightHistoryError>>,
+    node_state: impl Future<Output = Result<String, PassportVaultContractStateSourceError>>,
 ) -> Result<(), PassportVaultContractStateSourceError> {
     if snapshot.action_block_height < receipt.block_height {
         return Err(PassportVaultContractStateSourceError::NotFound);
@@ -420,36 +436,36 @@ async fn verify_contract_effect(
     {
         return Err(PassportVaultContractStateSourceError::FinalityMismatch);
     }
-    let transaction_hash =
-        verified_effect_in_block(rpc, action_block, receipt.extrinsic_hash, receipt.expected)
-            .await
-            .map_err(|error| match error {
-                FinalizedMidnightHistoryError::Unavailable
-                | FinalizedMidnightHistoryError::TimedOut => {
-                    PassportVaultContractStateSourceError::Unavailable
-                }
-                FinalizedMidnightHistoryError::CapacityExceeded => {
-                    PassportVaultContractStateSourceError::CapacityExceeded
-                }
-                _ => PassportVaultContractStateSourceError::FinalityMismatch,
-            })?;
+    let transaction_hash = finalized_effect.await.map_err(|error| match error {
+        FinalizedMidnightHistoryError::Unavailable | FinalizedMidnightHistoryError::TimedOut => {
+            PassportVaultContractStateSourceError::Unavailable
+        }
+        FinalizedMidnightHistoryError::CapacityExceeded => {
+            PassportVaultContractStateSourceError::CapacityExceeded
+        }
+        _ => PassportVaultContractStateSourceError::FinalityMismatch,
+    })?;
     if snapshot.transaction_hash_hex != hex::encode(transaction_hash) {
         return Err(PassportVaultContractStateSourceError::FinalityMismatch);
     }
-    let node_state = timeout(
-        REQUEST_TIMEOUT,
-        rpc_client.request::<String>(
-            "midnight_contractState",
-            rpc_params![&snapshot.contract_address_hex, action_block],
-        ),
-    )
-    .await
-    .map_err(|_| PassportVaultContractStateSourceError::Unavailable)?
-    .map_err(|_| PassportVaultContractStateSourceError::Unavailable)?;
-    if decode_bounded_hex_state(&node_state)? != snapshot.serialized_contract_state {
+    if decode_bounded_hex_state(&node_state.await?)? != snapshot.serialized_contract_state {
         return Err(PassportVaultContractStateSourceError::FinalityMismatch);
     }
     Ok(())
+}
+
+async fn read_node_contract_state(
+    rpc_client: &RpcClient,
+    address_hex: &str,
+    block: subxt::utils::H256,
+) -> Result<String, PassportVaultContractStateSourceError> {
+    timeout(
+        REQUEST_TIMEOUT,
+        rpc_client.request::<String>("midnight_contractState", rpc_params![address_hex, block]),
+    )
+    .await
+    .map_err(|_| PassportVaultContractStateSourceError::Unavailable)?
+    .map_err(|_| PassportVaultContractStateSourceError::Unavailable)
 }
 
 fn retain_context(
@@ -846,6 +862,78 @@ mod tests {
             !CONTRACT_STATE_AT_FINALIZED_HEIGHT_QUERY
                 .contains("contractAction(\n    address: $address\n    offset:")
         );
+    }
+
+    #[test]
+    fn exact_finalized_action_requires_identical_node_and_indexer_contract_state() {
+        use PassportVaultContractStateSourceError::{FinalityMismatch, NotFound};
+        use std::cell::Cell;
+
+        let address = "11".repeat(32);
+        let receipt = ContractEffectReceipt {
+            expected: CanonicalMidnightOperation::Deploy([0x11; 32]),
+            extrinsic_hash: [0x55; 32],
+            block_hash: [0x33; 32],
+            block_height: 41,
+            historical: false,
+        };
+        for (head_height, action_height, node_state, expected, requested) in [
+            (41, 41, "0x0102", Ok(()), true),
+            (47, 41, "0x0102", Ok(()), true),
+            (47, 41, "0x0103", Err(FinalityMismatch), true),
+            (47, 40, "0x0102", Err(NotFound), false),
+            (47, 42, "0x0102", Err(FinalityMismatch), false),
+        ] {
+            let action_hash = if action_height == receipt.block_height {
+                receipt.block_hash
+            } else {
+                [0x99; 32]
+            };
+            let head_hash = if head_height == action_height {
+                hex::encode(action_hash)
+            } else {
+                "44".repeat(32)
+            };
+            let response = serde_json::to_vec(&json!({
+                "data": {
+                    "block": {
+                        "hash": head_hash,
+                        "height": head_height,
+                        "timestamp": 1_700_000_000_000_i64,
+                        "ledgerParameters": "0506"
+                    },
+                    "contractAction": {
+                        "address": address,
+                        "state": "0102",
+                        "zswapState": "0304",
+                        "transaction": {
+                            "hash": "22".repeat(32),
+                            "block": { "hash": hex::encode(action_hash), "height": action_height }
+                        }
+                    }
+                }
+            }))
+            .expect("response");
+            let (snapshot, _) =
+                decode_indexer_response(&response, &address, head_hash, head_height)
+                    .expect("indexer snapshot");
+            let state_reads = Cell::new(0);
+            let result = futures::executor::block_on(verify_contract_effect(
+                &snapshot,
+                action_hash.into(),
+                receipt,
+                std::future::ready(Ok([0x22; 32])),
+                async {
+                    state_reads.set(state_reads.get() + 1);
+                    Ok(node_state.to_owned())
+                },
+            ));
+            assert_eq!(
+                result, expected,
+                "head {head_height}, action {action_height}"
+            );
+            assert_eq!(state_reads.get(), usize::from(requested));
+        }
     }
 
     #[test]
